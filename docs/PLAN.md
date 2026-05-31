@@ -1,7 +1,9 @@
-# DeliverIQ — 45-Day Master Plan (v2)
-### From Zero Dev Experience → Production-Grade Backend Project
+# DeliverIQ — 45-Day Master Plan (v3 — Ubuntu Edition)
+### Built for Ubuntu Linux · From Zero Dev Experience → Production-Grade Backend
 
-**Now with:** Daily resources (docs + YouTube) + folder structure explained step-by-step
+**For:** Shorya Gupta — final-year CSE, Codeforces Specialist · LeetCode Knight · 1500+ problems. Strong C++/DSA, zero backend experience.
+**System:** Ubuntu Linux (every command in this doc is Ubuntu-specific).
+**Now with:** Day 0 setup · daily YouTube + docs · C++→Python bridges · "Break It On Purpose" exercises · interview answer templates filled in as you build.
 
 ---
 
@@ -11,15 +13,62 @@ Each day has:
 - 🎯 **Goal** — what you'll achieve
 - 📚 **Resources** — official docs + ONE best YouTube video (max 30 min)
 - 💻 **Tasks** — exact things to code
-- ✅ **End of day** — proof you completed it
+- ✅ **End of Day** — proof you completed it
+
+Some days also have:
+- 💡 **C++ → Python** — maps new Python to the C++/CP you already know
+- 🔥 **Break It On Purpose** — deliberately sabotage your code to understand WHY each piece exists
+- 📝 **Interview Answer Template** — fill-in-the-blank answers, written the same day you build the feature
+- 🐧 **Ubuntu Note** — Linux-specific tips that aren't obvious
+- 🐛 **Stuck Protocol** — your debugging checklist (defined on Day 1)
 
 **Rule:** Spend max 30 min watching, then START CODING. Don't binge tutorials.
 
 ---
 
+## Why This Project Wins
+
+**One-line pitch:**
+> A production-grade REST API that dispatches food delivery orders to riders using priority queues, geohashing, rate limiting, and event streaming — built with FastAPI, Redis, Kafka, PostgreSQL, and Docker.
+
+**Why interviewers will love it:**
+- Uber/Zomato/Swiggy literally have teams building exactly this
+- Razorpay/PhonePe care about rate limiting, idempotency, webhooks (all included)
+- Demonstrates 5+ system design concepts in ONE codebase
+- Pure backend = no frontend complexity wasting your time
+- Every line is defensible — no "I copied a tutorial" smell
+
+---
+
+## Tech Stack Explained (For Beginners)
+
+You're a beginner. Here's what each tool does in PLAIN English:
+
+| Tool | What it is | Why we use it |
+|---|---|---|
+| **Python** | Programming language | Easy syntax, huge ecosystem, industry standard |
+| **FastAPI** | Web framework | Builds REST APIs fast, auto-generates docs |
+| **PostgreSQL** | Database | Stores orders, riders, logs permanently |
+| **SQLAlchemy** | ORM | Lets you write Python instead of raw SQL |
+| **Alembic** | Migration tool | Tracks database schema changes |
+| **Redis** | In-memory cache | Super-fast (microseconds) temporary storage |
+| **Kafka** | Event streaming | Sends events between services reliably |
+| **Docker** | Containerization | Packages your app so it runs anywhere |
+| **Docker Compose** | Multi-container tool | Starts FastAPI + Postgres + Redis + Kafka together |
+| **pytest** | Testing framework | Writes automated tests for your code |
+| **Postman** | API testing tool | Manually tests your endpoints |
+| **Git + GitHub** | Version control | Tracks code changes, hosts your repo |
+| **Railway/Render** | Cloud hosting | Deploys your app to a live public URL |
+
+**Don't panic.** You don't learn these in isolation — you learn them by USING them daily in this project.
+
+🐧 **Ubuntu Note:** On Ubuntu, modern Docker uses `docker compose` (a space — it's a built-in plugin), NOT the old `docker-compose` (hyphen). This whole doc uses `docker compose`.
+
+---
+
 ## Project Folder Structure (Explained Like You're 5)
 
-You won't build all of this on Day 6. We'll **grow it organically** as you learn. But here's what each piece means so you have context:
+You won't build all of this on Day 6. We'll **grow it organically** as you learn. Here's what each piece means so you have context:
 
 ```
 deliveriq/                  ← your project (a folder)
@@ -48,6 +97,8 @@ deliveriq/                  ← your project (a folder)
 │   │   ├── dispatch.py     ← priority queue logic
 │   │   └── geohash.py      ← rider matching logic
 │   │
+│   ├── middleware/         ← code that runs on EVERY request (rate limiter)
+│   ├── workers/            ← background scripts (Pub/Sub & Kafka consumers)
 │   └── utils/              ← helper functions used across the app
 │
 ├── tests/                  ← pytest test files
@@ -75,6 +126,21 @@ If you mix these (everything in one file), the code becomes unmaintainable. Real
 
 **You'll create folders ONE AT A TIME** as you need them. Don't create empty folders just because the structure says so.
 
+### Folder Unlock Schedule
+
+You create each folder ONLY when you first need it — never before.
+
+| Folder | Created on | Reason |
+|---|---|---|
+| `app/` | Day 6 | Entry point |
+| `app/schemas/` | Day 9 | First Pydantic model |
+| `app/core/` | Day 11 | DB connection |
+| `app/models/` | Day 11 | First ORM model |
+| `app/routers/` | Day 12 | First router split |
+| `app/middleware/` | Day 16 | Rate limiter |
+| `app/services/` | Day 17 | First algorithm |
+| `app/workers/` | Day 20 | Pub/Sub listener |
+
 ---
 
 ## What is `__init__.py`?
@@ -88,44 +154,175 @@ Example:
 
 You'll create one in every folder. They stay empty 99% of the time.
 
+💡 **C++ → Python:** `__init__.py` is loosely like a header that makes a directory "includable." Importing in Python (`from app.models.order import Order`) is the rough equivalent of `#include "order.h"` plus a namespace.
+
+---
+
+## Day 0 — Ubuntu System Check (30 minutes, do this before Day 1)
+
+### 🎯 Goal
+Verify your Ubuntu system is ready. Fix anything missing. On a fresh Ubuntu install, none of these tools may exist yet — that's fine.
+
+### 💻 Run this system check
+Open a terminal (**Ctrl+Alt+T**) and run each line:
+
+```bash
+# 1. Check Ubuntu version
+lsb_release -a
+# ✅ Should show Ubuntu 20.04 or 22.04 (24.04 also fine)
+
+# 2. Confirm you're on Linux
+uname -a
+# ✅ Should mention "Linux"
+
+# 3. Check Python
+python3 --version
+# ✅ Should show 3.8+. We'll install 3.11 on Day 1 if needed.
+
+# 4. Check if pip3 exists
+pip3 --version
+# If "command not found": sudo apt install python3-pip -y
+
+# 5. Check git
+git --version
+# If "command not found": sudo apt install git -y
+
+# 6. Check curl (needed for downloads)
+curl --version
+# If "command not found": sudo apt install curl -y
+
+# 7. Check available disk space
+df -h ~
+# ✅ Should have at least 10GB free (Docker images are large)
+
+# 8. Check internet
+ping -c 3 google.com
+# ✅ Should show 3 responses
+
+# 9. Update system packages (do this once — may take 5–10 min)
+sudo apt update && sudo apt upgrade -y
+```
+
+### What if something fails?
+- **Python3 not found:** `sudo apt install python3 python3-pip python3-venv -y`
+- **Git not found:** `sudo apt install git -y`
+- **curl not found:** `sudo apt install curl -y`
+- **No internet:** check WiFi/ethernet — not a code problem
+- **Less than 10GB disk:** free up space before continuing
+
+🐧 **Ubuntu Note:** Terminal paste is **Ctrl+Shift+V**, not Ctrl+V. Other handy shortcuts: Ctrl+C kills a running process, Ctrl+L clears the screen, Tab autocompletes, Up arrow recalls the last command.
+
+### ✅ End of Day 0
+All checks pass. You're ready for Day 1.
+
 ---
 
 # PHASE 1: Python + Git Fundamentals (Days 1–7)
 
-## Day 1 — Install Everything + Hello World
+## Day 1 — Install Everything (Ubuntu) + Hello World
 
 ### 🎯 Goal
-Get tools installed, write your first Python program, push to GitHub.
+Install your tools the Ubuntu way, write your first Python program, push to GitHub. Learn the Stuck Protocol (you'll use it all 45 days).
 
 ### 📚 Resources
-- **Install Python:** [python.org/downloads](https://www.python.org/downloads/) — get 3.11+
-  - ⚠️ On Windows: **CHECK "Add Python to PATH"** during install
-- **Install VS Code:** [code.visualstudio.com](https://code.visualstudio.com/)
-- **Install Git:** [git-scm.com/downloads](https://git-scm.com/downloads)
-- **Create GitHub account:** [github.com](https://github.com)
 - **Watch:** [Python in 1 Hour — Programming with Mosh](https://www.youtube.com/watch?v=kqtD5dpn9C8) *(watch only first 30 min — variables, loops, functions)*
 - **Setup video:** [Python + VS Code Setup — Corey Schafer](https://www.youtube.com/watch?v=-nh9rCzPJ20) *(15 min)*
+- **Create GitHub account:** [github.com](https://github.com)
 
 ### 💻 Tasks
-1. Install Python, VS Code, Git
-2. Open VS Code → install extension: **"Python"** by Microsoft
-3. Create a folder anywhere called `deliveriq`
-4. Open it in VS Code
-5. Create `hello.py`:
-   ```python
-   name = "DeliverIQ"
-   print(f"Welcome to {name}!")
 
-   # Try this: list, dict, loop
-   foods = ["pizza", "burger", "biryani"]
-   for f in foods:
-       print(f"Delivering: {f}")
-   ```
-6. Run in VS Code terminal: `python hello.py`
+**Step 1 — Install Python 3.11 (Ubuntu):**
+```bash
+# Check current version
+python3 --version
+
+# If not 3.11+, install it (Ubuntu supports multiple Python versions side by side)
+sudo apt update
+sudo apt install python3.11 python3.11-venv python3.11-dev python3-pip -y
+
+# Verify
+python3.11 --version
+```
+🐧 **Ubuntu Note:** If your system `python3` is 3.8 or 3.9, that's fine — just use `python3.11` explicitly when creating your venv on Day 5. There is no "Add to PATH" checkbox on Ubuntu; apt handles it.
+
+**Step 2 — Install Git (Ubuntu):**
+```bash
+sudo apt update
+sudo apt install git -y
+git --version
+```
+
+**Step 3 — Install VS Code (Ubuntu):**
+```bash
+wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > packages.microsoft.gpg
+sudo install -o root -g root -m 644 packages.microsoft.gpg /etc/apt/trusted.gpg.d/
+sudo sh -c 'echo "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/trusted.gpg.d/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list'
+sudo apt update
+sudo apt install code -y
+```
+
+**Step 4 — Set up your workspace:**
+```bash
+cd ~
+mkdir -p projects/deliveriq
+cd projects/deliveriq
+code .          # opens this folder in VS Code
+```
+In VS Code: install the extension **"Python"** by Microsoft.
+
+🐧 **Ubuntu Note:** Build everything inside your Linux home directory (`~/projects/deliveriq`). If you ever use WSL, never build under `/mnt/c/...` — file I/O there is up to 10× slower.
+
+**Step 5 — Write `hello.py`:**
+```python
+name = "DeliverIQ"
+print(f"Welcome to {name}!")
+
+# Try this: list, dict, loop
+foods = ["pizza", "burger", "biryani"]
+for f in foods:
+    print(f"Delivering: {f}")
+```
+
+**Step 6 — Run it:**
+```bash
+python3 hello.py
+```
+🐧 **Ubuntu Note:** At the system level (outside a venv), always use `python3` and `pip3` — plain `python`/`pip` may not exist on Ubuntu.
+
+### 🐛 STUCK PROTOCOL — read this now, use it for the next 45 days
+Follow in order, max 15 min per step.
+
+```
+Step 1 (5 min): Read the error message carefully.
+  On Ubuntu, errors print to the terminal. Look for:
+  - The LAST line (this is usually the actual error)
+  - Any line mentioning a file inside your project folder (not venv/)
+  - "Did you mean...?" suggestions (Python often tells you the fix)
+
+Step 2 (5 min): Google the exact last line of the error in quotes.
+  Example: "sqlalchemy.exc.OperationalError: could not connect to server"
+  Add "Ubuntu" or "FastAPI" to narrow results. Filter to the last 2 years.
+
+Step 3 (5 min): Check common Ubuntu-specific causes first:
+  ModuleNotFoundError       → venv not activated (run: source venv/bin/activate)
+  ConnectionRefusedError    → service not running (run: docker ps  or  systemctl status postgresql)
+  Permission denied         → Docker group issue (run: newgrp docker)
+  python: command not found → use python3 on Ubuntu
+  pip: command not found    → use pip3, or activate venv first
+  Port already in use       → run: sudo lsof -i :PORT   then   sudo kill -9 PID
+  422 Unprocessable Entity  → Pydantic schema mismatch — check your request body JSON
+
+Step 4 (15 min): Ask for help with this exact format:
+  "I'm on Ubuntu, building DeliverIQ with FastAPI, on Day [X].
+   I'm trying to: [one sentence]
+   Full error: [paste entire terminal output]
+   Relevant file: [paste the file]
+   Already tried: [steps 1-3 results]"
+```
 
 ### ✅ End of Day
 - You see `Welcome to DeliverIQ!` in your terminal
-- You can confidently say: *"I installed Python and ran my first program"*
+- You know where to look when something breaks (→ See Stuck Protocol)
 
 ---
 
@@ -167,6 +364,7 @@ r = Rider(1, "Suresh")
 r.assign_order(101)
 r.assign_order(102)  # Should fail — already busy
 ```
+Run with `python3 practice.py`. → See Stuck Protocol if anything breaks.
 
 ### ✅ End of Day
 - You understand functions, type hints, classes, `self`, `__init__`
@@ -181,6 +379,18 @@ Master Python's "magic" syntax that you'll use everywhere.
 ### 📚 Resources
 - **Watch:** [Python List Comprehensions — Corey Schafer](https://www.youtube.com/watch?v=3dt4OGnU5sM) *(20 min)*
 - **Docs:** [Python Data Structures](https://docs.python.org/3/tutorial/datastructures.html)
+
+### 💡 C++ → Python (for competitive programmers)
+```
+vector<int>              →  list:          [1, 2, 3]
+unordered_map<str,int>   →  dict:          {"key": 1}
+unordered_set<int>       →  set:           {1, 2, 3}
+pair<int,int>            →  tuple:         (1, 2)
+auto x = 5               →  x = 5          (no type needed)
+cout << x << endl        →  print(x)
+nullptr                  →  None
+true / false             →  True / False
+```
 
 ### 💻 Tasks
 ```python
@@ -270,18 +480,15 @@ Isolate your project's Python packages from the rest of your system.
 ```bash
 # Inside deliveriq/ folder:
 
-# Create virtual env
-python -m venv venv
+# Create virtual env (use python3.11 if your system python3 is older)
+python3 -m venv venv
 
 # Activate it
-# Windows:
-venv\Scripts\activate
-# Mac/Linux:
 source venv/bin/activate
 
-# You should see (venv) in your terminal prompt
+# You should now see (venv) at the start of your terminal prompt
 
-# Install FastAPI
+# Install FastAPI (inside venv, plain pip works)
 pip install fastapi uvicorn[standard]
 
 # Freeze versions
@@ -293,6 +500,10 @@ git commit -m "chore: add FastAPI dependencies"
 git push
 ```
 
+🐧 **Ubuntu Note:** The activation command is **`source venv/bin/activate`** — that's the only one you'll ever use. You may see `venv\Scripts\activate` in tutorials; that's **Windows only — ignore it**. To leave the venv later, type `deactivate`.
+
+💡 **C++ → Python:** A venv is like having a per-project set of linked libraries instead of polluting your global system. Each project gets its own clean dependency tree.
+
 ### ✅ End of Day
 - `(venv)` appears in your terminal
 - `requirements.txt` lists `fastapi`, `uvicorn`, etc.
@@ -303,7 +514,7 @@ git push
 ## Day 6 — Build the App Structure (Hands-On)
 
 ### 🎯 Goal
-Create the project skeleton — but understand EACH file as you make it.
+Create ONLY the entry point. You'll add every other folder later, exactly when you need it.
 
 ### 📚 Resources
 - **Watch:** [FastAPI Tutorial — first 20 min by ArjanCodes](https://www.youtube.com/watch?v=SORiTsvnU28)
@@ -311,14 +522,16 @@ Create the project skeleton — but understand EACH file as you make it.
 
 ### 💻 Tasks
 
-We'll build the structure **piece by piece**, understanding each step.
+> **We will create each folder ONLY when we first need it — not before.** Today you create just `app/` and `app/main.py`. See the Folder Unlock Schedule above.
 
 **Step 1: Create `app/` folder and `__init__.py`**
 ```bash
 mkdir app
-touch app/__init__.py    # On Windows: type nul > app\__init__.py
+touch app/__init__.py
 ```
 *Why?* `app/` will hold all your code. `__init__.py` makes Python treat it as a package.
+
+🐧 **Ubuntu Note:** `touch filename` creates an empty file on Ubuntu. (`type nul > filename` is a Windows command — ignore it if you see it anywhere.) Install `tree` once with `sudo apt install tree -y`, then run `tree app/` anytime to view your folder layout.
 
 **Step 2: Create `app/main.py`**
 ```python
@@ -382,6 +595,16 @@ Solidify Python by solving DSA problems in Python (not C++).
 - **Watch:** [Python for C++ Programmers — NeetCode](https://www.youtube.com/watch?v=0K_eZGS5NsU) *(quick reference)*
 - **Practice:** [LeetCode — Easy Array Problems](https://leetcode.com/problemset/all/?difficulty=EASY&topicSlugs=array)
 
+### 💡 C++ → Python
+You already know these cold in C++. Re-solving in Python builds fluency fast:
+```
+sort(v.begin(), v.end())        →  v.sort()   or   sorted(v)
+v.push_back(x)                  →  v.append(x)
+v.size()                        →  len(v)
+m.count(k)                      →  k in m
+s.find(x) != string::npos       →  x in s
+```
+
 ### 💻 Tasks
 Solve these 3 in Python (you already know them in C++):
 1. **Two Sum** — return indices of two numbers summing to target
@@ -394,9 +617,9 @@ This kills two birds: DSA practice + Python fluency.
 You now know:
 - ✅ Python syntax (variables, loops, functions, classes)
 - ✅ Git basics (commit, push, branch)
-- ✅ Virtual environments
+- ✅ Virtual environments (Ubuntu)
 - ✅ FastAPI runs locally
-- ✅ Project has clean structure starting to form
+- ✅ Project has a clean entry point — folders grow from here
 
 ---
 
@@ -456,6 +679,17 @@ Validate incoming data automatically.
 - **Docs:** [FastAPI Request Body](https://fastapi.tiangolo.com/tutorial/body/)
 - **Watch:** [Pydantic Tutorial — ArjanCodes](https://www.youtube.com/watch?v=Vj-iU-8_xLs) *(20 min)*
 
+### 💡 C++ → Python
+Pydantic `BaseModel` is exactly like a C++ `struct` — but it validates types automatically.
+```
+struct OrderCreate { int customer_id; float value; };
+        ↓
+class OrderCreate(BaseModel):
+    customer_id: int
+    value: float
+```
+The difference: if you pass a string where a float is expected, Pydantic raises an error automatically and returns HTTP 422. A C++ struct would silently accept garbage or crash.
+
 ### 💻 Tasks
 
 **Step 1:** Create `app/schemas/` folder (we need it now!)
@@ -511,34 +745,61 @@ def create_order(order: OrderCreate):
     return new_order
 ```
 
-Test in Swagger UI — try sending invalid data (negative value), see auto-rejection.
+Test in Swagger UI — try sending invalid data (negative value), see auto-rejection (422). → See Stuck Protocol if you get unexpected errors.
 
 ### ✅ End of Day
 - You understand: Pydantic = automatic validation + auto-docs in Swagger
 
 ---
 
-## Day 10 — PostgreSQL Setup
+## Day 10 — PostgreSQL Setup (Ubuntu)
 
 ### 🎯 Goal
-Install PostgreSQL, create your database, connect with a GUI.
+Install PostgreSQL on Ubuntu, create your database, connect with a GUI.
 
 ### 📚 Resources
 - **Watch:** [PostgreSQL Setup — Programming with Mosh](https://www.youtube.com/watch?v=qw--VYLpxG4) *(first 20 min)*
-- **Install Postgres:** [postgresql.org/download](https://www.postgresql.org/download/)
-- **Install DBeaver GUI:** [dbeaver.io/download](https://dbeaver.io/download/)
-- **OR easier: Docker:** `docker run -d --name deliveriq-pg -e POSTGRES_PASSWORD=password -p 5432:5432 postgres:15`
+- **Docs:** [PostgreSQL on Ubuntu](https://www.postgresql.org/download/linux/ubuntu/)
 
 ### 💻 Tasks
-1. Install Postgres (or use Docker command above)
-2. Install DBeaver
-3. Connect to Postgres in DBeaver (host: `localhost`, user: `postgres`, password: what you set)
-4. Create a database: right-click → `Create Database` → name it `deliveriq_db`
-5. Verify by browsing in DBeaver
+
+**Option A — Install PostgreSQL natively (recommended on Ubuntu):**
+```bash
+sudo apt update
+sudo apt install postgresql postgresql-contrib -y
+sudo systemctl start postgresql
+sudo systemctl enable postgresql
+
+# Create user and database
+sudo -u postgres psql -c "CREATE USER deliveriq_user WITH PASSWORD 'password';"
+sudo -u postgres psql -c "CREATE DATABASE deliveriq_db OWNER deliveriq_user;"
+
+# Test connection
+psql -U deliveriq_user -d deliveriq_db -h localhost
+# (type \q to exit)
+```
+
+**Option B — Run via Docker instead:**
+```bash
+docker run -d --name deliveriq-pg -e POSTGRES_USER=deliveriq_user \
+  -e POSTGRES_PASSWORD=password -e POSTGRES_DB=deliveriq_db \
+  -p 5432:5432 postgres:15
+```
+
+**Install DBeaver GUI (Ubuntu):**
+```bash
+wget https://dbeaver.io/files/dbeaver-ce_latest_amd64.deb
+sudo dpkg -i dbeaver-ce_latest_amd64.deb
+sudo apt install -f   # fix any dependency issues
+dbeaver &             # launch
+```
+In DBeaver: connect with host `localhost`, user `deliveriq_user`, password `password`, database `deliveriq_db`.
+
+🐧 **Ubuntu Note:** If you ever get `address already in use` on port 5432, something is already running there. Find it with `sudo lsof -i :5432` and stop it (or stop the native service with `sudo systemctl stop postgresql` if you decide to use the Docker one instead). Don't run both on the same port.
 
 ### ✅ End of Day
 - DBeaver shows you connected to `deliveriq_db`
-- You can right-click → "SQL Editor" → run `SELECT 1;` successfully
+- You can open a SQL Editor and run `SELECT 1;` successfully
 
 ---
 
@@ -571,7 +832,7 @@ touch app/core/__init__.py
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATABASE_URL = "postgresql://postgres:password@localhost:5432/deliveriq_db"
+DATABASE_URL = "postgresql://deliveriq_user:password@localhost:5432/deliveriq_db"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -640,12 +901,13 @@ Make endpoints actually save and read from PostgreSQL.
 
 ### 💻 Tasks
 
-**Create `app/routers/orders.py`:**
+**Create `app/routers/` folder:**
 ```bash
 mkdir app/routers
 touch app/routers/__init__.py
 ```
 
+`app/routers/orders.py`:
 ```python
 # app/routers/orders.py
 from fastapi import APIRouter, Depends, HTTPException
@@ -710,13 +972,13 @@ Test in Swagger — create order, fetch it, see it in DBeaver.
 Repeat what you learned. Build it without looking back.
 
 ### 📚 Resources
-- Same as Day 11–12 (reference back if stuck)
+- Same as Day 11–12 (reference back if stuck → See Stuck Protocol)
 
 ### 💻 Tasks
 - Create `app/models/rider.py` — fields: id, name, current_lat, current_lon, is_available, created_at
 - Create `app/schemas/rider.py` — `RiderCreate`, `RiderResponse`
 - Create `app/routers/riders.py` — POST, GET, list
-- Register router in `main.py`
+- Register router in `main.py` with `app.include_router(riders.router)`
 
 ### ✅ End of Day
 - You can create/list riders via API
@@ -761,19 +1023,42 @@ Remove `Base.metadata.create_all()` from `main.py` — Alembic handles it now.
 
 # PHASE 3: Redis + Core Dispatch Logic (Days 15–21)
 
-## Day 15 — Redis Setup + Basics
+## Day 15 — Redis Setup + Basics (Ubuntu)
 
 ### 🎯 Goal
-Install Redis, learn the 10 commands you'll use 90% of the time.
+Install Redis on Ubuntu, learn the 10 commands you'll use 90% of the time.
 
 ### 📚 Resources
 - **Watch:** [Redis in 20 minutes — Fireship](https://www.youtube.com/watch?v=G1rOthIU-uo)
 - **Watch:** [Redis Crash Course — Hussein Nasser](https://www.youtube.com/watch?v=jgpVdJB2sKQ) *(deeper)*
 - **Docs:** [Redis Data Types](https://redis.io/docs/data-types/)
-- **Install:** Docker — `docker run -d --name deliveriq-redis -p 6379:6379 redis:7`
-- **GUI:** [RedisInsight](https://redis.io/docs/connect/insight/) (free)
 
 ### 💻 Tasks
+
+**Option A — Install Redis natively (Ubuntu):**
+```bash
+sudo apt update
+sudo apt install redis-server -y
+sudo systemctl start redis-server
+sudo systemctl enable redis-server
+
+# Test
+redis-cli ping
+# Should return: PONG
+```
+
+**Option B — Run via Docker:**
+```bash
+docker run -d --name deliveriq-redis -p 6379:6379 redis:7
+```
+
+**RedisInsight GUI (easiest on Ubuntu via Docker):**
+```bash
+docker run -d --name redisinsight -p 5540:5540 redis/redisinsight:latest
+# Open: http://localhost:5540
+```
+
+**Install the Python client:**
 ```bash
 pip install redis
 ```
@@ -811,6 +1096,34 @@ redis_client.zrevrange("pending_orders", 0, 0)  # highest score
 
 ## Day 16 — Token Bucket Rate Limiter ⭐ (Most Important Day)
 
+### Before we code: what is middleware?
+
+Every HTTP request your API receives goes through a pipeline. Middleware sits in that pipeline and runs on every request — before your endpoint code executes.
+
+```
+Incoming request
+      │
+      ▼
+┌─────────────────────┐
+│  Rate Limit Check   │  ← middleware (runs first, always)
+└──────────┬──────────┘
+           │ (if allowed)
+           ▼
+┌─────────────────────┐
+│  Your Endpoint Code │  ← only runs if middleware allows it
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Add Response Header │  ← middleware again (runs on the way out)
+└─────────────────────┘
+           │
+           ▼
+    Response to client
+```
+
+You write middleware ONCE. It protects ALL your endpoints automatically — you never have to add rate limiting code inside each endpoint function. This is the same principle as a `#pragma` or a decorator in C++ — applied globally.
+
 ### 🎯 Goal
 Build the rate limiter — your #1 interview talking point.
 
@@ -819,14 +1132,18 @@ Build the rate limiter — your #1 interview talking point.
 - **Read:** [Cloudflare's Rate Limiting Explanation](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/)
 - **Docs:** [FastAPI Middleware](https://fastapi.tiangolo.com/tutorial/middleware/)
 
+### 💡 C++ → Python
+Token bucket is the sliding-window rate problem from LeetCode (e.g. LC 239, 480) — but instead of running once on an array, it runs on EVERY incoming HTTP request. The Redis hash is your "window state" that persists between requests.
+
 ### 💻 Tasks
 
-Create `app/middleware/rate_limiter.py`:
+Create `app/middleware/` folder:
 ```bash
 mkdir app/middleware
 touch app/middleware/__init__.py
 ```
 
+`app/middleware/rate_limiter.py`:
 ```python
 # app/middleware/rate_limiter.py
 import time
@@ -874,14 +1191,25 @@ from app.middleware.rate_limiter import rate_limit_middleware
 app.middleware("http")(rate_limit_middleware)
 ```
 
-**Test it:** Open terminal, run this 110 times fast:
+**Test it:** Open a terminal and fire 110 requests fast:
 ```bash
-for i in {1..110}; do curl http://localhost:8000/health; done
-# Or on Windows PowerShell:
-1..110 | ForEach-Object { curl http://localhost:8000/health }
+for i in {1..110}; do curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/health; done
 ```
+You'll see `200` for the first ~100, then `429` after the bucket empties. **MAGIC. You just built rate limiting.**
 
-You'll see 429 errors after the 100th. **MAGIC. You just built rate limiting.**
+🐧 **Ubuntu Note:** The `for i in {1..110}; do ...; done` loop is native bash and works in your Ubuntu terminal as-is. No PowerShell needed.
+
+### 🔥 Break It On Purpose
+Delete the `redis_client.expire(bucket_key, 120)` line. Restart the server. Make 110 requests (you'll get 429 after 100 — good). Now wait 3 minutes and make 10 more requests. They should succeed IF the TTL was working. But they fail — the bucket is permanently empty. The expire line is what allows recovery. Now restore it.
+
+### 📝 Interview Answer Template — fill this in now, save to `INTERVIEW_NOTES.md`
+```
+"I implemented a ________ rate limiter backed by ________.
+Each API client gets ________ tokens, replenished at ________ per minute.
+Every request costs ________ token. If the bucket is empty, I return HTTP ________.
+I chose this algorithm over ________ because it allows ________ (hint: think bursts).
+The check costs ________ Redis operations, so overhead per request is under ________."
+```
 
 ### ✅ End of Day
 - Rate limiter blocks requests after quota
@@ -898,14 +1226,26 @@ Implement order dispatch using Redis sorted sets.
 - **Watch:** [Priority Queues Explained — NeetCode](https://www.youtube.com/watch?v=wptevk0bshY)
 - **Docs:** [Redis Sorted Sets](https://redis.io/docs/data-types/sorted-sets/)
 
+### 💡 C++ → Python
+```
+priority_queue<pair<float,int>, vector<...>, greater<...>>  →  heapq module
+```
+`heapq` is a MIN-heap by default (smallest score out first). To simulate a MAX-heap (largest priority first), push NEGATIVE scores:
+```python
+heapq.heappush(pq, (-priority, order_id))
+heapq.heappop(pq)  # returns most negative = originally highest priority
+```
+In DeliverIQ we use Redis **sorted sets** instead (ZADD/ZREVRANGE), which is cleaner for distributed state shared across multiple API instances.
+
 ### 💻 Tasks
 
-Create `app/services/dispatch.py`:
+Create `app/services/` folder:
 ```bash
 mkdir app/services
 touch app/services/__init__.py
 ```
 
+`app/services/dispatch.py`:
 ```python
 # app/services/dispatch.py
 import time
@@ -931,8 +1271,20 @@ def pop_highest_priority() -> int | None:
     return int(order_id)
 ```
 
-In `app/routers/orders.py`, after creating order, call `add_to_dispatch_queue()`.
-Create new endpoint `POST /dispatch` that calls `pop_highest_priority()`.
+In `app/routers/orders.py`, after creating an order, call `add_to_dispatch_queue()`.
+Create a new endpoint `POST /dispatch` that calls `pop_highest_priority()`.
+
+### 🔥 Break It On Purpose
+Change `zrevrange` to `zrange` (drop the 'rev'). Create 3 orders with values 100, 500, 200. Call `POST /dispatch` 3 times. You'll get them in order: 100, 200, 500 — cheapest first. A regular delivery customer gets dispatched before the premium order. That's the bug. Restore `zrevrange`.
+
+### 📝 Interview Answer Template — fill this in now
+```
+"I dispatch orders using a ________ data structure stored in Redis ________ (data type).
+Each order gets a priority score: ________ × 0.4 + ________ × 0.6.
+Higher value + longer wait time = higher priority.
+The dispatch operation is O(________) for insert and O(________) for extract.
+If two orders tie on score, I break ties by ________."
+```
 
 ### ✅ End of Day
 - Create 3 orders with different values → dispatch endpoint returns highest-priority first
@@ -949,6 +1301,9 @@ Find nearby riders without scanning all riders.
 - **Watch:** [Geohashing Explained — System Design Interview](https://www.youtube.com/watch?v=UaYAYrXlBS8) *(10 min)*
 - **Interactive:** [Geohash Explorer](https://geohash.softeng.co/)
 - **Library docs:** [python-geohash](https://github.com/hkwi/python-geohash)
+
+### 💡 C++ → Python
+Geohash is just a spatial hash function — it maps (lat, lon) → string key. It's like `unordered_map` but the keys have a spatial property: nearby locations share a common prefix. `"tdr1yz"` and `"tdr1yx"` are adjacent cells; `"xyz123"` is far away. You're doing O(1) Redis SET lookup by key — same idea as `unordered_map::find()`.
 
 ### 💻 Tasks
 ```bash
@@ -979,6 +1334,17 @@ def find_nearby_riders(lat: float, lon: float) -> list[int]:
 ```
 
 **Why check neighbors?** Orders at cell edges might have closer riders in adjacent cells. **Gold interview talking point.**
+
+### 🔥 Break It On Purpose
+In `find_nearby_riders`, delete `neighbors = geohash.neighbors(cell)` and change `cells_to_check = [cell] + neighbors` to `cells_to_check = [cell]`. Add a rider at exactly lat=28.6139, lon=77.2090. Place an order at lat=28.6140, lon=77.2091 (literally 10 metres away but just across a cell boundary). The dispatch returns no riders. Restore the neighbors line.
+
+### 📝 Interview Answer Template — fill this in now
+```
+"For rider matching, I use ________ instead of computing haversine distance to every rider.
+This encodes (lat, lon) into a ________ string where nearby locations share a ________.
+Lookup is O(________) — I query the home cell plus ________ neighbors to handle boundary cases.
+Without this, matching would be O(________)."
+```
 
 ### ✅ End of Day
 - Adding 5 riders → finding orders correctly returns nearby ones
@@ -1022,10 +1388,13 @@ def transition(current: OrderStatus, target: OrderStatus):
         raise InvalidTransition(f"Cannot go from {current} to {target}")
 ```
 
-Add `PATCH /orders/{id}/status` endpoint that uses this.
+Add a `PATCH /orders/{id}/status` endpoint that uses this.
+
+### 🔥 Break It On Purpose
+Comment out the `if target not in VALID_TRANSITIONS[current]` block entirely. Now PATCH an order directly from PENDING to DELIVERED. It works — an order is "delivered" before any rider was assigned. This is a data-integrity nightmare. Restore the validation.
 
 ### ✅ End of Day
-- Trying to mark DELIVERED → PENDING returns 400 error
+- Trying to mark DELIVERED → PENDING returns a 400 error
 
 ---
 
@@ -1039,8 +1408,9 @@ Build event publishing — we'll upgrade to Kafka in Week 5.
 - **Docs:** [Redis Pub/Sub](https://redis.io/docs/manual/pubsub/)
 
 ### 💻 Tasks
-Publish event when order dispatched:
+Publish an event when an order is dispatched:
 ```python
+import json, time
 redis_client.publish("order.dispatched", json.dumps({
     "order_id": order_id,
     "rider_id": rider_id,
@@ -1048,7 +1418,13 @@ redis_client.publish("order.dispatched", json.dumps({
 }))
 ```
 
-Create a separate script `app/workers/notification_worker.py`:
+Create `app/workers/` folder and a listener script:
+```bash
+mkdir app/workers
+touch app/workers/__init__.py
+```
+
+`app/workers/notification_worker.py`:
 ```python
 import json
 from app.core.redis_client import redis_client
@@ -1063,12 +1439,14 @@ for msg in pubsub.listen():
         print(f"📲 Notify customer: Order {data['order_id']} dispatched to rider {data['rider_id']}")
 ```
 
-Run in separate terminal: `python -m app.workers.notification_worker`.
-Now dispatch an order — see notification log.
+Run in a separate terminal: `python -m app.workers.notification_worker`.
+Now dispatch an order — see the notification log.
+
+🐧 **Ubuntu Note:** Open a second terminal tab with **Ctrl+Shift+T** so you can keep `uvicorn` running in one tab and the worker in another.
 
 ### ✅ End of Day
 - Pub/Sub works
-- You feel the limitation: if worker is off, message is lost (this is why we'll move to Kafka)
+- You feel the limitation: if the worker is off, the message is lost (this is why we move to Kafka)
 
 ---
 
@@ -1107,7 +1485,7 @@ def test_create_order():
     assert response.json()["value"] == 500
 
 def test_invalid_value():
-    response = client.post("/orders", json={"value": -10, ...})
+    response = client.post("/orders", json={"value": -10})
     assert response.status_code == 422  # validation error
 ```
 
@@ -1182,6 +1560,9 @@ class InvalidStateTransition(DeliverIQException): pass
 
 In `main.py`:
 ```python
+from fastapi.responses import JSONResponse
+from app.core.exceptions import OrderNotFound
+
 @app.exception_handler(OrderNotFound)
 async def order_not_found_handler(request, exc):
     return JSONResponse(status_code=404, content={"error": "ORDER_NOT_FOUND", "message": str(exc)})
@@ -1223,7 +1604,7 @@ settings = Settings()
 
 Create `.env`:
 ```
-DATABASE_URL=postgresql://postgres:password@localhost:5432/deliveriq_db
+DATABASE_URL=postgresql://deliveriq_user:password@localhost:5432/deliveriq_db
 REDIS_URL=redis://localhost:6379
 ```
 
@@ -1234,6 +1615,8 @@ REDIS_URL=
 ```
 
 Use `settings.database_url` everywhere instead of hardcoded strings.
+
+🐧 **Ubuntu Note:** To check an env var in your terminal, run `echo $DATABASE_URL`. To set one temporarily for the current shell, run `export DATABASE_URL="postgresql://..."`. `python-dotenv` reads the `.env` file the same way on Ubuntu as anywhere else.
 
 ### ✅ End of Day
 - Zero hardcoded secrets in code
@@ -1250,7 +1633,33 @@ Package your app into a portable container.
 - **Docs:** [Docker Get Started](https://docs.docker.com/get-started/)
 
 ### 💻 Tasks
-Create `Dockerfile` in project root:
+
+**First, install Docker on Ubuntu (if you haven't already):**
+```bash
+# Remove old versions if any
+sudo apt remove docker docker-engine docker.io containerd runc
+
+# Install Docker
+sudo apt update
+sudo apt install ca-certificates curl gnupg lsb-release -y
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+sudo apt install docker-ce docker-ce-cli containerd.io docker-compose-plugin -y
+
+# Run Docker without sudo (IMPORTANT)
+sudo usermod -aG docker $USER
+newgrp docker
+
+# Verify
+docker --version
+docker compose version
+```
+
+🐧 **Ubuntu Note:** If you get `permission denied` on Docker, you need to refresh your group membership. Either run `newgrp docker` in the current terminal, or fully log out and back in. Verify with `groups $USER` — you should see `docker` in the list.
+
+**Create `Dockerfile` in project root:**
 ```dockerfile
 FROM python:3.11-slim
 
@@ -1276,17 +1685,17 @@ docker run -p 8000:8000 --env-file .env deliveriq
 
 ---
 
-## Day 26 — docker-compose for Full Stack
+## Day 26 — Docker Compose for Full Stack
 
 ### 🎯 Goal
 One command starts FastAPI + Postgres + Redis.
 
 ### 📚 Resources
-- **Watch:** [docker-compose Tutorial — TechWorld with Nana](https://www.youtube.com/watch?v=DM65_JyGxCo) *(15 min)*
-- **Docs:** [docker-compose reference](https://docs.docker.com/compose/)
+- **Watch:** [docker compose Tutorial — TechWorld with Nana](https://www.youtube.com/watch?v=DM65_JyGxCo) *(15 min)*
+- **Docs:** [Compose reference](https://docs.docker.com/compose/)
 
 ### 💻 Tasks
-Create `docker-compose.yml`:
+Create `docker-compose.yml` (the file is still named with a hyphen; only the *command* changed to `docker compose`):
 ```yaml
 version: '3.8'
 services:
@@ -1294,7 +1703,7 @@ services:
     build: .
     ports: ["8000:8000"]
     environment:
-      DATABASE_URL: postgresql://postgres:password@db:5432/deliveriq_db
+      DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
       REDIS_URL: redis://redis:6379
     depends_on: [db, redis]
 
@@ -1302,6 +1711,7 @@ services:
     image: postgres:15
     environment:
       POSTGRES_DB: deliveriq_db
+      POSTGRES_USER: deliveriq_user
       POSTGRES_PASSWORD: password
     volumes:
       - pg_data:/var/lib/postgresql/data
@@ -1315,7 +1725,12 @@ volumes:
   pg_data:
 ```
 
-Run: `docker-compose up --build`. Visit `localhost:8000/docs`.
+Run: `docker compose up --build`. Visit `localhost:8000/docs`.
+
+🐧 **Ubuntu Note:** If port 5432 or 6379 says "address already in use", you probably still have the native Postgres/Redis running from Days 10/15. Stop them with `sudo systemctl stop postgresql redis-server` so Compose can use those ports, or find the process with `sudo lsof -i :5432`.
+
+### 🔥 Break It On Purpose
+Remove `depends_on: [db, redis]` from the `api` service. Run `docker compose up`. The API starts before Postgres is ready and crashes with `connection refused`. The `depends_on` is startup ordering. Restore it.
 
 ### ✅ End of Day
 - One command brings up your entire stack
@@ -1393,12 +1808,54 @@ Visit `http://localhost:8089` → start 500 users.
 
 ---
 
+# Before Phase 5: Redis vs Kafka — Read This First
+
+This confuses every beginner. Here's the truth, before you touch Kafka.
+
+### Redis = Fast Memory Storage
+Use Redis for things that need to be **read/written in microseconds**:
+- **Rate limit buckets** — count "how many requests has this user made in the last minute?"
+- **Rider location cache** — store rider GPS coordinates for instant lookup
+- **Geohash → rider sets** — map "which riders are in grid cell xyz?" using Redis Sets
+- **Session data** — temporary user info
+
+Redis stores data in RAM. Lightning fast, but data can be lost if Redis crashes (unless you configure persistence).
+
+### Kafka = Reliable Event Pipeline
+Use Kafka for **events that must NEVER be lost** and may be processed later:
+- **Order created event** — multiple services need to know: notification service, analytics, inventory
+- **Order dispatched event** — trigger driver app push, customer SMS, restaurant alert
+- **Audit logs** — every action stored permanently
+
+Kafka stores events on disk in a log. Slightly slower (milliseconds) but **durable, replayable, scalable**.
+
+### Simple Rule
+- **Need it NOW, can lose it** → Redis
+- **Need it RELIABLY, may process later** → Kafka
+
+### In DeliverIQ:
+| Feature | Tool | Reason |
+|---|---|---|
+| Rate limit counters | Redis | Microsecond reads on every request |
+| Cache rider locations | Redis | Hot data, refreshed every minute |
+| Geohash → rider sets | Redis | Set operations are O(1) |
+| Order dispatched event | **Kafka** | Multiple services consume, can't lose it |
+| Customer notifications | **Kafka** | Async, durable |
+| Analytics events | **Kafka** | Replay history if analytics service crashes |
+
+### Beginner Path
+- **Week 1–4:** Use only Redis (Pub/Sub for events)
+- **Week 5:** Replace Redis Pub/Sub with Kafka
+- This way you UNDERSTAND why Kafka exists before using it
+
+---
+
 # PHASE 5: Kafka + Advanced Features (Days 29–35)
 
-## Day 29 — Kafka Theory
+## Day 29 — Kafka Theory + First Touch
 
 ### 🎯 Goal
-Understand Kafka before touching it.
+Understand Kafka, then immediately use it once (no Python yet) so the theory sticks.
 
 ### 📚 Resources
 - **Watch:** [Kafka in 100 Seconds — Fireship](https://www.youtube.com/watch?v=uvb00oaa3k8) *(2 min)*
@@ -1407,21 +1864,38 @@ Understand Kafka before touching it.
 - **Course (free):** [Confluent Kafka 101](https://developer.confluent.io/learn-kafka/apache-kafka/events/)
 
 ### 💻 Tasks
-**No code today.** Just learn:
+Learn the vocabulary and write a 1-page note in your own words:
 - Topic, Partition, Offset, Producer, Consumer, Consumer Group
 - Why Kafka > Redis Pub/Sub: persistence, replay, scaling
 
-Write a 1-page note in your own words. This goes into your interview prep.
+### Hands-on Kafka preview (15 min)
+*(You'll add the Kafka services to docker-compose.yml properly on Day 30. If they're not there yet, do this preview after Day 30's compose edit.)*
+```bash
+# Bring up Kafka and its UI
+docker compose up zookeeper kafka kafka-ui -d
+
+# Wait 30 seconds for startup, then open:
+# http://localhost:8080
+
+# In Kafka UI:
+# 1. Click "Topics" → "Add a Topic" → name it "test.topic", 1 partition
+# 2. Click into the topic → "Produce Message" → type any text → Send
+# 3. Click "Messages" tab — see your message appear with offset=0
+
+# Congratulations — you just used Kafka without writing a line of code.
+# Tomorrow: do the exact same thing from Python.
+```
 
 ### ✅ End of Day
 - You can explain Kafka in 2 minutes to a beginner
+- You produced and saw one Kafka message in the UI
 
 ---
 
 ## Day 30 — Kafka in docker-compose
 
 ### 🎯 Goal
-Get Kafka running locally.
+Get Kafka running locally as part of your stack.
 
 ### 📚 Resources
 - **Watch:** [Kafka with Docker — Stéphane Maarek](https://www.youtube.com/watch?v=YA1JosJW1XQ)
@@ -1455,7 +1929,7 @@ Add to `docker-compose.yml`:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
 ```
 
-Run `docker-compose up`. Visit `localhost:8080` → Kafka UI.
+Run `docker compose up`. Visit `localhost:8080` → Kafka UI.
 
 ### ✅ End of Day
 - Kafka running, GUI accessible
@@ -1491,7 +1965,7 @@ def publish_event(topic: str, event: dict):
 Replace Redis `publish` calls with `publish_event("order.dispatched", {...})`.
 
 ### ✅ End of Day
-- Events appear in Kafka UI under `order.dispatched` topic
+- Events appear in Kafka UI under the `order.dispatched` topic
 
 ---
 
@@ -1538,7 +2012,7 @@ Run: `python -m app.workers.notification_consumer`.
 Show event-driven architecture with 3 independent consumers.
 
 ### 💻 Tasks
-Create 3 workers, each in own file:
+Create 3 workers, each in its own file:
 - `notification_consumer.py` — group `notifications`
 - `analytics_consumer.py` — group `analytics` (writes to DB)
 - `audit_consumer.py` — group `audit-log` (writes to file)
@@ -1548,8 +2022,17 @@ All consume the same `order.dispatched` topic. Each gets its own copy.
 **This is gold.** In an interview, you say:
 > "I have 3 independent consumers — notifications, analytics, audit — each consuming the same Kafka topic via different consumer groups. They scale and fail independently. That's event-driven architecture."
 
+### 📝 Interview Answer Template — fill this in now
+```
+"I replaced Redis Pub/Sub with Kafka because Pub/Sub is ________ — if the consumer is down, messages are ________.
+Kafka persists events to ________ and allows ________ from any point.
+I have ________ independent consumer groups on the order.dispatched topic:
+________, ________, and ________.
+Each group processes events ________ and can fail without affecting the others."
+```
+
 ### ✅ End of Day
-- 3 separate worker scripts, all reading same topic, doing different things
+- 3 separate worker scripts, all reading the same topic, doing different things
 
 ---
 
@@ -1565,6 +2048,7 @@ Handle duplicate requests safely.
 ### 💻 Tasks
 Add middleware:
 ```python
+import json
 async def idempotency_middleware(request: Request, call_next):
     if request.method != "POST":
         return await call_next(request)
@@ -1585,8 +2069,16 @@ async def idempotency_middleware(request: Request, call_next):
 
 **Pitch this in every Razorpay/PhonePe interview.**
 
+### 📝 Interview Answer Template — fill this in now
+```
+"Idempotency keys solve the problem of ________ due to network retries.
+The client sends a ________ header with a UUID. The server caches the response in Redis for ________.
+On a duplicate request, we return the ________ response instead of processing again.
+This is critical for ________ APIs where charging a customer twice is unacceptable."
+```
+
 ### ✅ End of Day
-- Same `Idempotency-Key` returns same response on retry
+- Same `Idempotency-Key` returns the same response on retry
 
 ---
 
@@ -1604,7 +2096,7 @@ Secure your API.
 pip install python-jose[cryptography] passlib[bcrypt]
 ```
 
-Add `/auth/register`, `/auth/login` endpoints. Protect `/admin/stats` with JWT bearer dependency.
+Add `/auth/register`, `/auth/login` endpoints. Protect `/admin/stats` with a JWT bearer dependency.
 
 ### ✅ End of Week 5
 - ✅ Kafka producer + 3 consumers
@@ -1646,7 +2138,7 @@ Visit `/metrics` — beautiful metrics page.
 ## Day 37 — Grafana Dashboard
 
 ### 🎯 Goal
-Visual dashboard for showpiece screenshot.
+Visual dashboard for a showpiece screenshot.
 
 ### 📚 Resources
 - **Watch:** [Grafana + Prometheus Setup — TechWorld with Nana](https://www.youtube.com/watch?v=h4Sl21AKiDg)
@@ -1675,13 +2167,13 @@ scrape_configs:
       - targets: ['api:8000']
 ```
 
-Login to Grafana (`admin`/`admin`), add Prometheus as data source, build dashboard with:
+Run `docker compose up`. Login to Grafana (`admin`/`admin`), add Prometheus as a data source, and build a dashboard with:
 - Request rate
 - p95/p99 latency
 - Error rate
 - Active orders
 
-**Take SCREENSHOTS.** These go in README.
+**Take SCREENSHOTS.** These go in the README.
 
 ### ✅ End of Day
 - You have a Grafana dashboard screenshot — interview gold
@@ -1695,26 +2187,33 @@ Production-ready health endpoint.
 
 ### 💻 Tasks
 ```python
+from fastapi.responses import JSONResponse
+
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     checks = {}
     try:
         db.execute("SELECT 1")
         checks["db"] = "up"
-    except: checks["db"] = "down"
+    except Exception:
+        checks["db"] = "down"
 
     try:
         redis_client.ping()
         checks["redis"] = "up"
-    except: checks["redis"] = "down"
+    except Exception:
+        checks["redis"] = "down"
 
     all_up = all(v == "up" for v in checks.values())
     status_code = 200 if all_up else 503
-    return JSONResponse(content={"status": "ok" if all_up else "degraded", **checks}, status_code=status_code)
+    return JSONResponse(
+        content={"status": "ok" if all_up else "degraded", **checks},
+        status_code=status_code,
+    )
 ```
 
 ### ✅ End of Day
-- Health check covers DB + Redis + Kafka
+- Health check covers DB + Redis (extend to Kafka if you wish)
 
 ---
 
@@ -1776,6 +2275,8 @@ jobs:
 
 Push → see green CI badge.
 
+🐧 **Ubuntu Note:** The CI runner uses `ubuntu-latest` — the same OS you develop on. So "works on my machine" actually means something here. Nice.
+
 ### ✅ End of Day
 - CI badge in README, tests run on every PR
 
@@ -1793,7 +2294,15 @@ Showpiece front page.
 
 ### 💻 Tasks
 - Draw architecture in Excalidraw, save `architecture.png` in repo
-- Write README with: description, badges, live URL, architecture diagram, quickstart, design decisions, load test results, screenshot of Grafana
+- Write README with: description, badges, live URL, architecture diagram, quickstart, design decisions, load test results, Grafana screenshot
+
+**README quickstart snippet to include:**
+```bash
+git clone https://github.com/you/deliveriq
+cp .env.example .env
+docker compose up --build
+# API at http://localhost:8000/docs
+```
 
 ### ✅ End of Day
 - README looks like a real product page
@@ -1836,32 +2345,299 @@ Link video in README and LinkedIn.
 ### 💻 Tasks
 - Run all 3, fix all warnings
 - Delete dead code
-- Add docstrings to every function
+- Add docstrings to every function:
+  ```python
+  def dispatch_order(order_id: int) -> Rider:
+      """Assign the highest-priority pending order to the nearest available rider.
+
+      Args:
+          order_id: Database ID of the order to dispatch.
+
+      Returns:
+          The Rider object assigned to this order.
+
+      Raises:
+          RiderUnavailableException: If no riders are within the geohash neighborhood.
+      """
+  ```
 - Squash messy commits with `git rebase -i`
+
+### ✅ End of Day
+- Codebase is clean, formatted, type-checked, documented
 
 ---
 
 ## Day 44 — Interview Drills
 
+### 🎯 Goal
+Lock in every answer. You've been filling templates since Day 16 — now consolidate and rehearse.
+
 ### 📚 Resources
 - **Watch:** [System Design Mock Interviews — Hello Interview](https://www.youtube.com/@hello_interview)
 
 ### 💻 Tasks
-- Write answers to all 20 interview questions from your notes
-- Record yourself doing the 2-min pitch
-- Sketch architecture from memory on paper
-- Practice with a friend if possible
+- Open your `INTERVIEW_NOTES.md` (all those filled-in templates from Days 16, 17, 18, 33, 34)
+- Answer the full question bank below out loud, timed
+- Record yourself doing the 2-minute pitch
+- Sketch the architecture from memory on paper in 2 minutes
+
+### The Full 20-Question Bank
+
+**System Design**
+1. **Why FastAPI over Flask/Django?**
+   *Async by default, Pydantic validation, auto-OpenAPI, near-Go performance for I/O-bound work.*
+
+2. **How does your rate limiter work? Why Token Bucket?**
+   *Token Bucket allows burst traffic (good UX) while capping average rate. Implemented as a Redis hash storing tokens + last_refill_time, with lazy refill on each request. O(1) per check.*
+
+3. **Why Redis for the priority queue, not PostgreSQL?**
+   *Sub-ms reads, sorted sets are purpose-built (ZADD/ZREVRANGE). PostgreSQL would need an index scan.*
+
+4. **What happens if Redis dies?**
+   *Fallback: dispatch from PostgreSQL with a latency penalty. Rate limiter fails open with logging.*
+
+5. **How does geohashing work?**
+   *Encodes lat/lon into a base-32 string. Adjacent cells share a prefix. We check the home cell + 8 neighbors for boundary cases.*
+
+6. **Why Kafka over Redis Pub/Sub?**
+   *Pub/Sub is fire-and-forget — if the consumer is down, the message is lost. Kafka persists to disk, allows replay, supports consumer groups for parallel processing, and scales horizontally.*
+
+**DSA**
+7. **Why min-heap for dispatch?**
+   *O(log n) insert/extract vs O(n) scan. Priority is a composite score (value × 0.4 + wait × 0.6).*
+
+8. **Time complexity of your dispatch endpoint end-to-end?**
+   *Rate-limit check: O(1). Pop from sorted set: O(log n). Geohash lookup: O(1). Total: O(log n).*
+
+9. **Two orders with the same priority — what happens?**
+   *Tiebreak by created_at (FIFO). Encode the score as `priority * 1e6 + (max_timestamp - created_at)`.*
+
+10. **At 10M concurrent orders, what breaks first?**
+    *The single-node Redis sorted set. Fix: Redis Cluster sharded by zone_id. Kafka partitions by region.*
+
+**Database**
+11. **Schema design?**
+    *Orders(id, customer_id, restaurant_id, value, status, created_at, ...). Indexes on status, created_at. Audit-log table for state transitions.*
+
+12. **Why PostgreSQL over MongoDB?**
+    *Relational integrity matters here — orders FK to riders, zones. PostgreSQL gives ACID transactions. MongoDB shines for unstructured data.*
+
+13. **How do you handle concurrent dispatch (two requests for the same order)?**
+    *`SELECT ... FOR UPDATE` to lock the row, or atomic Redis ZREM (returns 1 if removed, 0 if already gone). Use the latter — faster.*
+
+**Production**
+14. **How does your CI/CD work?**
+    *GitHub Actions runs pytest + black + flake8 on every PR. Merge to main triggers a Railway deploy. Health check confirms before serving traffic.*
+
+15. **What if your API gets DDoSed?**
+    *Token Bucket blocks per-key. Add Cloudflare in front for L7 protection. Rate-limit by IP at the gateway level too.*
+
+16. **How do you debug a slow endpoint in production?**
+    *Check Grafana p99 latency. Check structured logs by request_id. Profile with Python's cProfile if needed. Add explicit timing logs around the suspect code.*
+
+17. **Idempotency — why and how?**
+    *Network retries cause duplicate POSTs. Client sends an `Idempotency-Key` UUID. Server caches the response in Redis (24h TTL). A repeat key returns the cached response. Critical for payment APIs.*
+
+**Behavioral**
+18. **Hardest part to build?**
+    *Geohash boundary conditions — an order at the edge of a cell needs to check 8 neighbors. Initially I only checked the home cell, and riders 100m away in the next cell weren't matching.*
+
+19. **What would you do differently with more time?**
+    *Add a circuit breaker (Hystrix pattern), distributed tracing with OpenTelemetry, a proper saga pattern for payment integration, and chaos testing with toxiproxy.*
+
+20. **What did you learn?**
+    *Event-driven architecture deeply — Kafka's offset model, consumer groups, partitioning trade-offs. Also production hygiene: structured logs, metrics, health checks.*
+
+### ✅ End of Day
+- You can answer all 20 cold, and deliver the 2-minute pitch from memory
 
 ---
 
 ## Day 45 — Final Buffer
 
 ### 💻 Tasks
+- Fix any last bugs
 - Tag release: `git tag v1.0.0 && git push --tags`
-- Pin repo on GitHub profile
+- Pin the repo on your GitHub profile
 - Update LinkedIn projects section
-- Update resume with project bullets
+- Update resume with the project bullets (see Resume Tips below)
 - **Rest. You did it.**
+
+---
+
+# GitHub Workflow
+
+### Daily Loop
+```bash
+git checkout dev
+git pull
+git checkout -b feature/kafka-consumer
+
+# ... write code, write tests ...
+
+git add -p                    # stage hunks, review what you're committing
+git commit -m "feat: add Kafka consumer for order.dispatched events"
+git push origin feature/kafka-consumer
+
+# Open PR on GitHub → review → merge to dev
+# Every Sunday: merge dev → main
+```
+
+### Commit Message Convention
+| Prefix | When to use |
+|---|---|
+| `feat:` | New feature |
+| `fix:` | Bug fix |
+| `docs:` | Documentation |
+| `test:` | Tests |
+| `refactor:` | Code restructuring |
+| `chore:` | Build/tooling |
+| `perf:` | Performance improvement |
+
+### Branch Structure
+- `main` — always deployable, protected, requires PR
+- `dev` — integration branch
+- `feature/*` — feature work
+- `fix/*` — bug fixes
+
+### Pro Tip
+**Make at least 50+ commits over 45 days.** Recruiters check your GitHub contribution graph. Green squares matter.
+
+---
+
+# Deployment Guide
+
+### Railway (Recommended for Beginners)
+1. **Sign up** at railway.app
+2. **New Project** → **Deploy from GitHub repo**
+3. Railway auto-detects `Dockerfile`
+4. **Add plugins:**
+   - PostgreSQL → auto-sets `DATABASE_URL`
+   - Redis → auto-sets `REDIS_URL`
+5. **For Kafka:** Use [Upstash Kafka](https://upstash.com) free tier
+6. **Set env vars** in Railway dashboard
+7. **Get URL** — share it with everyone
+
+### Render (Alternative)
+- Free Postgres and Redis
+- Slower cold starts than Railway
+- Better for static sites
+
+### Production URL Looks Like
+`https://deliveriq.up.railway.app/docs`
+
+---
+
+# Resume Tips
+
+### Format (place under "Projects" section)
+```
+DeliverIQ — Order Dispatch API   [GitHub] [Live Demo]
+Python · FastAPI · PostgreSQL · Redis · Kafka · Docker
+• Designed a food delivery dispatch system with min-heap priority queue
+  (O(log n)) and geohash-based rider matching (O(1) zone lookup), handling
+  500 concurrent requests at p99 < 50ms.
+• Built a Token Bucket rate limiter in Redis with <1ms overhead per request;
+  reduced abusive traffic by 99% in load tests.
+• Implemented an event-driven architecture with Kafka topics for order
+  lifecycle events, enabling async notifications and decoupled analytics.
+• Added idempotency keys for safe retries; deployed full stack
+  (API + PostgreSQL + Redis + Kafka) via Docker Compose and GitHub
+  Actions CI/CD to Railway.
+```
+
+### Rules
+- ✅ **Quantify everything:** ms, RPS, complexity, %
+- ✅ **Use industry vocabulary:** dispatch, idempotency, event-driven, geohash
+- ✅ **Link GitHub AND live URL**
+- ✅ **Put it under "Projects" not "Experience"**
+- ❌ Don't say "learned" or "explored" — say "built", "designed", "implemented"
+
+---
+
+# How to Present Confidently
+
+### The 2-Minute Pitch (Memorize)
+> "I built DeliverIQ — a backend system that solves the order dispatch problem at companies like Zomato and Uber Eats.
+>
+> The core challenge: given hundreds of incoming orders and available riders, how do you assign them optimally in real time?
+>
+> I implemented a min-heap priority queue where each order gets a score based on value and wait time. For rider matching, I used geohashing — instead of computing distance to every rider, I look up the local grid cell in O(1).
+>
+> The API has a Token Bucket rate limiter in Redis with sub-millisecond overhead, and an event-driven pipeline using Kafka — when an order is dispatched, downstream services (notifications, analytics, audit) consume the event independently.
+>
+> The whole stack runs in Docker Compose, has Prometheus + Grafana for observability, and is deployed on Railway with GitHub Actions CI/CD.
+>
+> What I'm proudest of is that every design decision has a clear reason — I can tell you exactly why I chose Token Bucket over Leaky Bucket, and Kafka over Redis Pub/Sub."
+
+### Do's
+- ✅ **Draw the architecture** on the whiteboard FIRST, then walk through it
+- ✅ **Lead with the problem**, not the tech
+- ✅ **Quote concrete numbers:** "500 RPS, p99 of 43ms"
+- ✅ **Proactively mention trade-offs:** "I chose X, but Y would be better at scale because..."
+- ✅ **Have one war story:** the bug that taught you something (your geohash boundary bug is perfect)
+
+### Don'ts
+- ❌ Don't say "I followed a tutorial"
+- ❌ Don't apologize for missing features
+- ❌ Don't list tech alphabetically — connect them: "FastAPI handles requests, Redis caches hot data, Kafka handles events"
+- ❌ Don't go over 2 minutes without a question — pause and ask "should I go deeper on any part?"
+
+### Body Language
+- Stand if possible (energy + confidence)
+- Smile when you mention something you're proud of
+- Use your hands to draw boxes in the air when explaining architecture
+
+---
+
+# Final Polishing Checklist
+
+### Code Quality
+- [ ] No hardcoded secrets (check with `git log -p | grep -i password`)
+- [ ] All functions have docstrings
+- [ ] No dead code or commented-out blocks
+- [ ] `black` and `flake8` pass with zero warnings
+- [ ] `mypy` passes
+- [ ] `pip freeze > requirements.txt` (pinned versions)
+- [ ] Test coverage ≥ 60%
+
+### GitHub
+- [ ] README has: description, badges, live URL, architecture diagram, quickstart, design decisions
+- [ ] At least 50 meaningful commits
+- [ ] CI badge showing passing tests
+- [ ] `.env.example` present, `.env` in `.gitignore`
+- [ ] Tagged release `v1.0.0`
+- [ ] Loom demo video linked
+- [ ] Repo pinned on profile
+
+### Deployment
+- [ ] Live URL works at `/docs` (Swagger UI)
+- [ ] `GET /health` returns DB + Redis + Kafka status
+- [ ] App auto-restarts on crash
+- [ ] HTTPS enabled (Railway gives this free)
+- [ ] Grafana dashboard screenshot in README
+
+### Interview Readiness
+- [ ] Can explain every file in the codebase
+- [ ] Know the Big-O of every algorithm
+- [ ] Have an answer for "what breaks at 10x scale"
+- [ ] Have an answer for "what's next"
+- [ ] Can sketch the architecture from memory in 2 mins
+- [ ] 2-minute pitch memorized
+- [ ] 5 war stories ready (bugs, design choices, trade-offs)
+
+---
+
+# Common Pitfalls to Avoid
+
+1. **Tutorial Hell** — Don't watch 10 hours of Kafka videos. Read docs, build immediately.
+2. **Refactoring too early** — Make it work first. Refactor in Week 7 (Day 43).
+3. **Skipping tests** — Without tests, your "done" features will silently break.
+4. **Hardcoding secrets** — Never. Use `.env` from Day 24 (and `.gitignore` from Day 4).
+5. **Big commits** — Commit small and often. One commit = one logical change.
+6. **Ignoring errors** — Read every error message. Search the exact text. (→ See Stuck Protocol)
+7. **Not asking for help** — Stuck >45 min? Ask Claude, ChatGPT, Stack Overflow.
+8. **Comparing to others** — Your only competition is yesterday-you.
 
 ---
 
@@ -1890,10 +2666,14 @@ Link video in README and LinkedIn.
 | Pydantic | https://docs.pydantic.dev |
 | Pytest | https://docs.pytest.org |
 
+## Books (Optional, if time)
+- "Designing Data-Intensive Applications" — Martin Kleppmann (reference, not cover-to-cover)
+- "Fluent Python" — Luciano Ramalho (Python deep dive)
+
 ## When Stuck
 1. **Read the exact error message** (90% of the time it tells you the fix)
 2. **Google the exact error**
-3. **Ask Claude/ChatGPT** with: error + relevant code + what you tried
+3. **Ask Claude/ChatGPT** with: error + relevant code + what you tried (use the Stuck Protocol format)
 4. **Stack Overflow** for tricky ones
 5. **Discord:** [FastAPI Discord](https://discord.gg/VQjSZaeJmf), [Python Discord](https://pythondiscord.com)
 
@@ -1902,11 +2682,27 @@ Link video in README and LinkedIn.
 # Final Sanity Check
 
 Before you start Day 1, ensure:
-- [ ] You have a Windows/Mac/Linux laptop with ~10GB free disk space
+- [ ] You're on Ubuntu with ~10GB free disk space (Day 0 confirms this)
 - [ ] You can dedicate 3–4 hours daily (no exceptions for 45 days)
 - [ ] You have a GitHub account
 - [ ] You're emotionally ready to be confused — that's the LEARNING part
 
-**Don't read this whole doc again.** Open Day 1. Start.
+**Don't read this whole doc again.** Open Day 0, then Day 1. Start.
+
+---
+
+# Closing Words
+
+This roadmap is comprehensive because **your goal is comprehensive** — beating 90% of candidates at top product companies. Three things to remember:
+
+1. **Discipline > Motivation.** Show up daily. Even 1 hour beats 8 hours once a week.
+2. **Build > Watch.** Every concept you learn, immediately use it in DeliverIQ.
+3. **Depth > Breadth.** Knowing Kafka deeply beats knowing 10 frameworks superficially.
+
+You're a Codeforces Specialist and LeetCode Knight — the algorithmic muscle is already there. This project simply wraps that muscle in the production skin interviewers want to see: APIs, databases, caching, queues, events, deployment.
+
+On Day 45, you'll have something rare: a project you can defend in any technical interview because every line came from your fingers.
+
+**Now stop reading. Open the terminal (Ctrl+Alt+T). Start Day 0.**
 
 🚀 *See you on Day 45.*
