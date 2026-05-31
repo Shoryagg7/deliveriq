@@ -1201,7 +1201,7 @@ You'll see `200` for the first ~100, then `429` after the bucket empties. **MAGI
 
 ### 🔥 Break It On Purpose
 Delete the `redis_client.expire(bucket_key, 120)` line. Restart the server. Make 110 requests (you'll get 429 after 100 — good). Now wait 3 minutes and make 10 more requests. They should succeed IF the TTL was working. But they fail — the bucket is permanently empty. The expire line is what allows recovery. Now restore it.
-
+### touch INTERVIEW_NOTES.md
 ### 📝 Interview Answer Template — fill this in now, save to `INTERVIEW_NOTES.md`
 ```
 "I implemented a ________ rate limiter backed by ________.
@@ -2064,6 +2064,7 @@ async def idempotency_middleware(request: Request, call_next):
     response = await call_next(request)
     # Cache successful responses for 24h
     redis_client.setex(f"idempotency:{key}", 86400, response.body.decode())
+    # FastAPI's Response object from call_next doesn't expose .body directly — you need to read it with await response.body().
     return response
 ```
 
