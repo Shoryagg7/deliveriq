@@ -53,6 +53,8 @@ class Rider:
 # Test the class
 r1 = Rider(1, "Suresh", 28.61, 77.20)
 r2 = Rider(2, "Ramesh", 28.63, 77.22)
+r3 = Rider(3, "Ritu", 28.65, 77.25)
+
 
 r1.assign_order(101)
 r1.assign_order(102)   # should fail — already busy
@@ -84,5 +86,10 @@ def assign_or_raise(rider: Rider, order_id: int):
 # Test exceptions
 try:
     assign_or_raise(r2, 999)   # r2 is busy — should raise
+except RiderUnavailableError as e:
+    print(f"Caught exception: {e}")
+
+try:
+    assign_or_raise(r3, 999)   # r3 is free — should succeed
 except RiderUnavailableError as e:
     print(f"Caught exception: {e}")
