@@ -5,3 +5,4 @@ print(f"Welcome to {name}!")
 foods = ["pizza", "burger", "biryani"]
 for f in foods:
     print(f"Delivering: {f}")
+
