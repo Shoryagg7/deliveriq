@@ -70,9 +70,3 @@ class cat(pet):
         self.color = color
     def speak(self):
         print(f"{self.name} says Meow!")
-
-
-
-c1 = cat("Whiskers", 3, "black")
-c1.show()   # inherited method
-c1.speak()  # cat's own method
