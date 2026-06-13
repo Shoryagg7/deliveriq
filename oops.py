@@ -16,7 +16,7 @@
 # dogs = [Dog("Fido", 3), Dog("Rex", 5)]
 # print(dogs[0].get_age())
 
-#q2
+# q2
 # class students:
 #     def __init__(self,name,age,grade):
 #         self.name = name
@@ -57,17 +57,68 @@
 
 # inheritance
 
-class pet:
-    def __init__(self,name,age):
-        self.name = name
-        self.age = age
-    def show(self):
-        print(f"{self.name} is {self.age} years old.")
+# class pet:
+#     def __init__(self,name,age):
+#         self.name = name
+#         self.age = age
+#     def show(self):
+#         print(f"{self.name} is {self.age} years old.")
 
-class cat(pet):
-    def __init__(self,name,age,color):
-        super().__init__(name,age)
-        self.color = color
-    def speak(self):
-        print(f"{self.name} says Meow!")
+# class cat(pet):
+#     def __init__(self,name,age,color):
+#         super().__init__(name,age)    #need to call the parent class constructor to initialize the inherited attributes
+#         self.color = color
+#     def speak(self):
+#         print(f"{self.name} says Meow!")
 
+# class fish(pet):
+#     def __init__(self,name,age,water_type):
+#         super().__init__(name,age)
+#         self.water_type = water_type
+#     def speak(self):
+#         print(f"{self.name} says Blub!")
+
+# pet1 = cat("Whiskers", 3, "black")
+# pet2 = fish("Nemo", 1, "saltwater")
+# pet1.show()
+# pet1.speak()
+# pet2.show()
+# pet2.speak()
+
+
+# class person:
+#     number_of_people = 0
+
+#     def __init__(self, name):
+#         self.name = name
+
+
+# p1 = person("Alice")
+# p2 = person("Bob")
+# p1.number_of_people += 1
+# person.number_of_people += 10
+# print(p1.number_of_people)
+# print(person.number_of_people)
+#Output: 2 why??
+# because number_of_people is a class variable,
+# it is shared among all instances of the class.
+# When you increment person.number_of_people by 2, it updates the class variable for all instances.
+# However, when you increment p1.number_of_people by 1, it creates an instance variable for p1 that shadows the class variable.
+# Therefore, the output of person.number_of_people remains 2, while p1.number_of_people becomes 3.
+#but if you print p2.number_of_people, it will still be 2, because p2 does not have its own instance variable for number_of_people.
+
+class math:
+    # @staticmethod
+    def add(a, b):
+        return a + b
+
+    @staticmethod
+    def multiply(a, b):
+        return a * b
+print(math.add(3, 5))       # Output: 8
+print(math.multiply(3, 5))  # Output: 15
+#explanation: The add and multiply methods are defined as static methods using the @staticmethod decorator.
+# This means that they can be called directly on the class without needing to create an instance of the class.
+# In this example, we call math.add(3, 5) and math.multiply(3, 5) to perform addition and multiplication, respectively.
+# but without static method its giving same result because we are calling the method directly on the class,
+# which is allowed in Python even without the @staticmethod decorator.
