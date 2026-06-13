@@ -95,8 +95,8 @@
 
 # p1 = person("Alice")
 # p2 = person("Bob")
+# person.number_of_people += 2
 # p1.number_of_people += 1
-# person.number_of_people += 10
 # print(p1.number_of_people)
 # print(person.number_of_people)
 #Output: 2 why??
@@ -107,18 +107,25 @@
 # Therefore, the output of person.number_of_people remains 2, while p1.number_of_people becomes 3.
 #but if you print p2.number_of_people, it will still be 2, because p2 does not have its own instance variable for number_of_people.
 
+# Whereas , in C++, a static member is truly one single memory location — there's no way for p1.number_of_people to "shadow" it.
+# p1.number_of_people += 1 modifies the same static variable, so both prints show 3.
+
 class math:
-    # @staticmethod
+    @staticmethod
     def add(a, b):
         return a + b
 
     @staticmethod
     def multiply(a, b):
         return a * b
-print(math.add(3, 5))       # Output: 8
-print(math.multiply(3, 5))  # Output: 15
+# print(math.add(3, 5))       # Output: 8
+# print(math.multiply(3, 5))  # Output: 15
 #explanation: The add and multiply methods are defined as static methods using the @staticmethod decorator.
 # This means that they can be called directly on the class without needing to create an instance of the class.
 # In this example, we call math.add(3, 5) and math.multiply(3, 5) to perform addition and multiplication, respectively.
 # but without static method its giving same result because we are calling the method directly on the class,
 # which is allowed in Python even without the @staticmethod decorator.
+# but if used like m = math() and then m.add(3, 5) it will work only if add is a static method, otherwise it will give an error.
+# m = math()
+# print(m.add(3, 5))
+# print(m.multiply(3, 5))
