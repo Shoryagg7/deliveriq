@@ -5,7 +5,7 @@
 > Built with FastAPI · PostgreSQL · Redis · Docker.
 
 ## Learning Plan
-Following a structured 45-day roadmap → [View Plan](docs/PLAN.md)
+Following a structured 45-day roadmap → [View Plan](docs/PLAN2.md)
 
 ## Stack
 - Python · FastAPI
