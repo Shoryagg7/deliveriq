@@ -31,8 +31,12 @@ Some days also have:
 **One-line pitch:**
 > A production-grade REST API that dispatches food delivery orders to riders using priority queues, geohashing, rate limiting, and event streaming — built with FastAPI, Redis, Kafka, PostgreSQL, and Docker.
 
+**The differentiator (your answer to "how is this different from Swiggy?"):**
+> Dispatch is **fairness-aware**. Among riders within a bounded distance band Δ of the nearest, it assigns to the one with the fewest orders today — balancing rider earnings without breaching delivery SLA. This reframes naive greedy-nearest as a **bounded constrained-assignment problem**, and gives an honest social-impact answer: fairer earnings distribution for gig riders.
+
 **Why interviewers will love it:**
 - Uber/Zomato/Swiggy literally have teams building exactly this
+- **Not a clone — the fairness-banded dispatch is a defensible design choice that's yours**
 - Razorpay/PhonePe care about rate limiting, idempotency, webhooks (all included)
 - Demonstrates 5+ system design concepts in ONE codebase
 - Pure backend = no frontend complexity wasting your time
@@ -1201,7 +1205,7 @@ You'll see `200` for the first ~100, then `429` after the bucket empties. **MAGI
 
 ### 🔥 Break It On Purpose
 Delete the `redis_client.expire(bucket_key, 120)` line. Restart the server. Make 110 requests (you'll get 429 after 100 — good). Now wait 3 minutes and make 10 more requests. They should succeed IF the TTL was working. But they fail — the bucket is permanently empty. The expire line is what allows recovery. Now restore it.
-### touch INTERVIEW_NOTES.md
+
 ### 📝 Interview Answer Template — fill this in now, save to `INTERVIEW_NOTES.md`
 ```
 "I implemented a ________ rate limiter backed by ________.
@@ -1335,15 +1339,61 @@ def find_nearby_riders(lat: float, lon: float) -> list[int]:
 
 **Why check neighbors?** Orders at cell edges might have closer riders in adjacent cells. **Gold interview talking point.**
 
+### 💻 Tasks (continued) — Fairness-Banded Rider Selection
+
+`find_nearby_riders` gives you the *candidate set*. Now pick ONE — but not just the nearest. Naive nearest-rider starves some riders and overloads others. Instead: among riders within a band Δ of the closest, assign to whoever has the **fewest orders today**. Fairness is a tiebreaker *inside* a distance band — never an override (or you'd send a far rider and deliver cold food).
+
+Add to `app/services/geohash_service.py`:
+```python
+import math, time
+
+def _haversine(lat1, lon1, lat2, lon2) -> float:
+    R = 6_371_000  # metres
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlmb/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
+
+def select_rider(order_lat: float, order_lon: float, band_m: float = 500) -> int | None:
+    candidates = find_nearby_riders(order_lat, order_lon)
+    if not candidates:
+        return None
+    scored = []
+    for rid in candidates:
+        loc = redis_client.hgetall(f"rider:{rid}:loc")
+        if not loc:
+            continue
+        dist = _haversine(order_lat, order_lon, float(loc["lat"]), float(loc["lon"]))
+        orders_today = int(redis_client.hget(f"rider:{rid}", "orders_today") or 0)
+        scored.append((rid, dist, orders_today))
+    if not scored:
+        return None
+    d_min = min(s[1] for s in scored)
+    feasible = [s for s in scored if s[1] <= d_min + band_m]
+    feasible.sort(key=lambda s: (s[2], s[1]))   # fewest orders, then nearest
+    chosen = feasible[0][0]
+    redis_client.hincrby(f"rider:{chosen}", "orders_today", 1)
+    redis_client.hset(f"rider:{chosen}", "last_assigned_at", int(time.time()))
+    return chosen
+```
+> **Heap framing for the interview:** the selection is a min-heap on the composite key `(orders_today, distance)` over the feasible band — greedy on a composite key, O(k log k) on the small candidate set k, not O(n) over all riders.
+
+> **Reset note:** `orders_today` needs a daily reset — a midnight job, or store it as `rider:{id}:orders:{YYYY-MM-DD}` with a 48h TTL. Mention this if asked; it shows you thought about state lifecycle.
+
 ### 🔥 Break It On Purpose
-In `find_nearby_riders`, delete `neighbors = geohash.neighbors(cell)` and change `cells_to_check = [cell] + neighbors` to `cells_to_check = [cell]`. Add a rider at exactly lat=28.6139, lon=77.2090. Place an order at lat=28.6140, lon=77.2091 (literally 10 metres away but just across a cell boundary). The dispatch returns no riders. Restore the neighbors line.
+**(a) Boundary bug:** In `find_nearby_riders`, delete `neighbors = geohash.neighbors(cell)` and change `cells_to_check = [cell] + neighbors` to `cells_to_check = [cell]`. Add a rider at exactly lat=28.6139, lon=77.2090. Place an order at lat=28.6140, lon=77.2091 (literally 10 metres away but just across a cell boundary). The dispatch returns no riders. Restore the neighbors line.
+
+**(b) Fairness vs SLA:** Set `band_m = 50000` in `select_rider`. Add two riders — one 50 m away with 10 orders today, one 4 km away with 0 orders. Dispatch. The far, idle rider wins → cold food. This is the exact failure an interviewer probes. Drop `band_m` back to 500 and watch the near rider win. **You just proved you understood the tradeoff — that's the whole point of the feature.**
 
 ### 📝 Interview Answer Template — fill this in now
 ```
 "For rider matching, I use ________ instead of computing haversine distance to every rider.
 This encodes (lat, lon) into a ________ string where nearby locations share a ________.
 Lookup is O(________) — I query the home cell plus ________ neighbors to handle boundary cases.
-Without this, matching would be O(________)."
+Without this, matching would be O(________).
+To pick the final rider I don't just take the nearest — among riders within a ________ m band of the closest, I assign the one with the fewest ________, which balances rider ________ without hurting delivery ________.
+This reframes greedy-nearest as a ________ problem."
 ```
 
 ### ✅ End of Day
@@ -2064,7 +2114,6 @@ async def idempotency_middleware(request: Request, call_next):
     response = await call_next(request)
     # Cache successful responses for 24h
     redis_client.setex(f"idempotency:{key}", 86400, response.body.decode())
-    # FastAPI's Response object from call_next doesn't expose .body directly — you need to read it with await response.body().
     return response
 ```
 
@@ -2449,6 +2498,16 @@ Lock in every answer. You've been filling templates since Day 16 — now consoli
 20. **What did you learn?**
     *Event-driven architecture deeply — Kafka's offset model, consumer groups, partitioning trade-offs. Also production hygiene: structured logs, metrics, health checks.*
 
+**Design / Differentiation**
+21. **How is this different from a real Swiggy/Zomato dispatch?**
+    *Theirs optimizes pure ETA. Mine adds a bounded fairness constraint: within a distance band Δ of the nearest rider, I assign to whoever has the fewest orders today. Greedy-nearest reframed as a constrained assignment problem.*
+
+22. **What real problem does the fairness band solve?**
+    *Naive nearest-rider starves some riders and overloads others — a real gig-economy issue. Banding spreads earnings more evenly while Δ guarantees I never trade away delivery SLA. Honest social-impact angle, no fabrication.*
+
+23. **Why a band instead of a single weighted score (α·dist + β·fairness)?**
+    *A blended score can silently send a far rider when β is high — cold food. The band makes the SLA guarantee explicit and tunable: fairness only operates inside Δ. Easier to reason about and defend.*
+
 ### ✅ End of Day
 - You can answer all 20 cold, and deliver the 2-minute pitch from memory
 
@@ -2538,6 +2597,9 @@ Python · FastAPI · PostgreSQL · Redis · Kafka · Docker
 • Designed a food delivery dispatch system with min-heap priority queue
   (O(log n)) and geohash-based rider matching (O(1) zone lookup), handling
   500 concurrent requests at p99 < 50ms.
+• Built a fairness-aware rider assignment that balances rider earnings within
+  a bounded distance band — reframing greedy-nearest as a constrained
+  assignment problem without breaching delivery SLA.
 • Built a Token Bucket rate limiter in Redis with <1ms overhead per request;
   reduced abusive traffic by 99% in load tests.
 • Implemented an event-driven architecture with Kafka topics for order
@@ -2564,6 +2626,8 @@ Python · FastAPI · PostgreSQL · Redis · Kafka · Docker
 > The core challenge: given hundreds of incoming orders and available riders, how do you assign them optimally in real time?
 >
 > I implemented a min-heap priority queue where each order gets a score based on value and wait time. For rider matching, I used geohashing — instead of computing distance to every rider, I look up the local grid cell in O(1).
+>
+> One thing that's mine: dispatch is fairness-aware — among riders within a distance band of the nearest, I assign to whoever has the fewest orders today, so earnings stay balanced without delivering cold food.
 >
 > The API has a Token Bucket rate limiter in Redis with sub-millisecond overhead, and an event-driven pipeline using Kafka — when an order is dispatched, downstream services (notifications, analytics, audit) consume the event independently.
 >
@@ -2700,7 +2764,7 @@ This roadmap is comprehensive because **your goal is comprehensive** — beating
 2. **Build > Watch.** Every concept you learn, immediately use it in DeliverIQ.
 3. **Depth > Breadth.** Knowing Kafka deeply beats knowing 10 frameworks superficially.
 
-You're a Codeforces Expert and LeetCode Knight — the algorithmic muscle is already there. This project simply wraps that muscle in the production skin interviewers want to see: APIs, databases, caching, queues, events, deployment.
+You're a Codeforces Specialist and LeetCode Knight — the algorithmic muscle is already there. This project simply wraps that muscle in the production skin interviewers want to see: APIs, databases, caching, queues, events, deployment.
 
 On Day 45, you'll have something rare: a project you can defend in any technical interview because every line came from your fingers.
 
