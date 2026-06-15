@@ -43,7 +43,7 @@ flowchart TD
 ```
 
 ## Learning Plan
-Following a structured 45-day roadmap → [View Plan](docs/PLAN2.md)
+Following a structured 45-day roadmap → [View Plan](docs/PLAN.md)
 
 ## Stack
 - Python · FastAPI
