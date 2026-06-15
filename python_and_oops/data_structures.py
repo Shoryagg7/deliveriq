@@ -51,67 +51,68 @@ orders = [
 # PART 2: Comprehensions — Python's killer feature
 # ─────────────────────────────────────────────
 
-print("\n=== LIST COMPREHENSIONS ===")
-# Syntax: [expression  for item in iterable  if condition]
-#          ^what to    ^loop                  ^filter
-#           keep
+# print("\n=== LIST COMPREHENSIONS ===")
+# # Syntax: [expression  for item in iterable  if condition]
+# #          ^what to    ^loop                  ^filter
+# #           keep
 
-# Get all pending order IDs
-# C++ equivalent:
-#   vector<int> pending_ids;
-#   for (auto& o : orders)
-#       if (o["status"] == "PENDING") pending_ids.push_back(o["id"]);
+# # Get all pending order IDs
+# # C++ equivalent:
+# #   vector<int> pending_ids;
+# #   for (auto& o : orders)
+# #       if (o["status"] == "PENDING") pending_ids.push_back(o["id"]);
 
-pending_ids = [o["id"] for o in orders if o["status"] == "PENDING"]
-print(f"Pending IDs: {pending_ids}")           # [1, 3]
+# pending_ids = [o["id"] for o in orders if o["status"] == "PENDING"]
+# print(f"Pending IDs: {pending_ids}")           # [1, 3]
 
-# Get values of all pending orders
-pending_values = [o["value"] for o in orders if o["status"] == "PENDING"]
-print(f"Pending values: {pending_values}")     # [250, 450]
+# # Get values of all pending orders
+# pending_values = [o["value"] for o in orders if o["status"] == "PENDING"]
+# print(f"Pending values: {pending_values}")     # [250, 450]
 
-# Transform: add priority score to every order
+# # Transform: add priority score to every order
 def calculate_priority(value: float, wait: int = 0) -> float:
     return value * 0.4 + wait * 0.6
 
-scored = [
-    {**o, "priority": calculate_priority(o["value"])}
-    for o in orders
-]
-# {**o, "priority": ...} means: copy all keys from o, then add "priority"
-# C++ equivalent: structured binding + insert
-print(f"First scored order: {scored[0]}")
+# scored = [
+#     {**o, "priority": calculate_priority(o["value"])}
+#     for o in orders
+# ]
+# # {**o, "priority": ...} means: copy all keys from o, then add "priority"
+# # C++ equivalent: structured binding + insert
+# print(f"First scored order: {scored[0]}")
 
 
-print("\n=== DICT COMPREHENSIONS ===")
-# Build a lookup map: order_id → order value
-# C++ equivalent:
-#   unordered_map<int,float> order_values;
-#   for (auto& o : orders) order_values[o["id"]] = o["value"];
-order_values = {o["id"]: o["value"] for o in orders}
-print(f"Order values map: {order_values}")
-print(f"Value of order 3: {order_values[3]}")  # O(1) lookup
+# print("\n=== DICT COMPREHENSIONS ===")
+# # Build a lookup map: order_id → order value
+# # C++ equivalent:
+# #   unordered_map<int,float> order_values;
+# #   for (auto& o : orders) order_values[o["id"]] = o["value"];
+# order_values = {o["id"]: o["value"] for o in orders}
+# print(f"Order values map: {order_values}")
+# print(f"Value of order 3: {order_values[3]}")  # O(1) lookup
 
-# Build status groups: status → list of order IDs
-# This is groupBy — you'll use this pattern in analytics endpoints
-from collections import defaultdict
-by_status = defaultdict(list)
-for o in orders:
-    by_status[o["status"]].append(o["id"])
-print(f"By status: {dict(by_status)}")
+# # Build status groups: status → list of order IDs
+# # This is groupBy — you'll use this pattern in analytics endpoints
+# from collections import defaultdict  # noqa: E402
+
+# by_status = defaultdict(list)
+# for o in orders:
+#     by_status[o["status"]].append(o["id"])
+# print(f"By status: {dict(by_status)}")
 
 
-print("\n=== SET COMPREHENSIONS ===")
-# Get unique customer IDs who have pending orders
-# C++ equivalent: unordered_set<int>
-customers_with_pending = {o["customer_id"] for o in orders if o["status"] == "PENDING"}
-print(f"Customers with pending orders: {customers_with_pending}")
+# print("\n=== SET COMPREHENSIONS ===")
+# # Get unique customer IDs who have pending orders
+# # C++ equivalent: unordered_set<int>
+# customers_with_pending = {o["customer_id"] for o in orders if o["status"] == "PENDING"}
+# print(f"Customers with pending orders: {customers_with_pending}")
 
-# Set operations — useful for rider availability checks
-all_customers    = {o["customer_id"] for o in orders}
-active_customers = {o["customer_id"] for o in orders if o["status"] != "CANCELLED"}
-print(f"All: {all_customers}")
-print(f"Active: {active_customers}")
-print(f"Only cancelled: {all_customers - active_customers}")  # set difference
+# # Set operations — useful for rider availability checks
+# all_customers    = {o["customer_id"] for o in orders}
+# active_customers = {o["customer_id"] for o in orders if o["status"] != "CANCELLED"}
+# print(f"All: {all_customers}")
+# print(f"Active: {active_customers}")
+# print(f"Only cancelled: {all_customers - active_customers}")  # set difference
 
 # ─────────────────────────────────────────────
 # PART 3: Sorting + Aggregation + any/all
@@ -121,21 +122,16 @@ print("\n=== SORTING ===")
 
 # Sort by value ascending — like sort() with custom comparator
 by_value_asc = sorted(orders, key=lambda o: o["value"])
-print("Cheapest first:", [o["id"] for o in by_value_asc])
-
+print([f"{o['id']}: {o['value']}" for o in by_value_asc])
 # Sort by value descending — most expensive first
 by_value_desc = sorted(orders, key=lambda o: o["value"], reverse=True)
-print("Most expensive first:", [o["id"] for o in by_value_desc])
+print([f"{o['id']}: {o['value']}" for o in by_value_desc])
 
 # Sort by priority score (value × 0.4 + wait × 0.6)
 # This is exactly what Redis sorted sets do automatically on Day 17
-by_priority = sorted(
-    orders,
-    key=lambda o: calculate_priority(o["value"]),
-    reverse=True
-)
-print("By priority:", [o["id"] for o in by_priority])
-
+by_priority = sorted(orders,key=lambda o: calculate_priority(o["value"]),reverse=True)
+print("By priority:")
+print([f"{o['id']}: {calculate_priority(o['value'])}" for o in by_priority])
 # lambda is an anonymous function — like C++ lambda:
 # C++:    [](auto& o) { return o["value"]; }
 # Python: lambda o: o["value"]
@@ -153,6 +149,7 @@ print(f"Average order value: ₹{avg_value:.2f}")   # :.2f = 2 decimal places
 
 max_order = max(orders, key=lambda o: o["value"])
 min_order = min(orders, key=lambda o: o["value"])
+print(max_order)
 print(f"Highest value order: #{max_order['id']} (₹{max_order['value']})")
 print(f"Lowest value order:  #{min_order['id']} (₹{min_order['value']})")
 
@@ -175,4 +172,5 @@ batch = [
     {"id": 11, "value": 0,   "status": "PENDING", "customer_id": 202},  # invalid!
 ]
 all_valid = all(o["value"] > 0 for o in batch)
+print(all_valid)                                   # False
 print(f"Batch all valid? {all_valid}")             # False — catches the zero-value order
