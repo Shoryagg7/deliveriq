@@ -1,3 +1,5 @@
+from enum import Enum
+
 from fastapi import FastAPI, HTTPException
 
 app = FastAPI(title="DeliverIQ")
@@ -15,7 +17,6 @@ def get_order(order_id: int):
         raise HTTPException(status_code=404, detail="Order not found")
     return orders_db[order_id]
 
-from enum import Enum
 
 
 class OrderStatus(str, Enum):
