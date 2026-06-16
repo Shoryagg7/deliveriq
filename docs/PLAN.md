@@ -642,6 +642,8 @@ Build dynamic endpoints that take inputs.
 ### 💻 Tasks
 Update `app/main.py`:
 ```python
+from enum import Enum
+
 from fastapi import FastAPI, HTTPException
 
 app = FastAPI(title="DeliverIQ")
@@ -658,11 +660,21 @@ def get_order(order_id: int):
     if order_id not in orders_db:
         raise HTTPException(status_code=404, detail="Order not found")
     return orders_db[order_id]
+
+
+
+class OrderStatus(str, Enum):
+    PENDING = "PENDING"
+    DELIVERED = "DELIVERED"
+    # add the rest as your state machine grows: ASSIGNED, CANCELLED, ...
+
+
 @app.get("/orders")
-def list_orders(status: str | None = None):
+def list_orders(status: OrderStatus | None = None):
     if status:
-        return [o for o in orders_db.values() if o["status"] == status]
+        return [o for o in orders_db.values() if o["status"] == status.value]
     return list(orders_db.values())
+
 
 ```
 
