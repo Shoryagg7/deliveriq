@@ -1,32 +1,27 @@
-from enum import Enum
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
+
+from app.schemas.order import OrderCreate, OrderResponse
 
 app = FastAPI(title="DeliverIQ")
-
-# Fake in-memory database for now
-orders_db = {
-    1: {"id": 1, "value": 250, "status": "PENDING"},
-    2: {"id": 2, "value": 800, "status": "DELIVERED"},
-}
+orders_db = {}
+next_id = 1
 
 
-@app.get("/orders/{order_id}")
-def get_order(order_id: int):
-    if order_id not in orders_db:
-        raise HTTPException(status_code=404, detail="Order not found")
-    return orders_db[order_id]
+@app.post("/orders", response_model=OrderResponse, status_code=201)
+def create_order(order: OrderCreate):
+    global next_id
+    new_order = {
+        "id": next_id,
+        "customer_id": order.customer_id,
+        "restaurant_id": order.restaurant_id,  # NOT in OrderResponse
+        "value": order.value,
+        "status": "PENDING",
+        "created_at": datetime.now(timezone.utc),
+        "internal_payout_key": "rider-secret-xyz",  # NOT in OrderResponse
+    }
+    orders_db[next_id] = new_order
+    next_id += 1
+    return new_order  # we return EVERYTHING — watch what comes out
 
-
-
-class OrderStatus(str, Enum):
-    PENDING = "PENDING"
-    DELIVERED = "DELIVERED"
-    # add the rest as your state machine grows: ASSIGNED, CANCELLED, ...
-
-
-@app.get("/orders")
-def list_orders(status: OrderStatus | None = None):
-    if status:
-        return [o for o in orders_db.values() if o["status"] == status.value]
-    return list(orders_db.values())
