@@ -15,11 +15,9 @@ def create_order(order: OrderCreate):
     new_order = {
         "id": next_id,
         "customer_id": order.customer_id,
-        "restaurant_id": order.restaurant_id,  # NOT in OrderResponse
         "value": order.value,
         "status": "PENDING",
-        "created_at": datetime.now(timezone.utc),
-        "internal_payout_key": "rider-secret-xyz",  # NOT in OrderResponse
+        "created_at": datetime.now(timezone.utc)
     }
     orders_db[next_id] = new_order
     next_id += 1
