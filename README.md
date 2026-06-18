@@ -44,7 +44,10 @@ flowchart TD
 
 ## Learning Plan
 Following a structured 45-day roadmap → [View Plan](docs/PLAN.md)
+##
 And for SQL [View Plan](docs/SQL.md)
+##
+And for Interview Notes [View Plan](docs/Interview_prep.md)
 
 ## Stack
 - Python · FastAPI
