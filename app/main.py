@@ -2,13 +2,14 @@ from fastapi import FastAPI
 
 from app.core.database import Base, engine
 from app.models.order import Order
-from app.routers import orders
+from app.models.rider import Rider
+from app.routers import orders, riders
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="DeliverIQ")
 app.include_router(orders.router)
-
+app.include_router(riders.router)
 
 @app.get("/health")
 def health():
