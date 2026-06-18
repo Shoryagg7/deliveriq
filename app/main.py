@@ -1,8 +1,8 @@
 from fastapi import FastAPI
 
 from app.core.database import Base, engine
-from app.models.order import Order
-from app.models.rider import Rider
+from app.models.order import Order  # noqa: F401
+from app.models.rider import Rider  # noqa: F401
 from app.routers import orders, riders
 
 Base.metadata.create_all(bind=engine)
