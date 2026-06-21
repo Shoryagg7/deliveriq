@@ -12,7 +12,6 @@ class OrderCreate(BaseModel):
     drop_lat: float = Field(gt=-90, le=90, description="Latitude must be between -90 and 90")
     drop_lon: float = Field(gt=-180, le=180, description="Longitude must be between -180 and 180")
 
-
 class OrderResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
