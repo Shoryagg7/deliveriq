@@ -2,7 +2,6 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-
 class OrderCreate(BaseModel):
     customer_id: int
     restaurant_id: int
