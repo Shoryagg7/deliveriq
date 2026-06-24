@@ -941,11 +941,13 @@ touch app/routers/__init__.py
 # app/routers/orders.py
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+
 from app.core.database import get_db
 from app.models.order import Order
-from app.schemas.order import OrderCreate, OrderResponse
+from app.schemas.order import OrderCreate, OrderResponse, OrderStatus
 
 router = APIRouter(prefix="/orders", tags=["orders"])
+
 
 @router.post("", response_model=OrderResponse, status_code=201)
 def create_order(order: OrderCreate, db: Session = Depends(get_db)):
@@ -955,6 +957,7 @@ def create_order(order: OrderCreate, db: Session = Depends(get_db)):
     db.refresh(new_order)
     return new_order
 
+
 @router.get("/{order_id}", response_model=OrderResponse)
 def get_order(order_id: int, db: Session = Depends(get_db)):
     order = db.query(Order).filter(Order.id == order_id).first()
@@ -962,11 +965,12 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "Order not found")
     return order
 
+
 @router.get("", response_model=list[OrderResponse])
-def list_orders(status: str | None = None, db: Session = Depends(get_db)):
+def list_orders(status: OrderStatus | None = None, db: Session = Depends(get_db)):
     query = db.query(Order)
     if status:
-        query = query.filter(Order.status == status)
+        query = query.filter(Order.status == status.value)
     return query.all()
 ```
 
