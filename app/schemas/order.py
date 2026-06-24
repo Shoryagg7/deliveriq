@@ -25,5 +25,5 @@ class OrderResponse(BaseModel):
     id: int
     customer_id: int
     value: float
-    status: str
+    status: OrderStatus
     created_at: datetime
