@@ -717,31 +717,43 @@ touch app/schemas/__init__.py
 
 **Step 2:** Create `app/schemas/order.py`:
 ```python
-from pydantic import BaseModel, Field
 from datetime import datetime
+from enum import Enum
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class OrderStatus(str, Enum):
+    PENDING = "PENDING"
+    ASSIGNED = "ASSIGNED"
+    PICKED_UP = "PICKED_UP"
+    DELIVERED = "DELIVERED"
+    CANCELLED = "CANCELLED"
 
 class OrderCreate(BaseModel):
     customer_id: int
     restaurant_id: int
     value: float = Field(gt=0, description="Order value in INR, must be positive")
-    pickup_lat: float
-    pickup_lon: float
-    drop_lat: float
-    drop_lon: float
+    pickup_lat: float = Field(gt=-90, le=90, description="Latitude must be between -90 and 90")
+    pickup_lon: float = Field(gt=-180, le=180, description="Longitude must be between -180 and 180")
+    drop_lat: float = Field(gt=-90, le=90, description="Latitude must be between -90 and 90")
+    drop_lon: float = Field(gt=-180, le=180, description="Longitude must be between -180 and 180")
 
 class OrderResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     id: int
     customer_id: int
     value: float
     status: str
     created_at: datetime
+
 ```
 
 **Step 3:** Update `app/main.py`:
 ```python
 from fastapi import FastAPI
 from datetime import datetime
-from app.schemas.order import OrderCreate, OrderResponse
+from app.schemas.order import OrderCreate, OrderResponse, OrderStatus
 
 app = FastAPI(title="DeliverIQ")
 orders_db = {}
@@ -754,7 +766,7 @@ def create_order(order: OrderCreate):
         "id": next_id,
         "customer_id": order.customer_id,
         "value": order.value,
-        "status": "PENDING",
+        "status": OrderStatus.PENDING,
         "created_at": datetime.utcnow(),
     }
     orders_db[next_id] = new_order
