@@ -48,6 +48,8 @@ Following a structured 45-day roadmap → [View Plan](docs/PLAN.md)
 And for SQL [View Plan](docs/SQL.md)
 ##
 And for Interview Notes [Notes](docs/Interview_prep.md)
+##
+And for Resources (youtube links or official docs) [resources](docs/All_Resources_in_One_Place.md)
 
 ## Stack
 - Python · FastAPI
