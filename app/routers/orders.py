@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.rate_limit import rate_limiter
+from app.services.dispatch import pick_next_order
 from app.models.order import Order
 from app.schemas.order import OrderCreate, OrderResponse, OrderStatus
 
@@ -26,9 +26,17 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
     return order
 
 
-@router.get("", response_model=list[OrderResponse], dependencies=[Depends(rate_limiter)])
+@router.get("", response_model=list[OrderResponse])
 def list_orders(status: OrderStatus | None = None, db: Session = Depends(get_db)):
     query = db.query(Order)
     if status:
         query = query.filter(Order.status == status.value)
     return query.all()
+
+@router.post("/dispatch")
+def dispatch_order(db: Session = Depends(get_db)):
+    order_id = pick_next_order(db)
+    if order_id is None:
+        raise HTTPException(404, "No pending orders to dispatch")
+    return {"dispatched_order_id": order_id}
+
