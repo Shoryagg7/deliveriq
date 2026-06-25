@@ -2,9 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.services.dispatch import pick_next_order
 from app.models.order import Order
 from app.schemas.order import OrderCreate, OrderResponse, OrderStatus
+from app.services.dispatch import pick_next_order
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
