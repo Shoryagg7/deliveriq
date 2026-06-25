@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.rate_limit import rate_limiter
 from app.models.order import Order
 from app.schemas.order import OrderCreate, OrderResponse, OrderStatus
 
@@ -25,7 +26,7 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
     return order
 
 
-@router.get("", response_model=list[OrderResponse])
+@router.get("", response_model=list[OrderResponse], dependencies=[Depends(rate_limiter)])
 def list_orders(status: OrderStatus | None = None, db: Session = Depends(get_db)):
     query = db.query(Order)
     if status:
