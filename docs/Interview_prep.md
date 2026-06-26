@@ -509,3 +509,71 @@ Orders live in **Postgres only**. The dispatch heap is rebuilt from Postgres eac
 8. Why does `orders_today` never show up in DBeaver?
 
 *Shaky on any? That's your next review target.*
+# DeliverIQ — Interview Prep, Part 5 (Day 19)
+
+> Companion to the main guide. Covers the order state machine — enforcing a legal
+> lifecycle and the error-semantics that come with it. Same format: **concept (why)**,
+> **soundbite (how to say it)**, **gotcha (what trips people up)**.
+
+---
+
+## 19. Order State Machine
+
+### What it is
+Order status isn't a free string — it's a **directed graph** of legal transitions. Each status is a node; each allowed transition is an edge. The table is an adjacency list (`map<State, set<State>>` in C++ terms); "is this legal?" is an O(1) set-membership check. Terminal states (DELIVERED, CANCELLED) have empty neighbour sets — nothing is reachable from them.
+
+```
+PENDING ──→ ASSIGNED ──→ PICKED_UP ──→ DELIVERED
+   │            │
+   └──→ CANCELLED ←┘
+```
+
+**Soundbite:** "Order status is a state machine — a directed graph of legal transitions, not a settable string. The transition table is an adjacency list; validating a transition is an O(1) lookup in the current state's neighbour set. Terminal states have no outgoing edges, so a delivered order can't be un-delivered."
+
+**Gotcha:** the validator only *validates* — it raises or stays silent, it doesn't mutate or touch the DB. The caller persists. Keeping legality-check separate from persistence means the same `transition()` is reusable from any call site (the status endpoint, dispatch, a future rider app) with each deciding how to handle a failure.
+
+### Why strict — no ASSIGNED → PENDING (a design decision, not a default)
+A rider who accepts then abandons an order does **not** bounce it back to PENDING. Re-dispatching means the customer waits through a *second* matching cycle — cold food, broken SLA. Instead: cancel + penalize the rider. The penalty lives on the **rider**, not as an order-state edge.
+
+**Soundbite:** "I kept the machine strict — no ASSIGNED→PENDING. When a rider abandons an accepted order I cancel rather than re-pool, because re-dispatching breaks the customer's delivery-time guarantee. The rider penalty is tracked separately on the rider, not as an order transition — the order machine governs the order's lifecycle, penalties are a rider concern. Mixing two independent state spaces is a coupling mistake."
+
+**The senior line:** *order-state and rider-penalty are independent state spaces; don't couple them.*
+
+### The two-failure-semantics distinction ⭐ (best interview point here)
+The *same* `transition()` call has *different* failure meaning at different call sites:
+
+- **The status endpoint** — the target status comes from the **user**. An illegal transition is *expected bad input*. Catch `InvalidTransition` → return **400**.
+- **Dispatch** — the transition (PENDING→ASSIGNED) is derived from your own `status == "PENDING"` filter. A failure means a **server-side bug** (a non-PENDING order got pulled). **Don't catch it** — let it raise into a **500**.
+
+**Soundbite:** "Same `transition()` call, two different failure semantics. In the user-facing endpoint an illegal transition is expected bad input — catch it, return 400. In dispatch the transition is derived from my own query invariant, so a failure is a server bug, not user error — I let it raise into a 500 rather than mislabel my bug as the client's bad request. Error-handling follows *who caused the error*, not the function being called."
+
+**Gotcha:** wrapping the dispatch call in `try/except → HTTPException(400)` would be *wrong* — it blames the client (400 = "you did something wrong") for what is actually a server logic error. A 500 is the honest signal: "the server hit a state it believed impossible." The dispatch `transition()` is really an **assertion** (`assert order_is_pending`) — and asserts aren't meant to be caught.
+
+### Single gate for status changes
+Before the refactor, status was mutated in two places with two rule sets: the endpoint (validated) and dispatch (raw string, unvalidated). Routing dispatch through `transition()` too means **every** status change goes through one gate. The dispatch call is provably always-legal given the PENDING filter — so it's a no-op today — but the value is the *invariant*: "there is exactly one place order status changes legally" is a property worth being able to state. Without it, "how do you guarantee valid transitions?" gets a caveat: "well, except in dispatch."
+
+**Soundbite:** "Every status change routes through the state machine — no exceptions. The dispatch call is always-legal given the filter, so it never fires, but I added it so I can say there's a single gate for status changes. The comment marks it deliberate, not dead code — I know it's redundant today and chose the invariant anyway."
+
+**The honest counterpoint (have it ready):** "You could argue it's dead code — a check that provably can't fail is noise, and dead defensive code implies a check that isn't really happening. Both positions are defensible; I lean toward the single-gate invariant because the cost is one commented line and the story it buys is worth more than the line costs in clarity."
+
+### Legal-transition vs permitted-actor — orthogonal guards
+The state machine answers "is this transition legal *at all*?" It does **not** answer "is *this caller* allowed to make it?" A customer marking their own order DELIVERED is a *legal edge* but the *wrong actor*. Those are two independent protections — and authorization needs authenticated identities, so it's deferred to **Day 35 (JWT)**: role + ownership (assigned rider advances their own orders, ops cancels, customer can't touch status).
+
+**Soundbite:** "The state machine enforces which transitions are legal, not who may make them — orthogonal guards. A customer shouldn't mark their own order delivered even though it's a legal edge. After JWT, the status endpoint checks role and ownership on top of the legality check. Until then it's an unauthenticated admin tool, which I'm tracking deliberately, not by accident."
+
+---
+
+## 20. Self-Test — Day 19 (answer out loud)
+
+1. Why is order status a state machine and not just a string column?
+2. What's the adjacency-list / set-membership framing, and what's O(1) about it?
+3. Why does `transition()` only validate and not persist?
+4. Why keep ASSIGNED→PENDING illegal — what's the product reasoning?
+5. Why is the rider penalty *not* an order-state edge?
+6. Same `transition()` call — why does the endpoint catch it but dispatch doesn't?
+7. Why would `try/except → 400` be *wrong* in dispatch?
+8. The dispatch `transition()` never fires — so why add it? And the counterargument?
+9. Legal-transition vs permitted-actor — what's the difference, and which is deferred to Day 35?
+10. Why is 400 (not 422) the right code for an illegal-but-well-formed transition?
+
+*Shaky on any? That's your next review target.*

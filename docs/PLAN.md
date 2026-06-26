@@ -1255,36 +1255,109 @@ Test 2 returning **404** is the critical proof — `srem` removed the rider from
 ## Day 19 — Order State Machine
 
 ### 🎯 Goal
-Enforce valid transitions (no DELIVERED → PENDING).
+Stop order status from being set to anything arbitrary. Enforce a **legal lifecycle** — a directed graph of allowed transitions — and route *every* status change through one gate.
 
-### 💻 Tasks — `app/services/order_state.py`
+### 💡 C++ → Python
+The transition table is an **adjacency list**: `map<State, set<State>>`. "Is this transition legal?" is "is `target` in the neighbour set of `current`?" — an O(1) set lookup. Terminal states (DELIVERED, CANCELLED) have empty neighbour sets — nothing is reachable from them.
+
+### ⚠️ Prerequisite — consolidate `OrderStatus` first
+Before Day 19, `OrderStatus` must live in **one** place. If it's still defined in `schemas/order.py` (and `dispatch.py` uses raw `"PENDING"`/`"ASSIGNED"` strings, and `order_state.py` imports from a non-existent `core.enums` behind a `# type: ignore`), fix that first:
+1. Create `app/core/enums.py` with the full 5-value enum (PENDING, ASSIGNED, PICKED_UP, DELIVERED, CANCELLED).
+2. In `schemas/order.py`: delete the class, replace with `from app.core.enums import OrderStatus`.
+3. In `dispatch.py`: import the enum, replace raw strings with `OrderStatus.PENDING.value` / `OrderStatus.ASSIGNED.value`.
+4. Remove every `# type: ignore` that was masking the broken import.
+5. Verify: `python -c "from app.core.enums import OrderStatus; from app.services.order_state import transition; from app.services.dispatch import pick_next_order; print('all imports OK')"`
+
+> A `# type: ignore` on an import is a smell — it was silencing a real `ModuleNotFoundError`. Comments that suppress errors usually hide the bug you need to see.
+
+### 💻 The state machine — `app/services/order_state.py`
 ```python
-from app.core.enums import OrderStatus   # reuse the one definition
+from app.core.enums import OrderStatus   # the one definition
 
 VALID_TRANSITIONS = {
     OrderStatus.PENDING:   {OrderStatus.ASSIGNED, OrderStatus.CANCELLED},
     OrderStatus.ASSIGNED:  {OrderStatus.PICKED_UP, OrderStatus.CANCELLED},
     OrderStatus.PICKED_UP: {OrderStatus.DELIVERED},
-    OrderStatus.DELIVERED: set(),
-    OrderStatus.CANCELLED: set(),
+    OrderStatus.DELIVERED: set(),     # terminal
+    OrderStatus.CANCELLED: set(),     # terminal
 }
 
-class InvalidTransition(Exception): ...
+class InvalidTransition(Exception):
+    pass
 
 def transition(current: OrderStatus, target: OrderStatus) -> None:
     if target not in VALID_TRANSITIONS[current]:
-        raise InvalidTransition(f"Cannot go from {current} to {target}")
+        raise InvalidTransition(f"Cannot go from {current.value} to {target.value}")
 ```
-> 🐛 **Corrected from v3:** the old plan redefined `OrderStatus` here. It's now imported from `app/core/enums.py` — one definition, no drift.
+> Pure logic — no DB, no Redis. It only *validates* (raises or stays silent); it does **not** mutate. The caller persists. That separation is deliberate: the service decides legality, the caller decides what to do about it.
 
-Add `PATCH /orders/{id}/status` that calls `transition(...)` and returns `400` on `InvalidTransition`.
+### 🧭 Design decision — no `ASSIGNED → PENDING` (kept strict)
+A rider who accepts then abandons an order does **not** send it back to PENDING. Re-dispatching forces the customer through a second matching cycle → cold food, broken SLA. Instead: `ASSIGNED → CANCELLED` + a rider penalty (penalty tracked separately on the rider, *not* as an order transition — order-state and rider-penalty are independent state spaces; coupling them is a mistake). The penalty mechanics come later with the event plumbing; today only the *rule* (ASSIGNED→CANCELLED legal, ASSIGNED→PENDING not) matters.
+
+### 💻 The status endpoint — `app/routers/orders.py`
+```python
+from pydantic import BaseModel
+from app.core.enums import OrderStatus
+from app.services.order_state import transition, InvalidTransition
+
+class StatusUpdate(BaseModel):
+    status: OrderStatus
+
+@router.patch("/{order_id}/status")
+def update_status(order_id: int, body: StatusUpdate, db: Session = Depends(get_db)):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(404, "Order not found")
+
+    current = OrderStatus(order.status)          # str from DB → enum
+    try:
+        transition(current, body.status)         # validate; raises if illegal
+    except InvalidTransition as e:
+        raise HTTPException(400, str(e))         # user asked for illegal → 400
+
+    order.status = body.status.value             # enum → str for the DB
+    db.commit()
+    return {"order_id": order_id, "status": order.status}
+```
+> **Validate before mutate.** Status never changes unless the transition was legal.
+> **`OrderStatus(order.status)`** casts the stored string back to the enum (`transition` compares enum keys).
+> **400, not 422:** the input is well-formed (a valid status) but *illegal given current state* — that's a runtime "doesn't make sense against the data" raise, not a malformed-input 422. ("Type it if you can, raise it if you must.")
+
+### 💻 Refactor — route dispatch's flip through the state machine too
+`dispatch.py` was setting `winner.status = "ASSIGNED"` raw, bypassing the gate. Route it through `transition()` so **all** status changes go through one place:
+```python
+from app.core.enums import OrderStatus
+from app.services.order_state import transition   # InvalidTransition NOT caught here — see below
+
+    # ... after popping the winner ...
+    current = OrderStatus(winner.status)
+    # Always legal here (we filtered for PENDING); routing through the state
+    # machine keeps ALL status changes going through one gate. If this ever
+    # raises, it's an invariant violation — a real bug — so let it crash.
+    transition(current, OrderStatus.ASSIGNED)
+    winner.status = OrderStatus.ASSIGNED.value
+    db.commit()
+    return order_id
+```
+> **Endpoint catches, dispatch doesn't — deliberate.** In the endpoint the target comes from the *user*, so an illegal transition is expected bad input → catch → 400. In dispatch the transition is derived from your own `status == "PENDING"` filter, so a failure means a server-side bug (a non-PENDING order got pulled) → let it raise into a 500. Error-handling follows *who caused the error*, not the function being called. (The `transition()` call is provably always-legal here given the filter — it's an invariant assertion, not user validation. Cheap insurance + single-gate story; the comment marks it as deliberate, not dead code.)
+
+### ⚠️ Auth deferred to Day 35 — endpoint is open right now
+The state machine enforces *which transitions are legal*; it does **not** enforce *who may make them*. A customer shouldn't mark their own order DELIVERED even though it's a legal edge. Transitions are really driven by riders (ASSIGNED→PICKED_UP→DELIVERED) and the dispatch system (PENDING→ASSIGNED), not the customer. **Legal-transition and permitted-actor are orthogonal guards** — the second needs authenticated identities, so it lands on **Day 35 (JWT)**: role + ownership checks (assigned rider advances their own orders, ops can cancel, customer can't touch status). Today the endpoint is an unauthenticated dev/admin tool — fine for this stage, tracked as a deliberate follow-up.
 
 ### 🔥 Break It On Purpose
-Comment out the `if target not in ...` check. PATCH an order straight from PENDING → DELIVERED — "delivered" before any rider was assigned: a data-integrity nightmare. Restore the check.
+Comment out the `if target not in ...` check in `transition()`. PATCH an order straight PENDING → DELIVERED — "delivered" before any rider was assigned, a data-integrity nightmare. Restore the check.
+
+### Test
+Create an order (starts PENDING), use its returned id:
+```bash
+curl -X PATCH :8000/orders/1/status -H "Content-Type: application/json" -d '{"status":"ASSIGNED"}'    # legal  → 200
+curl -X PATCH :8000/orders/1/status -H "Content-Type: application/json" -d '{"status":"DELIVERED"}'   # skips PICKED_UP → 400
+curl -X PATCH :8000/orders/1/status -H "Content-Type: application/json" -d '{"status":"PENDING"}'     # backward → 400
+```
+Then dispatch a fresh PENDING order and confirm PENDING→ASSIGNED still flips (now validated through the state machine).
 
 ### ✅ End of Day
-DELIVERED → PENDING returns `400`.
-
+Illegal transitions return 400; dispatch's flip routes through the same state machine; `OrderStatus` lives in one file; auth gap tracked for Day 35. *(Concept depth — state machine as a graph, the two-failure-semantics distinction, legal-vs-permitted — is in `Interview_prep.md` §19.)*
 ---
 
 ## Day 20 — Redis Pub/Sub (Pre-Kafka Practice)
