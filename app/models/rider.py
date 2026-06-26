@@ -1,5 +1,5 @@
 # app/models/rider.py
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import Column, DateTime, Float, Integer, String
 
@@ -14,4 +14,4 @@ class Rider(Base):
     current_lat = Column(Float, nullable=False)
     current_lon = Column(Float, nullable=False)
     status = Column(String, default="AVAILABLE", index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC))

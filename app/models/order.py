@@ -1,5 +1,5 @@
 # app/models/order.py
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import Column, DateTime, Float, Integer, String
 
@@ -18,4 +18,4 @@ class Order(Base):
     drop_lat = Column(Float, nullable=False)
     drop_lon = Column(Float, nullable=False)
     status = Column(String, default="PENDING", index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC))

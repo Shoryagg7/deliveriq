@@ -64,3 +64,13 @@ def select_rider(order_lat: float, order_lon: float, band_m: float = 500) -> int
     redis_client.incr(key)
     redis_client.expire(key, 172800)   # 48h TTL — auto-cleans old days
     return chosen
+
+def update_rider_location(rider_id: int, lat: float, lon: float):
+    old_cell = redis_client.hget(f"rider:{rider_id}:loc", "cell")
+    new_cell = geohash.encode(lat, lon, PRECISION)
+    if old_cell and old_cell != new_cell:
+        redis_client.srem(f"geohash:{old_cell}", rider_id)  # leave stale cell
+    redis_client.sadd(f"geohash:{new_cell}", rider_id)
+    redis_client.hset(
+        f"rider:{rider_id}:loc", mapping={"lat": lat, "lon": lon, "cell": new_cell}
+    )
