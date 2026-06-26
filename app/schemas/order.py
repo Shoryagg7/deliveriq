@@ -1,15 +1,9 @@
 from datetime import datetime
-from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.core.enums import OrderStatus
 
-class OrderStatus(str, Enum):
-    PENDING = "PENDING"
-    ASSIGNED = "ASSIGNED"
-    PICKED_UP = "PICKED_UP"
-    DELIVERED = "DELIVERED"
-    CANCELLED = "CANCELLED"
 
 class OrderCreate(BaseModel):
     customer_id: int

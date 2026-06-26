@@ -2,12 +2,13 @@ import heapq
 
 from sqlalchemy.orm import Session
 
+from app.core.enums import OrderStatus
 from app.models.order import Order
 
 
 def pick_next_order(db: Session):
     # 1. Pull only orders still waiting for a rider
-    pending = db.query(Order).filter(Order.status == "PENDING").all()
+    pending = db.query(Order).filter(Order.status == OrderStatus.PENDING.value).all()
 
     if not pending:
         return None  # nothing to dispatch
@@ -21,7 +22,7 @@ def pick_next_order(db: Session):
     neg_value, order_id = heapq.heappop(heap)
     by_id = {o.id: o for o in pending}
     winner = by_id[order_id]
-    winner.status = "ASSIGNED"  # type: ignore
+    winner.status = OrderStatus.ASSIGNED.value # pyright: ignore[reportAttributeAccessIssue]
     db.commit()
 
     return order_id
