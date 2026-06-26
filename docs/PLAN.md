@@ -1023,7 +1023,6 @@ instances and ZREM gives an atomic concurrent-claim guard. Ties break by created
 Find nearby riders *without scanning all riders*, then pick one **fairly** — the feature that makes DeliverIQ yours.
 
 ### 📚 Resources
-- [Geohashing — System Design Interview](https://www.youtube.com/watch?v=UaYAYrXlBS8) *(10 min)*
 - [Geohash Explorer](https://geohash.softeng.co/)
 
 ### Two layers (keep them distinct)
@@ -1173,7 +1172,7 @@ select_rider(28.6139, 77.2090, band_m=50)   # band 50:  rider 2 outside band →
 Same riders, same loads — only Δ changed, and the winner inverts. **That's the tunable knob:** wide band = more fairness (spread earnings), narrow band = tighter SLA. Fairness only ever operates *inside* the band.
 
 ### 📝 Interview Answer
-> Full concept→soundbite→gotcha writeup is in `Interview_prep.md` §14–15. One-line summary: geohash for a coarse O(1)-ish candidate set (home cell + 8 neighbours), haversine to rank it, then a fairness band — among riders within Δ of the nearest, assign the least-loaded. Reframes greedy-nearest as a bounded constrained-assignment problem; the hard band makes the SLA guarantee explicit and tunable (a blended score could silently send a far rider).
+> Full concept→soundbite→gotcha writeup is in [Interview_notes](docs/Interview_prep.md) §14–15. One-line summary: geohash for a coarse O(1)-ish candidate set (home cell + 8 neighbours), haversine to rank it, then a fairness band — among riders within Δ of the nearest, assign the least-loaded. Reframes greedy-nearest as a bounded constrained-assignment problem; the hard band makes the SLA guarantee explicit and tunable (a blended score could silently send a far rider).
 
 ### ✅ End of Day
 Riders seeded → `POST /riders/match` returns the fairly-chosen nearby rider; fairness convergence and the band/SLA tradeoff both demonstrated live.
