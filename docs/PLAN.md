@@ -1017,7 +1017,6 @@ instances and ZREM gives an atomic concurrent-claim guard. Ties break by created
 3 orders dispatch highest-value-first, drain to `404`, statuses persist in Postgres.
 
 ---
-
 ## Day 18 — Geohash Rider Matching + Fairness Band ⭐ (The Differentiator)
 
 ### 🎯 Goal
@@ -1035,89 +1034,149 @@ Find nearby riders *without scanning all riders*, then pick one **fairly** — t
 
 > 🗂️ **Where rider data lives:** riders are persisted in **PostgreSQL** (source of truth, Day 13). Day 18 *also* indexes their live location in **Redis** for fast geohash lookup. Redis is a hot cache over the durable Postgres record.
 
-### 💻 Layer 1 — geohash lookup
+### 💻 Layer 1 + 2 — the service
 ```bash
 pip install python-geohash && pip freeze > requirements.txt
 ```
 `app/services/geohash_service.py`:
 ```python
+import math
+import time
+from datetime import UTC, datetime
+
 import geohash
+
 from app.core.redis_client import redis_client
 
 PRECISION = 6  # ~1.2 km cells
 
+
+def _orders_key(rider_id: int) -> str:
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    return f"rider:{rider_id}:orders:{today}"
+
+
 def add_rider(rider_id: int, lat: float, lon: float):
     cell = geohash.encode(lat, lon, PRECISION)
     redis_client.sadd(f"geohash:{cell}", rider_id)
-    redis_client.hset(f"rider:{rider_id}:loc",
-                      mapping={"lat": lat, "lon": lon, "cell": cell})
+    redis_client.hset(
+        f"rider:{rider_id}:loc", mapping={"lat": lat, "lon": lon, "cell": cell}
+    )
+
 
 def find_nearby_riders(lat: float, lon: float) -> list[int]:
     cell = geohash.encode(lat, lon, PRECISION)
-    cells_to_check = [cell] + geohash.neighbors(cell)   # home cell + 8 neighbours
+    cells_to_check = [cell] + geohash.neighbors(cell)  # home + 8 neighbours
     riders = set()
     for c in cells_to_check:
         riders.update(redis_client.smembers(f"geohash:{c}"))
     return [int(r) for r in riders]
-```
-> **Why check the 8 neighbours?** An order at a cell *edge* may have its closest rider just across the boundary. Skipping neighbours misses them — a classic geohash bug, and a gold interview talking point.
 
-### 💻 Layer 2 — fairness-banded selection
-```python
-import math, time
 
 def _haversine(lat1, lon1, lat2, lon2) -> float:
-    R = 6_371_000  # metres
+    R = 6_371_000  # earth radius, metres
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi, dlmb = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlmb/2)**2
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
     return 2 * R * math.asin(math.sqrt(a))
+
 
 def select_rider(order_lat: float, order_lon: float, band_m: float = 500) -> int | None:
     candidates = find_nearby_riders(order_lat, order_lon)
     if not candidates:
         return None
+
     scored = []
     for rid in candidates:
         loc = redis_client.hgetall(f"rider:{rid}:loc")
         if not loc:
             continue
         dist = _haversine(order_lat, order_lon, float(loc["lat"]), float(loc["lon"]))
-        orders_today = int(redis_client.hget(f"rider:{rid}", "orders_today") or 0)
+        orders_today = int(redis_client.get(_orders_key(rid)) or 0)
         scored.append((rid, dist, orders_today))
     if not scored:
         return None
+
     d_min = min(s[1] for s in scored)
-    feasible = [s for s in scored if s[1] <= d_min + band_m]   # within band of nearest
-    feasible.sort(key=lambda s: (s[2], s[1]))                  # fewest orders, then nearest
+    feasible = [s for s in scored if s[1] <= d_min + band_m]  # within band of nearest
+    feasible.sort(key=lambda s: (s[2], s[1]))  # fewest orders, then nearest
     chosen = feasible[0][0]
-    redis_client.hincrby(f"rider:{chosen}", "orders_today", 1)
+
     redis_client.hset(f"rider:{chosen}", "last_assigned_at", int(time.time()))
+    key = _orders_key(chosen)
+    redis_client.incr(key)
+    redis_client.expire(key, 172800)   # 48h TTL — auto-cleans old days
     return chosen
 ```
+
 > **Heap framing for interviews:** the selection is a min-heap on the composite key `(orders_today, distance)` over the small feasible band — greedy on a composite key, O(k log k) on candidate set k, not O(n) over all riders.
 
-> **State-lifecycle note:** `orders_today` needs a daily reset — a midnight job, or store it as `rider:{id}:orders:{YYYY-MM-DD}` with a 48h TTL. Mention this if asked; it shows you thought about lifecycle.
+> **State-lifecycle note (built):** `orders_today` resets via the date-stamped key `rider:{id}:orders:{YYYY-MM-DD}` — the date in the key name *is* the reset (tomorrow is a fresh key at 0, no cron). A sliding 48h TTL garbage-collects past days. The count (`incr`) and the TTL (`expire`) are independent on the same key.
+
+### 💻 The endpoint
+`app/routers/rider.py`:
+```python
+from pydantic import BaseModel
+from app.services.geohash_service import select_rider
+
+class MatchRequest(BaseModel):
+    lat: float
+    lon: float
+
+@router.post("/match")
+def match_rider(req: MatchRequest, db: Session = Depends(get_db)):
+    rider_id = select_rider(req.lat, req.lon)
+    if rider_id is None:
+        raise HTTPException(404, "No available rider nearby")
+    return {"assigned_rider_id": rider_id}
+```
+> **Use POST, not GET** — matching increments the winner's order count (a side effect). GETs must stay safe/idempotent. Same reasoning as `POST /orders/dispatch`.
+
+### Test
+Seed via the service (no HTTP route adds rider locations yet), then hit `/match`:
+```python
+# python shell
+from app.services.geohash_service import add_rider
+from app.core.redis_client import redis_client
+from datetime import UTC, datetime
+
+redis_client.flushdb()
+add_rider(1, 28.6139, 77.2090)   # nearest
+add_rider(2, 28.6145, 77.2095)   # ~80 m
+add_rider(3, 28.6150, 77.2100)   # ~150 m
+# make rider 1 busy so fairness has work to do
+redis_client.set(f"rider:1:orders:{datetime.now(UTC).strftime('%Y-%m-%d')}", 5)
+```
+```bash
+# fire the same request repeatedly, watch the winner change
+for i in $(seq 1 11); do
+  curl -s -X POST http://localhost:8000/riders/match \
+    -H "Content-Type: application/json" \
+    -d '{"lat": 28.6139, "lon": 77.2090}'; echo
+done
+```
+Expected: riders **2 and 3 alternate** (absorbing orders, climbing together) while rider 1 stays frozen at 5 — then once all three tie at 5, rider **1** wins on the distance tiebreak (it's at the order's exact spot). The system drains the load imbalance first, then reverts to nearest-rider.
 
 ### 🔥 Break It On Purpose
-**(a) Boundary bug:** in `find_nearby_riders`, change `cells_to_check` to just `[cell]` (drop neighbours). Put a rider at lat=28.6139, lon=77.2090; place an order at 28.6140, 77.2091 (≈10 m away, just across a cell edge). Dispatch returns no riders. Restore neighbours.
-**(b) Fairness vs SLA:** set `band_m = 50000`. Add two riders — one 50 m away with 10 orders today, one 4 km away with 0 orders. The far, idle rider wins → cold food. Drop `band_m` back to 500; the near rider wins. **That's the tradeoff the feature exists to manage** — fairness operates only *inside* the band, never overriding the SLA.
+**(a) Boundary bug:** in `find_nearby_riders`, change `cells_to_check` to just `[cell]` (drop neighbours). Rider at lat=28.6139, lon=77.2090; order at 28.6140, 77.2091 (≈10 m, just across a cell edge). Match returns no rider. Restore neighbours.
 
-### 📝 Interview Answer — save to `INTERVIEW_NOTES.md`
+**(b) Band vs SLA — both riders must be *within geohash range*:** the band only filters riders geohash already found, so a rider 4 km away is irrelevant (the neighbour ring ~3.6 km already excluded them — no band size rescues it). To see the tradeoff, place both inside range:
+```python
+redis_client.flushdb()
+add_rider(1, 28.6139, 77.2090)              # nearest
+add_rider(2, 28.6150, 77.2100)              # ~150 m away
+redis_client.set(f"rider:1:orders:{datetime.now(UTC).strftime('%Y-%m-%d')}", 10)  # near rider slammed
+
+select_rider(28.6139, 77.2090)              # band 500: rider 2 inside band → idle rider 2 wins
+select_rider(28.6139, 77.2090, band_m=50)   # band 50:  rider 2 outside band → slammed rider 1 wins
 ```
-"For rider matching I use geohashing instead of haversine-to-every-rider.
-It encodes (lat,lon) into a base-32 string where nearby locations share a prefix;
-lookup is O(1) on the home cell plus 8 neighbours (boundary handling). Without it,
-matching is O(n). To pick the final rider I don't take the nearest — among riders
-within a ~500 m band of the closest, I assign the one with the fewest orders today,
-balancing rider earnings without hurting delivery SLA. This reframes greedy-nearest
-as a bounded constrained-assignment problem. A blended score (α·dist+β·fairness)
-could silently send a far rider; the band makes the SLA guarantee explicit and tunable."
-```
+Same riders, same loads — only Δ changed, and the winner inverts. **That's the tunable knob:** wide band = more fairness (spread earnings), narrow band = tighter SLA. Fairness only ever operates *inside* the band.
+
+### 📝 Interview Answer
+> Full concept→soundbite→gotcha writeup is in `Interview_prep.md` §14–15. One-line summary: geohash for a coarse O(1)-ish candidate set (home cell + 8 neighbours), haversine to rank it, then a fairness band — among riders within Δ of the nearest, assign the least-loaded. Reframes greedy-nearest as a bounded constrained-assignment problem; the hard band makes the SLA guarantee explicit and tunable (a blended score could silently send a far rider).
 
 ### ✅ End of Day
-5 riders added → an order returns the correct nearby rider, chosen with the fairness rule.
-
+Riders seeded → `POST /riders/match` returns the fairly-chosen nearby rider; fairness convergence and the band/SLA tradeoff both demonstrated live.
 ---
 
 ## Day 19 — Order State Machine

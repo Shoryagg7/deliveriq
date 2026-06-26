@@ -373,3 +373,86 @@ A per-process heap is **single-instance**. The moment you run multiple API repli
 14. Why does the Redis sorted-set version *hide* your DSA — and why build the heap first anyway?
 
 *Shaky on any? That's your next review target.*
+
+
+# DeliverIQ — Interview Prep, Part 3 (Day 18)
+
+> Companion to the main guide. Covers geohash rider matching and fairness-banded
+> dispatch — the differentiator. Same format: **concept (why)**, **soundbite (how
+> to say it)**, **gotcha (what trips people up)**.
+
+---
+
+## 14. Geohash Rider Matching
+
+### The two-stage filter (keep them distinct)
+Matching is **two independent filters in order**, not one step:
+1. **Geohash — coarse "who's even considered."** Encode (lat, lon) into a base-32 string where nearby points share a prefix. Lookup is the home cell + its 8 neighbours — a cheap set union, not a distance calc against every rider. At precision 6 the reach is ~3.6 km total (a 3×3 grid of ~1.2 km cells).
+2. **Haversine — precise "exact distance" inside that set.** Geohash cells are approximate; haversine gives the real great-circle distance to rank the survivors. Euclidean (`√(Δlat²+Δlon²)`) is wrong on a sphere — 1° of longitude shrinks toward the poles — so haversine is the correct GPS-distance formula.
+
+**Soundbite:** "Rider matching is two filters: geohash for a coarse O(1)-ish candidate set — nearby points share a string prefix, so I check the home cell plus 8 neighbours instead of scanning every rider — then haversine for exact great-circle distance to rank that small set. Cheap filter, then precise sort on the survivors."
+
+**Gotcha — the boundary bug (gold interview material):** an order at a cell *edge* can have its nearest rider just across the line, in a neighbouring cell with a totally different geohash string. Checking only the home cell misses them. The fix is the 8 neighbours. I hit this live — dropping neighbours made a rider 10 m away invisible.
+
+**Gotcha — geohash range ≠ band.** `band_m` only filters riders geohash already *found*. A rider 13 km away is outside the neighbour ring, so no band size — even 50 km — can pull them in; they were never a candidate. Two filters, in sequence: geohash decides who's considered, band decides who's feasible among those.
+
+### Why a set AND a hash per rider
+- `geohash:<cell>` → **set** of rider IDs ("who's in this cell" — membership, dedupe).
+- `rider:<id>:loc` → **hash** of {lat, lon, cell} ("this rider's exact attributes").
+
+**Rule:** set = a bag of interchangeable peers; hash = one record with named fields. Same rider lives in both, playing different roles — a *member* of the cell roster, and an *owner* of a location record.
+
+**Gotcha:** Redis returns everything as strings. `float(loc["lat"])` before distance math, `int(...)` for counters — forget the cast and the math chokes.
+
+---
+
+## 15. Fairness-Banded Dispatch ⭐ (The Differentiator)
+
+### The rule
+Among riders within a distance band Δ of the **nearest** candidate, assign the one with the **fewest orders today**. Tiebreak on distance.
+
+```
+d_min = nearest candidate's distance
+feasible = riders within d_min + Δ
+winner = min(feasible) on key (orders_today, distance)
+```
+
+### Why a hard band, not a blended score
+A blended score `α·dist + β·load` can **silently send a far rider** when the load term dominates — cold food, broken SLA, and you can't tell from the formula when it'll happen. The hard band makes the SLA guarantee **explicit and tunable**: fairness operates *only inside* Δ, so a rider outside the band is never eligible no matter how idle. Δ is the single knob between competing goals — wide band = more fairness (spread earnings), narrow band = tighter SLA.
+
+**Soundbite:** "Greedy-nearest optimizes pure distance. I add a bounded fairness constraint — among riders within a band Δ of the nearest, assign the least-loaded. It's a constrained-assignment problem: minimize rider load subject to a distance bound. A blended score could silently send a far rider when load dominates; the hard band makes the SLA guarantee non-negotiable and tunable. That's my honest answer to both 'how is this different from Swiggy' and 'what's the social impact' — fairer earnings for gig riders without delivering cold food."
+
+### The behaviour (what you actually see)
+Two phases: the system **drains the load imbalance first**, then **reverts to nearest-rider**. Idle riders absorb orders until they catch up to the busy rider's count; once all loads tie, the distance tiebreak takes over and the nearest wins. A naive nearest-only dispatcher would hammer the closest rider every call and never balance anyone.
+
+**Heap framing:** the selection is a min-heap on the composite key `(orders_today, distance)` over the small feasible band — greedy on a composite key, O(k log k) on candidate set k, not O(n) over all riders. Same `pair`-comparison idea as a C++ tuple sort.
+
+### Daily counter reset — no cron
+`orders_today` is stored as a **date-stamped key**: `rider:<id>:orders:<YYYY-MM-DD>`. Tomorrow is a *different key* that starts at 0 automatically — the key name **is** the reset, no midnight job, no reset race. A 48 h TTL (`expire`) garbage-collects past days. The TTL **slides** — every order refreshes it to 48 h from the last write — so an active rider's key never dies mid-day, an idle rider's key expires 48 h after they stop.
+
+**Soundbite:** "Daily counter resets via a date-stamped key with a sliding TTL — the key rotates itself at midnight because the date is in the name, and a 48-hour expiry cleans old days. No cron, no midnight reset race."
+
+**Gotcha:** the count and the TTL are independent on the same key. `incr` accumulates the day's total; `expire` only refreshes the death-clock. The value persists and climbs within a day; the daily "reset" comes from the date in the key, not from `expire`. Lazy creation too — `incr`/`hincrby` on a missing key starts at 0 and creates it, so no explicit init; the read side guards with `or 0`.
+
+### The endpoint
+`POST /riders/match` — **POST not GET**, because matching has a side effect (it increments the winner's order count). GETs must be safe/idempotent; a mutation behind a GET violates HTTP semantics. Same reasoning as `POST /orders/dispatch`.
+
+---
+
+## 16. Self-Test — Day 18 (answer out loud)
+
+1. Why two filters (geohash + haversine) instead of one? What does each do?
+2. Why check the 8 neighbour cells, not just the home cell?
+3. Why can't a huge `band_m` rescue a rider 13 km away?
+4. Why is a rider stored in both a set and a hash — which question does each answer?
+5. Why haversine over Euclidean distance?
+6. Explain the band as a constrained-assignment problem in one sentence.
+7. Band vs blended score (α·dist + β·load) — why the hard band?
+8. Describe the two-phase behaviour (drain imbalance, then revert to nearest).
+9. How does `orders_today` reset daily with no cron job?
+10. Why does each order refresh the TTL, and what does that achieve?
+11. Why is `/riders/match` a POST and not a GET?
+
+*Shaky on any? That's your next review target.*
+
+
