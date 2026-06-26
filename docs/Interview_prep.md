@@ -456,3 +456,56 @@ Two phases: the system **drains the load imbalance first**, then **reverts to ne
 *Shaky on any? That's your next review target.*
 
 
+# DeliverIQ — Interview Prep, Part 4 (Rider Sync)
+
+> Companion to the main guide. Covers the Postgres↔Redis dual-write consistency work
+> layered onto Day 18. Same format: **concept (why)**, **soundbite (how to say it)**,
+> **gotcha (what trips people up)**.
+
+---
+
+## 17. Dual-Write Consistency (Postgres ↔ Redis)
+
+### The setup
+Riders live in **two stores at once**: PostgreSQL is the durable source of truth, Redis is a hot geohash index for fast matching. Every rider write (create, move) has to update **both** in one request — a **dual write**. Miss one and the index goes stale: `select_rider` reads Redis, so a rider absent from Redis is invisible to matching, and a rider with a stale Redis cell gets matched at a location they already left.
+
+**Soundbite:** "Riders are in two stores — Postgres as the source of truth, Redis as a hot geohash index. Each rider write updates both in one request. I keep Postgres authoritative precisely because Redis is the disposable, rebuildable layer — if they ever drift, Redis can be reconstructed from Postgres."
+
+### The move-path trap (the real bug)
+Indexing a rider does `sadd` to their cell's set. On a **move**, you must `srem` them from the *old* cell **before** `sadd`-ing the new one — otherwise they stay a phantom member of every cell they've ever been in, and match at stale locations. The old cell is recoverable because it's stored on the `rider:{id}:loc` hash.
+
+**Soundbite:** "The subtle bug is the move path — you have to remove the rider from their old geohash cell before adding the new one, or they become a phantom member of stale cells and get matched somewhere they've left. I read the old cell off the location hash, srem it, then sadd the new one."
+
+**Gotcha:** order matters — `srem` old, then `sadd` new. And guard `if old_cell and old_cell != new_cell` so a no-op move (same cell) doesn't needlessly churn the set.
+
+### What if the second write fails?
+The two writes aren't in one transaction (different systems). If the Postgres commit lands but the Redis write throws, they drift. Recovery is **reconciliation**: Redis is fully reconstructable from Postgres, so a periodic job re-indexes all riders from the DB. You never lose truth — only the cache goes briefly stale, and it's self-healing.
+
+**Soundbite:** "It's a dual write across two systems, so no single transaction spans both. If the Redis write fails after the Postgres commit they drift — but Redis is rebuildable from Postgres, so a reconciliation job re-indexing riders is the recovery path. Truth is never at risk; only the cache."
+
+### Orders don't have this problem — know the contrast
+Orders live in **Postgres only**. The dispatch heap is rebuilt from Postgres each call, not stored in Redis, so there's no order-side index to keep in sync. Being able to say *why* riders need dual-write and orders don't shows you understand the pattern, not just the mechanics.
+
+**Soundbite:** "Orders are Postgres-only — the dispatch heap is rebuilt from the DB each call, nothing cached in Redis — so there's no dual write to maintain. Riders need it because their location is indexed in Redis for fast geohash lookup. The dual-write cost only appears when you cache derived state."
+
+### The UTC reset nuance (daily counter)
+`orders_today` keys are stamped in **UTC** (`datetime.now(UTC)`), so the daily reset boundary is UTC midnight, not local. On IST (UTC+5:30) the key reads the *previous* calendar day for the first ~5.5h after local midnight. UTC is the right default — consistent across servers and DST-free — but in production you'd reset on the **business timezone** so "today" matches the rider's actual day.
+
+**Soundbite:** "The daily counter resets on UTC midnight because the key is stamped with `datetime.now(UTC)` — consistent across instances, no DST edge cases. In production I'd switch the reset to the business timezone so it matches the rider's local day, but UTC is the correct default for correctness."
+
+**Gotcha:** when inspecting, the key is `rider:{id}:orders:{UTC-date}` — on IST after midnight that's *yesterday's* date. And it's a **Redis** key: visible via `redis-cli`, never in DBeaver (DBeaver is Postgres only). "Why isn't X in DBeaver?" is almost always "because X is Redis state."
+
+---
+
+## 18. Self-Test — Rider Sync (answer out loud)
+
+1. Why do riders need a dual write but orders don't?
+2. What's the phantom-membership bug, and what's the fix (in what order)?
+3. Postgres commit succeeds, Redis write fails — what's the state, and how do you recover?
+4. Why is Postgres the truth and Redis the rebuildable layer, not the reverse?
+5. Why does `create_rider` need `refresh` before `add_rider`?
+6. Why PATCH (not PUT/POST) for the location update?
+7. Why is the daily counter stamped in UTC, and what's the IST consequence?
+8. Why does `orders_today` never show up in DBeaver?
+
+*Shaky on any? That's your next review target.*

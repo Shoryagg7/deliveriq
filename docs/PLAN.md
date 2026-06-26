@@ -1176,6 +1176,80 @@ Same riders, same loads — only Δ changed, and the winner inverts. **That's th
 
 ### ✅ End of Day
 Riders seeded → `POST /riders/match` returns the fairly-chosen nearby rider; fairness convergence and the band/SLA tradeoff both demonstrated live.
+
+### 🔄 Rider Sync — keep Postgres and Redis consistent (added after initial Day 18)
+
+Riders live in **two stores**: PostgreSQL (durable truth, Day 13) and Redis (hot geohash index). Every rider write must update **both**, or `select_rider` reads a stale index. Three pieces close the loop. *(Concept writeup — dual-write consistency, recovery, why orders don't have this problem — is in `Interview_prep.md` §17.)*
+
+#### 1. Create also indexes into Redis
+```python
+@router.post("", response_model=RiderResponse, status_code=201)
+def create_rider(rider: RiderCreate, db: Session = Depends(get_db)):
+    new_rider = Rider(**rider.model_dump())
+    db.add(new_rider)
+    db.commit()
+    db.refresh(new_rider)            # need the DB-generated id BEFORE indexing
+    add_rider(new_rider.id, new_rider.current_lat, new_rider.current_lon)
+    return new_rider
+```
+> Order is forced: `add_rider` needs the id Postgres generates on insert → `commit` → `refresh` → `add_rider`. Index before refresh and the id is still `None`.
+
+#### 2. The move path — update location, clean the old cell
+`add_rider` only ever `sadd`s the new cell, never leaves the old one → phantom membership on move. Remove from the old cell first (`srem`). Add to `geohash_service.py`:
+```python
+def update_rider_location(rider_id: int, lat: float, lon: float):
+    old_cell = redis_client.hget(f"rider:{rider_id}:loc", "cell")
+    new_cell = geohash.encode(lat, lon, PRECISION)
+    if old_cell and old_cell != new_cell:
+        redis_client.srem(f"geohash:{old_cell}", rider_id)   # leave stale cell
+    redis_client.sadd(f"geohash:{new_cell}", rider_id)
+    redis_client.hset(f"rider:{rider_id}:loc",
+                      mapping={"lat": lat, "lon": lon, "cell": new_cell})
+```
+Endpoint in `rider.py`:
+```python
+class LocationUpdate(BaseModel):
+    lat: float
+    lon: float
+
+@router.patch("/{rider_id}/location")
+def update_location(rider_id: int, loc: LocationUpdate, db: Session = Depends(get_db)):
+    rider = db.query(Rider).filter(Rider.id == rider_id).first()
+    if not rider:
+        raise HTTPException(404, "Rider not found")
+    rider.current_lat, rider.current_lon = loc.lat, loc.lon   # Postgres = truth
+    db.commit()
+    update_rider_location(rider_id, loc.lat, loc.lon)          # Redis index follows
+    return {"status": "updated", "rider_id": rider_id}
+```
+> **PATCH** — partial update of an existing resource. Postgres first (truth), then Redis (derived index).
+
+#### 3. Rider model — `utcnow` fix (missed in v3.2's sweep)
+```python
+# app/models/rider.py
+from datetime import datetime, UTC
+created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+```
+> Deprecated/naive `utcnow` → `datetime.now(UTC)`; `lambda` defers to per-insert. Migration-free (default lives in the ORM, not the DB column).
+
+### 🧪 Sync test (HTTP, no manual seeding)
+```bash
+redis-cli flushall
+# 1. create → auto-index, then match at that spot
+curl -X POST :8000/riders -H "Content-Type: application/json" \
+  -d '{"name":"Suresh","current_lat":28.6139,"current_lon":77.2090}'
+curl -X POST :8000/riders/match -H "Content-Type: application/json" \
+  -d '{"lat":28.6139,"lon":77.2090}'                       # → assigned_rider_id: 1
+# 2. move to Mumbai, match at OLD spot → must 404 (old cell cleaned)
+curl -X PATCH :8000/riders/1/location -H "Content-Type: application/json" \
+  -d '{"lat":19.0760,"lon":72.8777}'
+curl -X POST :8000/riders/match -H "Content-Type: application/json" \
+  -d '{"lat":28.6139,"lon":77.2090}'                       # → 404 No available rider
+# 3. match at NEW spot → found
+curl -X POST :8000/riders/match -H "Content-Type: application/json" \
+  -d '{"lat":19.0760,"lon":72.8777}'                       # → assigned_rider_id: 1
+```
+Test 2 returning **404** is the critical proof — `srem` removed the rider from the old Delhi cell. *(Note: the `orders_today` counter key is stamped in **UTC**, so on IST it may read e.g. `...:2026-06-26` after midnight UTC — inspect via `redis-cli get rider:1:orders:<UTC-date>`, not DBeaver. DBeaver shows only Postgres.)*
 ---
 
 ## Day 19 — Order State Machine
