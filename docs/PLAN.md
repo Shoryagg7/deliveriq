@@ -1446,10 +1446,11 @@ Full rider lifecycle (AVAILABLE→BUSY→AVAILABLE with re-indexing), event
 published on dispatch, consumed by a worker — and you've felt why Pub/Sub
 loses events when the consumer is down.
 ---
+### 📊 Current end-to-end flow (as of Day 20)
 
-## DeliverIQ — end-to-end flow as of Day 20
-## Dispatch (priority heap + fairness match + BUSY) and order completion
-## (free rider + re-index), plus the fire-and-forget Pub/Sub edge.
+```mermaid
+%% Dispatch (priority heap + fairness match + BUSY) and order completion
+%% (free rider + re-index), plus the fire-and-forget Pub/Sub edge.
 
 flowchart TD
     subgraph DISPATCH["POST /orders/dispatch"]
@@ -1486,8 +1487,7 @@ flowchart TD
         W --> X
         X --> Y["update_rider_location<br/>srem old + sadd new cell<br/>rider selectable again"]
     end
-
-
+```
 
 ## Day 21 — Integration Testing
 
