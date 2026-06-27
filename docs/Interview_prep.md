@@ -702,3 +702,106 @@ integer and crashes.
 
 *Shaky on any? That's your next review target.*
 ```
+# DeliverIQ — Interview Prep, Part 7 (Day 21)
+
+> Integration testing with proper isolation — a throwaway test DB, a swapped
+> Redis logical DB, and per-test reset. Same format: **concept (why)**,
+> **soundbite (how to say it)**, **gotcha (what trips people up)**.
+
+---
+
+## 23. Integration Testing & Isolation
+
+### Unit vs integration — what these tests are
+These are **integration** tests, not unit tests. Each one drives a real HTTP
+request through the full stack — endpoint → service → Redis → Postgres — and
+asserts on the response. A unit test would isolate one function with everything
+mocked; these deliberately exercise the wiring *between* layers, because the
+bugs in this project live in the seams (BUSY rider removed from the Redis index,
+rider relocated on delivery), not inside any single function.
+
+**Soundbite:** "They're integration tests — each hits a real endpoint against a
+real (test) DB and Redis, so they cover the wiring between layers. The valuable
+ones assert end-to-end behaviour: dispatch a busy rider's second order and get a
+404, proving the Redis index mirror works through the whole HTTP path, not just
+in isolation."
+
+### Isolation — the core discipline
+Tests that depend on dev-DB state aren't tests — they pass or fail based on
+leftover rows. Isolation has three parts:
+1. **A throwaway test database** (`deliveriq_test_db`), separate from dev.
+2. **A swapped Redis logical DB** — Redis has 16 (0–15); tests use 15, dev uses 0.
+3. **An autouse reset fixture** — drop+recreate all tables and `flushdb()`
+   *before every test*, so each starts from an empty, identical world.
+
+The result: tests are **repeatable** (same result every run) and
+**order-independent** (no test leaks state into the next). The `id == 1`
+assertion in the create test only holds because the reset wiped prior rows —
+it's a free proof the isolation works.
+
+**Soundbite:** "Each test runs against a throwaway test DB and a separate Redis
+logical DB, and an autouse fixture resets both before every test. That makes
+them repeatable and order-independent — a test that depends on dev-DB state
+isn't really a test."
+
+### Two override mechanisms — the senior detail ⭐
+Postgres and Redis are swapped *differently*, and knowing why is the signal:
+- **Postgres** is injected via `Depends(get_db)`. FastAPI exposes
+  `app.dependency_overrides[get_db] = ...`, so I point the dependency at a
+  session bound to the test engine. Same endpoint code, different DB.
+- **Redis** is a bare module global (`redis_client`), imported directly with no
+  `Depends`. There's no dependency to override — so the clean seam is an env var
+  (`REDIS_DB`) read at **import time**, set in conftest *before* the app imports.
+
+**Soundbite:** "The two stores need different override seams. Postgres goes
+through `Depends(get_db)`, so I use FastAPI's `dependency_overrides`. Redis is a
+module global with no dependency injection, so the seam is an env var read at
+import — which is why conftest sets `REDIS_DB=15` before importing the app.
+Recognizing that a global needs a different override strategy than an injected
+dependency is the part most people miss."
+
+**Gotcha:** the env var MUST be set before the first `import` that pulls in
+`redis_client`, because the client is constructed once at import time. Set it
+after, and the client is already bound to db 0 — your tests silently hit dev
+Redis.
+
+### TestClient — in-process, no server
+`TestClient(app)` wraps the ASGI app and lets you call it like an HTTP server
+with no uvicorn and no network. Requests run in-process, synchronously — fast
+and deterministic. It's still the *real* routing, validation, and middleware,
+just without a socket.
+
+### The autouse fixture + yield
+`@pytest.fixture(autouse=True)` runs without a test asking for it — perfect for
+universal setup like the reset. The `yield` splits setup (before) from teardown
+(after); code before `yield` runs pre-test, code after runs post-test. Here all
+the work is pre-test (drop/create/flush), so the next test's setup is also the
+previous test's cleanup.
+
+### Coverage is a map, not a grade
+86% isn't a target hit — it's a readout. The useful part is the **"Missing"
+column**: it names the lines/branches no test reached (e.g. the CANCELLED
+free-path, rate-limiter middleware, Kafka stubs). That tells you *what you
+forgot to test*, not whether the code is good. Chasing 100% means testing
+defensive branches that aren't worth it yet; ≥60% with the critical paths
+covered is the real bar.
+
+**Soundbite:** "I read coverage as a map of what's untested, not a grade. 86%
+with the full dispatch lifecycle covered matters more than a higher number that
+just exercises error branches. The 'Missing' column is the actionable part."
+
+---
+
+## 24. Self-Test — Day 21 (answer out loud)
+
+1. Unit vs integration test — which are these, and why suit this project?
+2. What three things make the tests isolated?
+3. Why does `id == 1` reliably hold in the create test?
+4. Postgres and Redis are overridden by different mechanisms — what and why?
+5. Why must `REDIS_DB=15` be set before the app is imported?
+6. What does `TestClient` give you that hitting the running server doesn't?
+7. What does `autouse=True` do, and what splits setup from teardown?
+8. Why is the busy-rider-404 test the most valuable one?
+9. How do you read a coverage report — what's the actionable part?
+
+*Shaky on any? That's your next review target.*
