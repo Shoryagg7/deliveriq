@@ -3,143 +3,16 @@
 > A self-study reference for everything built so far. Each topic has: **the concept (why)**,
 > the **interview soundbite** (how to say it out loud), and the **gotcha** (what trips people up).
 > If you can explain every soundbite without looking, you own the material.
+>
+> **Layout:** §1–2 frame the project (pitch + stack) — what an interviewer opens with.
+> §3–8 are the backend concepts. §9 onward (Alembic, then Parts 2–5) go day-by-day in depth.
 
 ---
 
-## 1. REST & HTTP Basics
+## 1. DeliverIQ — Project Talking Points
 
-### Status codes — what they signal
-- `200 OK` — success, here's the data
-- `201 Created` — success, a new resource was created (use for POST that creates)
-- `404 Not Found` — the resource doesn't exist
-- `422 Unprocessable Entity` — input failed validation (wrong type, missing field, constraint broken)
-
-**Soundbite:** "Status codes are the contract — a client decides success vs failure from the code, not the body. A missing resource is `404`, not a `200` with an error message inside."
-
-**Gotcha:** returning `200` with `{"error": "not found"}` is wrong — the client can't tell it failed. Use the right code.
-
-### Path vs Query parameters
-- **Path param** (`/orders/3`) → identity. *Which* resource. Required.
-- **Query param** (`/orders?status=PENDING`) → filter/options. Usually optional.
-
-**Soundbite:** "Path = identity, query = filter. FastAPI decides by name: if the param name appears in the route path inside `{}`, it's a path param; otherwise it's a query param."
-
-**Gotcha:** an optional filter like `status` should be a query param, not `/orders/{status}` — putting it in the path makes it required and reads as identity.
-
----
-
-## 2. Validation (FastAPI + Pydantic)
-
-### The core principle
-FastAPI validates against **the exact type you declare — no more.**
-- `str` accepts *any* string → loose gate, almost nothing rejected.
-- `int`, `Enum`, or a Pydantic model with constraints → tight gate.
-
-**Soundbite:** "Validation isn't magic — it enforces the declared contract. A loose type is a loose gate. I tighten inputs by typing them specifically: `int`, an `Enum`, or `Field(gt=0)`."
-
-### Declarative validation vs runtime checks — "type it if you can, raise it if you must"
-- **Type it (declarative):** "Is the input the right *shape*?" — knowable from input alone → use a type/Enum/Pydantic. Auto `422` at the boundary.
-- **Raise it (`HTTPException`):** "Input is valid, but does it make sense against the *data/state*?" — only knowable at runtime → check and raise.
-
-**Example:** `status` must be one of {PENDING, DELIVERED} → *static known set* → **Enum**.
-`order_id=3` exists? → *dynamic, depends on the database* → **runtime check + 404**.
-
-**Soundbite:** "Static, known-at-code-time sets become types. Data-dependent truths (does this row exist?) must be runtime checks that raise. Both look like `x not in collection`, but one the type system can express and the other it can't."
-
-### Pydantic models
-- **Request model** (`OrderCreate`) = input contract — what you accept.
-- **Response model** (`OrderResponse`) = output contract — what you expose.
-- `response_model` **filters output**: any field not declared is stripped — so internal fields can't leak. (Security boundary, not just docs.)
-- `Field(gt=0, description=...)` adds constraints + Swagger docs.
-- Pydantic **coerces when it can** (`"250"` → `250.0`), **rejects when it can't** (`"abc"` → 422).
-
-**Gotcha:** to return a SQLAlchemy object through a response model, the schema needs
-`model_config = ConfigDict(from_attributes=True)` (Pydantic v2; was `orm_mode = True` in v1).
-
-### Two kinds of "model" — don't confuse them
-| | Pydantic model | SQLAlchemy model |
-|---|---|---|
-| Lives in | `app/schemas/` | `app/models/` |
-| Job | shape of API data (validate JSON) | shape of a DB table |
-| Guards | the API door | the storage shelf |
-
-Having both for orders is **correct**, not redundant — different layers.
-
-### The error envelope
-`422` responses look like: `{"detail":[{"type","loc","msg","input"}]}`.
-`loc` tells you *where* it failed — `["body","value"]`, `["query","status"]`, `["path","order_id"]`.
-
----
-
-## 3. Databases & Persistence
-
-### In-memory vs on-disk
-A Python dict lives in the process's **RAM** → killed on restart (counter resets, data gone).
-PostgreSQL writes to **disk** → survives restarts, crashes, redeploys.
-
-**Soundbite:** "In-memory state dies with the process. A database persists to disk, so it's the durable source of truth even as the app restarts or scales to multiple instances."
-
-### Client / server model
-The database is a **separate server process** (port `5432`). Your app, `psql`, and DBeaver are all **clients** talking to it.
-
-**Soundbite:** "Postgres runs as its own server; my app is just one client connecting over a socket. That separation is what gives persistence, concurrency, and one shared source of truth."
-
-### Primary key / auto-increment
-`id` is a `SERIAL` (auto-incrementing sequence) — the DB generates it, and the counter **also persists** (next insert is 4, not 1, after a restart).
-
----
-
-## 4. SQLAlchemy / ORM
-
-### What an ORM is
-Object-Relational Mapper = a **translator**. You write Python classes; it generates SQL.
-- `engine` — the connection manager to the DB (lazy; connects when needed).
-- `Session` — one conversation/transaction with the DB.
-- `Base` — the registry; every model inheriting from it is tracked.
-
-**Soundbite:** "SQLAlchemy maps a Python class to a table. I write objects, it writes the SQL. `engine` is the connection, a `session` is one transaction, `Base` is the registry of all my tables."
-
-### create_all + THE classic trap
-`Base.metadata.create_all(bind=engine)` creates all registered tables that don't exist yet.
-
-**Gotcha:** a model only registers on `Base` when its file is **imported**. If you don't `import` the model before `create_all`, the table silently isn't created. (`from app.models.order import Order` is doing work just by running.)
-
-### Column options
-- `primary_key=True` → unique row id, DB auto-generates it.
-- `index=True` → builds a B-tree index → O(log n) lookups (vs O(n) scan).
-- `nullable=False` → required at the DB level (second layer beyond Pydantic).
-- `default=...` → auto-filled if not provided (e.g. `status="PENDING"`).
-
-### CRUD operations
-- **Create:** `db.add(obj)` → `db.commit()` (runs the INSERT) → `db.refresh(obj)` (reloads DB-generated fields like `id`, `created_at`).
-- **Read one:** `db.query(Order).filter(Order.id == x).first()` → row or `None`.
-- **Read many:** `db.query(Order).all()` (optionally `.filter(...)` first).
-
-**Gotcha:** without `db.refresh()`, `obj.id` is still `None` right after commit.
-
-### Dependency Injection (`Depends(get_db)`)
-`db: Session = Depends(get_db)` → FastAPI runs `get_db` before the endpoint, hands in a fresh session, and closes it after (the `try/finally`). Every request gets its own short-lived, auto-closed session.
-
-**Soundbite:** "Each request gets its own DB session via dependency injection — opened before the handler, closed after, automatically. No leaked connections."
-
----
-
-## 5. Project Structure
-
-```
-app/
-├── core/        # database.py: engine, SessionLocal, Base, get_db
-├── models/      # SQLAlchemy models (DB tables)
-├── schemas/     # Pydantic models (API in/out)
-├── routers/     # APIRouter modules (grouped endpoints)
-└── main.py      # create_all + FastAPI app + include_router
-```
-
-**APIRouter:** `APIRouter(prefix="/orders", tags=["orders"])` groups related routes in their own file; `app.include_router(...)` plugs them in. Keeps `main.py` thin.
-
----
-
-## 6. DeliverIQ — Project Talking Points
+### The one-line pitch
+> "A production-grade REST API that dispatches food-delivery orders to riders using priority queues, geohashing, rate limiting, and event streaming — FastAPI, Redis, Kafka, PostgreSQL, Docker."
 
 ### The differentiator: fairness-banded dispatch
 Instead of naive nearest-rider, among riders within a distance band Δ of the nearest, assign the one with the **fewest orders today**.
@@ -152,6 +25,8 @@ Instead of naive nearest-rider, among riders within a distance band Δ of the ne
 ### DSA core (steer interviews here)
 - **Priority queue** dispatch — O(log n) ordering.
 - **Geohash** rider matching — O(1) grid-cell lookup vs O(n) scan.
+- **Fairness band** — constrained assignment, a min-heap on a composite key.
+- **State machine** — a directed graph of legal order transitions.
 - These are the same nearest-neighbour shape as the FAISS work in SemanticCache.
 
 ### Honest framing
@@ -159,31 +34,7 @@ Instead of naive nearest-rider, among riders within a distance band Δ of the ne
 
 ---
 
-## 7. Quick-Fire Self-Test (answer out loud, no notes)
-
-1. When do you return `201` vs `200` vs `404` vs `422`?
-2. Path param vs query param — how does FastAPI decide which is which?
-3. Why does `status="banana"` give `422` with an Enum but `200 []` with a plain `str`?
-4. "Type it if you can, raise it if you must" — explain with `status` vs `order_id`.
-5. What does `response_model` do to fields you return but didn't declare?
-6. What's the difference between a Pydantic model and a SQLAlchemy model?
-7. Why does in-memory data reset on restart but the DB doesn't?
-8. What are `engine`, `session`, and `Base`?
-9. Why must you `import` a model before `create_all`?
-10. Walk through `add` → `commit` → `refresh`. What breaks if you skip `refresh`?
-11. What does `Depends(get_db)` give each request, and what closes the session?
-12. Explain fairness-banded dispatch and why it's a constrained assignment problem.
-13. Why can't you keep using `create_all` in production?
-14. What's the `env.py` import trap, and what bad thing happens if you hit it?
-15. Why review an autogenerated migration before applying it?
-16. What does the `alembic_version` table store?
-17. `default=` vs `nullable=False` — what's the difference?
-
-*If any answer is shaky, that's your next review target.*
-
----
-
-## 8. Tech Stack — Why These, and the Alternatives
+## 2. Tech Stack — Why These, and the Alternatives
 
 > Interviewers ask "why did you choose X?" to check whether you **decided** or just
 > copied a tutorial. The strong answer always names the **trade-off** and a credible
@@ -191,50 +42,230 @@ Instead of naive nearest-rider, among riders within a distance band Δ of the ne
 > industry-standard tools my target companies (Uber, Razorpay, PhonePe) actually use.
 
 ### Python
-- **Why:** fast to build, huge ecosystem, and it spans backend *and* AI/ML (matters for SemanticCache). The bottleneck in this app is I/O (DB, network), not CPU, so raw language speed isn't the constraint.
-- **Alternatives:** **Go** (compiled, excellent concurrency — Uber uses it heavily; faster but more verbose, weaker ML ecosystem). **Java/Spring** (enterprise-standard, very mature, but heavy boilerplate). **Node.js** (also great at I/O; Python won for the AI side).
+- **Why:** fast to build, huge ecosystem, spans backend *and* AI/ML (matters for SemanticCache). The bottleneck here is I/O (DB, network), not CPU, so raw language speed isn't the constraint.
+- **Alternatives:** **Go** (compiled, great concurrency — Uber uses it; faster but more verbose, weaker ML ecosystem). **Java/Spring** (enterprise-standard, mature, heavy boilerplate). **Node.js** (also great at I/O; Python won for the AI side).
 - **Soundbite:** "I/O-bound service, so developer speed beat raw speed. Go would be faster but I wanted Python's ecosystem and the ML overlap with my second project."
 
 ### FastAPI (web framework)
-- **Why:** async-first (handles many concurrent I/O requests), validation built in via Pydantic, and **auto-generated OpenAPI/Swagger docs**. Minimal boilerplate, type-hint driven.
-- **Alternatives:** **Flask** (simpler but you bolt on validation/docs/async yourself). **Django + DRF** (batteries-included with ORM/admin/auth, but heavy and opinionated — overkill for a focused API, less async-native).
+- **Why:** async-first, validation built in via Pydantic, **auto-generated OpenAPI/Swagger docs**. Minimal boilerplate, type-hint driven.
+- **Alternatives:** **Flask** (simpler but you bolt on validation/docs/async). **Django + DRF** (batteries-included, but heavy, less async-native — overkill for a focused API).
 - **Soundbite:** "FastAPI gives me async, validation, and live docs out of the box. Flask is lighter but I'd rebuild those; Django is heavier than an API-first service needs."
 
 ### PostgreSQL (database)
-- **Why:** ACID-compliant relational DB — orders and riders have clear relationships and I can't afford to lose an order. Rich SQL (window functions, indexes), great JSON support, and **PostGIS** for geospatial (relevant to a location-based dispatch system).
-- **Alternatives:** **MySQL** (also solid; Postgres wins on window functions, JSON, geospatial, stricter SQL). **MongoDB** (flexible schema, but my data is relational and needs consistency — NoSQL fits unstructured, denormalized, massive-scale data). **SQLite** (great for dev, not concurrent production load).
+- **Why:** ACID relational DB — orders and riders have clear relationships and I can't afford to lose an order. Rich SQL (window functions, indexes), JSON support, **PostGIS** for geospatial.
+- **Alternatives:** **MySQL** (solid; Postgres wins on window functions, JSON, geospatial, stricter SQL). **MongoDB** (flexible schema, but my data is relational and needs consistency). **SQLite** (great for dev, not concurrent production load).
 - **Soundbite:** "Structured, related data that needs consistency → relational + ACID. Postgres over MySQL for window functions and geospatial; over Mongo because losing an order isn't acceptable."
 
 ### SQLAlchemy (ORM)
-- **Why:** most mature Python ORM, pairs cleanly with FastAPI, lets me write Python but drop to raw SQL when needed, and is database-agnostic.
-- **Alternatives:** **Raw SQL via psycopg2** (max control/performance, more boilerplate, injection risk if careless). **SQLModel** (newer, merges Pydantic + SQLAlchemy — promising but less battle-tested). **Tortoise ORM** (async-native).
-- **Trade-off to acknowledge:** ORMs add abstraction and can generate inefficient queries (the N+1 problem) — you trade some control for productivity.
+- **Why:** most mature Python ORM, pairs cleanly with FastAPI, lets me write Python but drop to raw SQL when needed, database-agnostic.
+- **Alternatives:** **Raw SQL via psycopg2** (max control, more boilerplate, injection risk if careless). **SQLModel** (newer, merges Pydantic + SQLAlchemy — less battle-tested). **Tortoise ORM** (async-native).
+- **Trade-off:** ORMs add abstraction and can generate inefficient queries (N+1) — you trade some control for productivity.
 
 ### Pydantic (validation)
-- **Why:** comes with FastAPI; declarative validation + serialization from type hints, with structured error output.
-- **Alternatives:** **marshmallow** (older, more manual), or hand-rolled validation. Pydantic is the modern standard.
+- **Why:** ships with FastAPI; declarative validation + serialization from type hints, structured error output.
+- **Alternatives:** **marshmallow** (older, more manual), or hand-rolled. Pydantic is the modern standard.
 
-### Redis (caching, rate limiting, rider state) — *upcoming*
-- **Why:** in-memory key-value store, sub-millisecond, perfect for hot ephemeral state: rate-limit counters, rider locations, `orders_today`. Has TTLs, pub/sub, and rich structures (sorted sets, native geo commands, hashes).
-- **Alternatives:** **Memcached** (simpler cache, but no rich structures/persistence/pub-sub). **In-process memory** (doesn't work across multiple app instances — Redis is shared state).
-- **Soundbite:** "I need fast, shared, ephemeral state across app instances. Redis over Memcached for sorted sets and geo; over in-memory because that doesn't survive scaling horizontally."
+### Redis (caching, rate limiting, rider state)
+- **Why:** in-memory key-value, sub-millisecond, perfect for hot ephemeral state: rate-limit counters, rider locations, `orders_today`. TTLs, pub/sub, rich structures (sorted sets, geo, hashes).
+- **Alternatives:** **Memcached** (simpler cache, no rich structures/persistence/pub-sub). **In-process memory** (doesn't work across instances — Redis is shared state).
+- **Soundbite:** "Fast, shared, ephemeral state across app instances. Redis over Memcached for sorted sets and geo; over in-memory because that doesn't survive scaling horizontally."
 
 ### Kafka (event streaming) — *upcoming*
-- **Why:** durable, high-throughput, replayable event log. Decouples producers from consumers — one order event fans out to notification, analytics, and audit as independent consumer groups reading the same log.
-- **Alternatives:** **RabbitMQ** (great task queue with smart routing/acks, but Kafka is better for high-throughput streaming, replay, and many independent consumers of the same stream). **Redis Pub/Sub** (simple but not durable — messages vanish with no subscriber). **AWS SQS/SNS** (managed, but ties you to AWS).
-- **Soundbite:** "I want a durable, replayable log many consumers read independently — that's Kafka's model. RabbitMQ is a queue, not a log; Redis pub/sub isn't durable."
+- **Why:** durable, high-throughput, replayable event log. Decouples producers from consumers — one order event fans out to notification, analytics, audit as independent consumer groups.
+- **Alternatives:** **RabbitMQ** (great task queue, but Kafka wins on high-throughput streaming, replay, many independent consumers). **Redis Pub/Sub** (simple, not durable). **AWS SQS/SNS** (managed, ties you to AWS).
+- **Soundbite:** "A durable, replayable log many consumers read independently — that's Kafka. RabbitMQ is a queue, not a log; Redis pub/sub isn't durable."
 
-### Docker (containerization) — *upcoming*
-- **Why:** reproducible environment ("works on my machine" → works everywhere), easy multi-service local setup with Compose (app + Postgres + Redis + Kafka), simple deploys.
-- **Alternatives:** bare-metal/venv only (not reproducible across machines), **Podman** (Docker-compatible). Docker is the de facto standard.
-
-### Prometheus + Grafana (observability) — *upcoming*
-- **Why:** Prometheus scrapes metrics (pull model), Grafana visualizes them. The standard open-source combo.
-- **Alternatives:** **Datadog / New Relic** (managed SaaS, paid), **ELK** (more for logs than metrics).
+### Docker / Compose, Prometheus + Grafana — *upcoming*
+- **Docker:** reproducible env, easy multi-service local setup, simple deploys. Alt: bare-metal/venv (not reproducible), Podman.
+- **Prometheus + Grafana:** Prometheus scrapes metrics (pull), Grafana visualizes. Alt: Datadog/New Relic (paid SaaS), ELK (more for logs).
 
 ### The honest meta-answer
 "Some of these (Kafka, Prometheus) are more than a small project strictly needs. I added them deliberately to learn the production patterns my target companies use, and I can defend each one's trade-off rather than just listing it."
 
+---
+
+## 3. REST & HTTP Basics
+
+### Status codes — what they signal
+- `200 OK` — success, here's the data.
+- `201 Created` — success, a new resource was created (use for POST that creates).
+- `400 Bad Request` — the request is well-formed but **illegal given current state** (e.g. an illegal order-status transition). *Your* logic raised it.
+- `404 Not Found` — the resource doesn't exist.
+- `422 Unprocessable Entity` — input failed **validation** (wrong type, missing field, constraint broken). FastAPI raises this automatically.
+- `429 Too Many Requests` — rate limit exceeded (the token bucket).
+- `503 Service Unavailable` — health check degraded (a dependency is down). *Upcoming, Day 38.*
+
+**Soundbite:** "Status codes are the contract — a client decides success vs failure from the code, not the body. A missing resource is `404`, not a `200` with an error inside."
+
+### 400 vs 422 — the distinction (learned at the state machine)
+Both are "client's request didn't work," but they mean different things:
+- **422** = *malformed* — the input doesn't match the declared shape. FastAPI/Pydantic raises it **automatically** at the boundary (`status="banana"` against an Enum).
+- **400** = *well-formed but illegal* — the input is a valid shape, but doesn't make sense against current state (a legal-looking status that's an illegal *transition*). **You** raise it at runtime.
+
+**Soundbite:** "422 is the type system rejecting a malformed request automatically; 400 is my own runtime check rejecting a well-formed but state-illegal one. Same family — different cause, different layer. 'Type it if you can, raise it if you must.'"
+
+### HTTP verbs — and choosing them by *semantics*, not habit
+- **GET** — read, **safe** (no side effects) and **idempotent**. Must never mutate.
+- **POST** — create a resource, *or* trigger a **side-effecting action** (`/orders/dispatch`, `/riders/match` — they mutate state / increment counters). Not idempotent.
+- **PATCH** — **partial** update of an existing resource (rider location, order status — change a few fields).
+- **PUT** — **full** replace of a resource (send the whole object). Idempotent.
+- **DELETE** — remove a resource. Idempotent.
+
+**Soundbite:** "Verb follows semantics. `/match` and `/dispatch` are POST even though they don't 'create' anything — they have side effects (incrementing a counter, flipping status), and side effects can't sit behind a GET, which must stay safe and idempotent. Location and status updates are PATCH because they're partial edits, not full replacements."
+
+**Gotcha:** putting a mutation behind a GET is the classic violation — a crawler or a retry could silently fire it. Safe/idempotent is a *contract*, not a suggestion.
+
+### Path vs Query parameters
+- **Path param** (`/orders/3`) → identity. *Which* resource. Required.
+- **Query param** (`/orders?status=PENDING`) → filter/options. Usually optional.
+
+**Soundbite:** "Path = identity, query = filter. FastAPI decides by name: if the param name appears in the route path inside `{}`, it's a path param; otherwise it's a query param."
+
+**Gotcha:** an optional filter like `status` should be a query param, not `/orders/{status}` — putting it in the path makes it required and reads as identity.
+
+### The error envelope
+`422` responses look like: `{"detail":[{"type","loc","msg","input"}]}`.
+`loc` tells you *where* it failed — `["body","value"]`, `["query","status"]`, `["path","order_id"]`.
+
+---
+
+## 4. Validation (FastAPI + Pydantic)
+
+### The core principle
+FastAPI validates against **the exact type you declare — no more.**
+- `str` accepts *any* string → loose gate, almost nothing rejected.
+- `int`, `Enum`, or a Pydantic model with constraints → tight gate.
+
+**Soundbite:** "Validation isn't magic — it enforces the declared contract. A loose type is a loose gate. I tighten inputs by typing them specifically: `int`, an `Enum`, or `Field(gt=0)`."
+
+### Declarative validation vs runtime checks — "type it if you can, raise it if you must"
+- **Type it (declarative):** "Is the input the right *shape*?" — knowable from input alone → use a type/Enum/Pydantic. Auto `422` at the boundary.
+- **Raise it (`HTTPException`):** "Input is valid, but does it make sense against the *data/state*?" — only knowable at runtime → check and raise.
+
+**Example:** `status` ∈ {PENDING, DELIVERED} → *static known set* → **Enum** (422 on bad). `order_id=3` exists? → *dynamic, depends on DB* → **runtime check + 404**. A status *transition* being legal → *depends on current state* → **runtime check + 400**.
+
+**Soundbite:** "Static, known-at-code-time sets become types. Data-dependent truths — does this row exist, is this transition legal — must be runtime checks that raise. Both look like `x not in collection`, but one the type system can express and the other it can't."
+
+### Pydantic models
+- **Request model** (`OrderCreate`) = input contract — what you accept.
+- **Response model** (`OrderResponse`) = output contract — what you expose.
+- `response_model` **filters output**: any field not declared is stripped — internal fields can't leak. (Security boundary, not just docs.)
+- `Field(gt=0, description=...)` adds constraints + Swagger docs.
+- Pydantic **coerces when it can** (`"250"` → `250.0`), **rejects when it can't** (`"abc"` → 422).
+
+**Gotcha:** to return a SQLAlchemy object through a response model, the schema needs `model_config = ConfigDict(from_attributes=True)` (Pydantic v2; was `orm_mode = True` in v1).
+
+### Two kinds of "model" — don't confuse them
+| | Pydantic model | SQLAlchemy model |
+|---|---|---|
+| Lives in | `app/schemas/` | `app/models/` |
+| Job | shape of API data (validate JSON) | shape of a DB table |
+| Guards | the API door | the storage shelf |
+
+Having both for orders is **correct**, not redundant — different layers.
+
+### One enum, one home (learned at the state machine)
+`OrderStatus` is shared by schemas, models, dispatch, *and* the state machine. Define it **once** in `app/core/enums.py` and import everywhere. Two definitions silently drift — and two enum classes compare unequal even when their values match (`schemas.OrderStatus.PENDING != core.OrderStatus.PENDING`).
+
+**Gotcha:** a `# type: ignore` on an *import* is a smell — it's usually silencing a real `ModuleNotFoundError` (the file you're importing from doesn't exist yet). Comments that suppress errors hide the bug you need to see.
+
+---
+
+## 5. Databases & Persistence
+
+### In-memory vs on-disk
+A Python dict lives in the process's **RAM** → killed on restart (counter resets, data gone). PostgreSQL writes to **disk** → survives restarts, crashes, redeploys.
+
+**Soundbite:** "In-memory state dies with the process. A database persists to disk, so it's the durable source of truth even as the app restarts or scales to multiple instances."
+
+### Client / server model
+The database is a **separate server process** (port `5432`). Your app, `psql`, and DBeaver are all **clients** talking to it. (Same for Redis on `6379` — which is why Redis state shows in `redis-cli`, never in DBeaver.)
+
+**Soundbite:** "Postgres runs as its own server; my app is just one client over a socket. That separation is what gives persistence, concurrency, and one shared source of truth."
+
+### Primary key / auto-increment
+`id` is a `SERIAL` (auto-incrementing sequence) — the DB generates it, and the counter **persists** (next insert is 4, not 1, after a restart). Sequences never reset on DELETE; gaps are intentional so old references never silently re-point.
+
+---
+
+## 6. SQLAlchemy / ORM
+
+### What an ORM is
+Object-Relational Mapper = a **translator**. You write Python classes; it generates SQL.
+- `engine` — the connection manager to the DB (lazy; connects when needed).
+- `Session` — one conversation/transaction with the DB.
+- `Base` — the registry; every model inheriting from it is tracked.
+
+**Soundbite:** "SQLAlchemy maps a Python class to a table. I write objects, it writes the SQL. `engine` is the connection, a `session` is one transaction, `Base` is the registry of all my tables."
+
+### create_all + THE classic trap
+`Base.metadata.create_all(bind=engine)` creates all registered tables that don't exist yet.
+
+**Gotcha:** a model only registers on `Base` when its file is **imported**. If you don't `import` the model before `create_all`, the table silently isn't created. (`from app.models.order import Order` is doing work just by running.) *(In this project Alembic owns the schema — see §9 — but the import-trap principle recurs in `env.py`.)*
+
+### Column options
+- `primary_key=True` → unique row id, DB auto-generates it.
+- `index=True` → B-tree index → O(log n) lookups (vs O(n) scan).
+- `nullable=False` → required at the DB level (second layer beyond Pydantic).
+- `default=...` → auto-filled if not provided. **Wrap a callable in `lambda`** (`default=lambda: datetime.now(UTC)`) so it's evaluated **per insert**, not once at import.
+
+### CRUD operations
+- **Create:** `db.add(obj)` → `db.commit()` (runs the INSERT) → `db.refresh(obj)` (reloads DB-generated fields like `id`, `created_at`).
+- **Read one:** `db.query(Order).filter(Order.id == x).first()` → row or `None`.
+- **Read many:** `db.query(Order).all()` (optionally `.filter(...)` first).
+
+**Gotcha:** without `db.refresh()`, `obj.id` is still `None` right after commit — which breaks anything downstream that needs the id (e.g. indexing a new rider into Redis: commit → refresh → `add_rider`).
+
+### Dependency Injection (`Depends(get_db)`)
+`db: Session = Depends(get_db)` → FastAPI runs `get_db` before the endpoint, hands in a fresh session, closes it after (the `try/finally`). Every request gets its own short-lived, auto-closed session.
+
+**Soundbite:** "Each request gets its own DB session via dependency injection — opened before the handler, closed after, automatically. No leaked connections."
+
+### The type-checker squiggle (SQLAlchemy + Pylance)
+`new_rider.id` / `.current_lat` show red underlines because SQLAlchemy types columns as `Column[...]` at the class level while returning real values at runtime. **Harmless** — runtime works. The clean fix is SQLAlchemy 2.0's `Mapped[int]` / `mapped_column(...)` annotations (deferred to the Day 43 quality sweep).
+
+---
+
+## 7. Project Structure
+
+```
+app/
+├── core/        # database.py, redis_client.py, enums.py (one OrderStatus), config.py
+├── models/      # SQLAlchemy models (DB tables)
+├── schemas/     # Pydantic models (API in/out)
+├── routers/     # APIRouter modules (grouped endpoints)
+├── services/    # business logic / algorithms (dispatch, geohash, order_state)
+├── middleware/  # runs on every request (rate limiter)
+└── main.py      # FastAPI app + include_router
+```
+
+**Separation of concerns:** routers = *what endpoints exist*; schemas = *what shape data has*; services = *how the logic works*; models = *what the DB stores*; core = glue (connections, shared enums). **`core` = infrastructure glue, `services` = business logic** — that's why `dispatch.py` belongs in `services/`, not `core/`.
+
+**APIRouter:** `APIRouter(prefix="/orders", tags=["orders"])` groups related routes in their own file; `app.include_router(...)` plugs them in. Keeps `main.py` thin.
+
+---
+
+## 8. Quick-Fire Self-Test (Pre-Alembic concepts)
+
+1. When do you return `200` / `201` / `400` / `404` / `422` / `429`?
+2. 400 vs 422 — what's the difference, and which one does FastAPI raise for you?
+3. Why are `/dispatch` and `/match` POST and not GET? Why is location-update PATCH not PUT?
+4. Path param vs query param — how does FastAPI decide which is which?
+5. Why does `status="banana"` give `422` with an Enum but `200 []` with a plain `str`?
+6. "Type it if you can, raise it if you must" — explain with `status` vs `order_id` vs a status *transition*.
+7. What does `response_model` do to fields you return but didn't declare?
+8. Pydantic model vs SQLAlchemy model — what's the difference?
+9. Why must `OrderStatus` live in one file, and what's the `# type: ignore`-on-import smell?
+10. Why does in-memory data reset on restart but the DB doesn't?
+11. What are `engine`, `session`, and `Base`?
+12. Walk through `add` → `commit` → `refresh`. What breaks if you skip `refresh`?
+13. Why wrap a `default=` callable in `lambda`?
+14. What does `Depends(get_db)` give each request, and what closes the session?
+15. Why do SQLAlchemy column attributes show type-checker squiggles, and are they real?
+
+*If any answer is shaky, that's your next review target.*
+
+---
 ---
 
 ## 9. Database Migrations (Alembic)
