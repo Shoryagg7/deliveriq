@@ -1676,51 +1676,55 @@ htmlcov/
 ### ✅ End of Day
 7 integration tests covering the full dispatch lifecycle, isolated test DB +
 Redis, 86% coverage. Tests are repeatable and order-independent.
+# DeliverIQ — Plan Ahead (v4, Days 22→45 reorganized)
 
-## Day 22 — Structured Logging
-Replace `print()` with JSON logs. `app/core/logging_config.py`:
-```python
-import logging, json
-from datetime import datetime, UTC
+> Replaces Days 22–45 of v3.2. Days 1–21 are done and unchanged.
+> Reordered by **dependency**, with the logical gaps in v3.2 fixed.
+> Same per-day rhythm (goal → key code/decision → gotcha → ✅), but lighter on
+> tutorial prose — you build each day with full code in-session.
 
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        return json.dumps({
-            "timestamp": datetime.now(UTC).isoformat(),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-        })
+---
 
-def setup_logging():
-    handler = logging.StreamHandler()
-    handler.setFormatter(JsonFormatter())
-    logging.basicConfig(level=logging.INFO, handlers=[handler])
-```
-> 🐛 **Corrected:** `datetime.now(UTC)` (not deprecated `utcnow()`).
-Call `setup_logging()` in `main.py`; replace every `print()` with `logger.info(...)`.
-**✅** Logs come out as JSON.
+## What changed from v3.2 (and why the reorder)
 
-## Day 23 — Custom Exceptions
-`app/core/exceptions.py`:
-```python
-class DeliverIQException(Exception): ...
-class OrderNotFound(DeliverIQException): ...
-class RiderUnavailable(DeliverIQException): ...
-class InvalidStateTransition(DeliverIQException): ...
-```
-In `main.py`:
-```python
-from fastapi.responses import JSONResponse
-from app.core.exceptions import OrderNotFound
+| # | Problem in v3.2 | Fix in v4 |
+|---|---|---|
+| 1 | Migrations never run in Docker/Railway (`create_all` gone since Day 14) → no tables | Migration entrypoint (`alembic upgrade head`) added to Dockerize day; Railway release command |
+| 2 | `Settings` created but never consumed; test seams hardcoded → CI breaks | **Config day moved up (Day 23)**; `database.py`/`redis_client.py`/Kafka refactored to read it; test URLs env-driven |
+| 3 | Rate limiter throttles Locust (1 IP → 100 tokens → 429) | Env toggle `RATE_LIMIT_ENABLED` + per-key option, added in the limiter-hardening day before load test |
+| 4 | Idempotency middleware `response.body` bug | Rewritten to consume `body_iterator` and rebuild the response |
+| 5 | Kafka `localhost:9092` breaks in Compose/Upstash | Bootstrap from config (`kafka:9092` in Compose, SASL_SSL on Upstash) |
+| 6 | "Distributed" via Redis sorted set discards aging + work-conserving loop | **Primary path = Postgres `SELECT … FOR UPDATE SKIP LOCKED`** (preserves aging + fairness + rider loop); sorted-set is an optional alt |
+| 7 | JWT day drops Day-19 ownership/role checks; no User model/migration | Auth day expanded: User model + migration + the deferred status-endpoint authz |
+| 8 | Rate-limiter read-write race real at multi-instance, never fixed | Atomic Lua/pipeline in the hardening day, before scaling |
+| 9 | Health check omits Kafka | Added to the health day |
+| 10 | Custom exceptions unused; name clash with `InvalidTransition` | Integrated into real raises; renamed to avoid clash |
+| 11 | `request_id` cited in interviews, never built | Added to the logging day (correlation middleware) |
+| 12 | Rider penalty (Day-19 deferred) unscheduled, no field | Scheduled a small slot in the auth/events area; or explicitly drop + soften |
 
-@app.exception_handler(OrderNotFound)
-async def order_not_found_handler(request, exc):
-    return JSONResponse(status_code=404, content={"error": "ORDER_NOT_FOUND", "message": str(exc)})
-```
-**✅** Clean JSON errors, no tracebacks leaking.
+Minor cleanups folded in: routers are **plural** in real code (`orders.py`, `riders.py`) — reconcile the structure doc; `last_assigned_at` is a dead write (remove in the quality sweep); `INTERVIEW_NOTES.md` → use the real `Interview_prep.md`.
 
-## Day 24 — Environment Config with .env
+---
+
+# PHASE 4 — Production Hardening (local) · Days 22–26
+
+## Day 22 — Structured Logging + request_id correlation
+**Goal:** JSON logs, and a `request_id` on every log line so you can trace one request end-to-end (the thing interview Q16 claims).
+
+- `app/core/logging_config.py` — `JsonFormatter` (timestamp via `datetime.now(UTC)`, level, logger, message, **request_id**), `setup_logging()`.
+- `app/middleware/request_id.py` — middleware that generates a UUID per request, stashes it in a `contextvars.ContextVar`, and the formatter reads it. Add `X-Request-ID` to the response.
+- Replace the `print()` in `notification_worker.py` (and any others) with `logger.info(...)`.
+- Register `setup_logging()` in `main.py`.
+
+**Gotcha:** middleware order — request_id must run **outermost** so every downstream log (including the rate limiter) carries the id. `contextvars` (not a global) is what makes the id correct under async concurrency.
+
+**✅** Every log line is JSON with a request_id; one request is greppable across the app and the worker.
+
+---
+
+## Day 23 — Centralized Config (.env + Settings)  *(moved up — everything downstream reads it)*
+**Goal:** one config object; zero hardcoded URLs; test seams env-driven so Docker and CI work later.
+
 ```bash
 pip install pydantic-settings python-dotenv
 ```
@@ -1729,498 +1733,283 @@ pip install pydantic-settings python-dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     database_url: str
-    redis_url: str = "redis://localhost:6379"
-    rate_limit_per_minute: int = 100
+    redis_url: str = "redis://localhost:6379/0"
+    kafka_bootstrap: str = "localhost:9092"
+    rate_limit_enabled: bool = True
+    rate_limit_capacity: int = 100
+    rate_limit_refill_per_min: int = 100
 
 settings = Settings()
 ```
-`.env` (gitignored) and `.env.example` (committed, blank values). Use `settings.database_url` everywhere — no hardcoded secrets.
-🐧 `echo $DATABASE_URL` to check; `export VAR="..."` to set for the shell.
-**✅** Zero hardcoded secrets.
+**Then actually consume it (the step v3.2 skipped):**
+- `database.py`: `create_engine(settings.database_url)`.
+- `redis_client.py`: `redis.Redis.from_url(settings.redis_url, decode_responses=True)` — **but keep the test seam**: tests point `REDIS_URL` at db 15 (`redis://localhost:6379/15`). The `REDIS_DB` env from Day 21 is replaced by a full `redis_url` override in conftest.
+- `rate_limiter.py`: read capacity/refill/enabled from `settings`.
+- `.env` (gitignored) + `.env.example` (committed, blank values).
 
-## Day 25 — Dockerize
-Install Docker (Ubuntu):
-```bash
-sudo apt update && sudo apt install ca-certificates curl gnupg lsb-release -y
-sudo mkdir -p /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt update && sudo apt install docker-ce docker-ce-cli containerd.io docker-compose-plugin -y
-sudo usermod -aG docker $USER && newgrp docker
-docker --version && docker compose version
-```
+**Gotcha:** conftest must set `os.environ["DATABASE_URL"]` and `os.environ["REDIS_URL"]` to the **test** values *before* importing the app — same import-time seam as before, now for both stores. This is what makes CI (Day 36) pass without hardcoding.
+
+**✅** `grep -r "postgresql://" app/` and `localhost:6379` return nothing outside config; tests still green.
+
+---
+
+## Day 24 — Custom Exceptions (integrated, not dead code)
+**Goal:** a clean JSON error envelope, wired into the **existing** raises — not a parallel set of unused classes.
+
+- `app/core/exceptions.py`: `DeliverIQError` base + `OrderNotFound`, `RiderNotFound`, `RiderUnavailable`. **Do not** redefine state-transition errors — reuse the existing `InvalidTransition` from `order_state.py` (the v3.2 `InvalidStateTransition` was a name clash).
+- Register `@app.exception_handler(...)` for each → `{"error": "CODE", "message": ...}`.
+- **Refactor existing endpoints** to raise these instead of bare `HTTPException(404, ...)`. If you don't refactor, the day is dead code — that's the whole point of doing it now.
+
+**Gotcha:** keep `InvalidTransition` → 400 mapping (the Day-19 semantics: well-formed but illegal). The handler just standardizes the body shape.
+
+**✅** A missing order returns `{"error":"ORDER_NOT_FOUND","message":...}`, no stack traces leak, and every router uses the typed exceptions.
+
+---
+
+## Day 25 — Rate-Limiter Hardening (atomic + toggleable)  *(prereq for scaling AND load test)*
+**Goal:** kill the read-write race and make the limiter controllable — so multi-instance (Day 28) is safe and the load test (Day 27) produces real numbers.
+
+1. **Atomic check** — collapse HGETALL→compute→HSET into one **Lua script** (or a `pipeline`/`WATCH`), so two concurrent requests can't both read the same token count. One round-trip, no interleave. (This is the "at scale I'd use Lua" line — now built.)
+2. **Toggle + config** — `if not settings.rate_limit_enabled: return await call_next(request)`. Capacity/refill from `settings`.
+3. **Per-key for load tests** — Locust can send a unique `X-API-Key` per simulated user so each gets its own bucket; otherwise one IP throttles the whole test.
+
+**Gotcha:** the Lua script runs server-side in Redis, which is *why* it's atomic — Redis executes a script without interleaving other commands. This is the senior version of the Day-16 limiter.
+
+**✅** Concurrent requests can't desync the bucket; `RATE_LIMIT_ENABLED=false` disables it; per-API-key buckets work.
+
+---
+
+## Day 26 — Admin Analytics Endpoint
+**Goal:** aggregation endpoint (its own router, since JWT will protect it on Day 31).
+
+- `app/routers/admin.py` — `GET /admin/stats`: total orders, count by status, avg value, count of BUSY vs AVAILABLE riders.
+- Register the router.
+
+**Gotcha:** give it its **own router** now so the JWT bearer dependency attaches cleanly later. `func.count`, `group_by` are SQLAlchemy aggregates.
+
+**✅** `/admin/stats` returns live counts (open for now; locked on Day 31).
+
+---
+
+# PHASE 5 — Containerization (done right) · Days 27–28
+
+## Day 27 — Dockerize (with migrations) + Load Test
+**Goal:** the app runs in a container **with its schema applied**, then measure real throughput.
+
 `Dockerfile`:
 ```dockerfile
 FROM python:3.14-slim
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
 ```
-```bash
-docker build -t deliveriq .
-docker run -p 8000:8000 --env-file .env deliveriq
-```
-🐧 `permission denied` on Docker → `newgrp docker` or log out/in; verify with `groups $USER`.
-**✅** App runs in a container.
+> **The migration fix:** `alembic upgrade head` runs **before** uvicorn, so the container always has the current schema. Without this the container has no tables.
 
-## Day 26 — Docker Compose (Full Stack)
-`docker-compose.yml`:
-```yaml
-services:
-  api:
-    build: .
-    ports: ["8000:8000"]
-    environment:
-      DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
-      REDIS_URL: redis://redis:6379
-    depends_on: [db, redis]
-  db:
-    image: postgres:18
-    environment:
-      POSTGRES_DB: deliveriq_db
-      POSTGRES_USER: deliveriq_user
-      POSTGRES_PASSWORD: password
-    volumes: ["pg_data:/var/lib/postgresql/data"]
-    ports: ["5432:5432"]
-  redis:
-    image: redis:7-alpine
-    ports: ["6379:6379"]
-volumes:
-  pg_data:
-```
-`docker compose up --build` → `localhost:8000/docs`.
-🐧 Port clash on 5432/6379 → stop native services: `sudo systemctl stop postgresql redis-server`.
-### 🔥 Break It On Purpose
-Remove `depends_on: [db, redis]`. The API starts before Postgres is ready → `connection refused`. Restore it (startup ordering).
-
-### 🟥 Earn the "distributed" claim — multi-instance dispatch (the deferred Day-17 work lands here)
-Now that the stack runs in Compose, this is where you make "distributed" *true* on your resume:
-1. Scale the API to multiple replicas: `docker compose up --build --scale api=3` (and put nginx or Compose's load balancing in front if needed).
-2. Move the dispatch queue from the in-process `heapq` into a **Redis sorted set** (`ZADD` on create, `ZREVRANGE` to peek, `ZREM` to claim) — see Day 17's scale-up note.
-3. **Demonstrate the race + fix:** with the old heap, two instances can claim the same order. With `ZREM`, only one instance gets the `1` return → atomic claim guard. Capture this — it's a top-tier war story ("two instances double-dispatched; ZREM's atomic return fixed it").
-Once this works and you can show it, "distributed" is earned. If you skip it, soften the resume wording instead.
-
-**✅** One command brings up the whole stack; dispatch survives multiple API instances via Redis-sorted-set claims.
-
-## Day 27 — Admin Analytics Endpoint
-```python
-from sqlalchemy import func
-from app.models.order import Order
-
-@router.get("/admin/stats")
-def stats(db: Session = Depends(get_db)):
-    total = db.query(func.count(Order.id)).scalar()
-    by_status = db.query(Order.status, func.count(Order.id)).group_by(Order.status).all()
-    avg_value = db.query(func.avg(Order.value)).scalar()
-    return {"total_orders": total, "by_status": dict(by_status), "avg_order_value": float(avg_value or 0)}
-```
-**✅** Aggregation endpoint working.
-
-## Day 28 — Load Testing
+**Load test** (after the container runs, or against local):
 ```bash
 pip install locust
 ```
-`load_test.py`:
-```python
-from locust import HttpUser, task, between
+- Locust task posts orders; **set a unique `X-API-Key` per user** (or run with `RATE_LIMIT_ENABLED=false`) so the limiter doesn't turn the test into a wall of 429s.
+- Screenshot p99/RPS for the README.
 
-class DeliverIQUser(HttpUser):
-    wait_time = between(0.1, 0.5)
-    @task
-    def create_order(self):
-        self.client.post("/orders", json={
-            "customer_id": 1, "restaurant_id": 1, "value": 500,
-            "pickup_lat": 28.6, "pickup_lon": 77.2, "drop_lat": 28.7, "drop_lon": 77.3,
-        })
-```
-`locust -f load_test.py --host http://localhost:8000` → `localhost:8089` → 500 users. **Screenshot p99/RPS** for the README.
-### ✅ End of Week 4
-Dockerized, dotenv'd, logged, tested, with real load numbers (e.g. "p99 = 43ms at 500 RPS").
+**Gotcha:** `libpq-dev`/`gcc` in the image because `psycopg2-binary` *usually* ships a wheel but the source build needs them; safe to include. The rate-limit toggle is why your numbers are now honest.
+
+**✅** Container boots, migrates, serves; load test shows real p99/RPS (not 429s).
 
 ---
 
-# Before Phase 5 — Redis vs Kafka (read first)
+## Day 28 — Docker Compose (full local stack, multi-instance ready)
+**Goal:** one command brings up API + Postgres + Redis, with readiness gating and migrations.
 
-**Redis = fast memory.** Rate-limit buckets, rider-location cache, geohash→rider sets, sessions. RAM-fast, lossy on crash unless persisted.
-**Kafka = durable event log.** Order events that must never be lost and may be processed later by multiple independent services. Disk-backed, replayable, scalable.
+- `docker-compose.yml`: `api`, `db` (postgres:18, named volume), `redis`. Env from Compose → `settings`.
+- **Healthcheck on `db`** + `depends_on: { db: { condition: service_healthy } }` — so the API waits for Postgres to actually accept connections, not just "started". (v3.2's `depends_on` alone doesn't wait for readiness.)
+- The API's entrypoint already runs `alembic upgrade head`, so the schema lands on first `up`.
 
-**Rule:** *Need it NOW, can lose it →* Redis. *Need it RELIABLY, process later →* Kafka.
+**Gotcha:** stop native services first (`sudo systemctl stop postgresql redis-server`) to free 5432/6379. Kafka is **not** here yet — it joins on Day 33.
 
-| Feature | Tool | Why |
-|---|---|---|
-| Rate-limit counters | Redis | microsecond reads every request |
-| Rider locations / geohash sets | Redis | O(1) set ops |
-| Dispatch queue (scale-up) | Redis | sorted set, shared across instances |
-| order.dispatched event | **Kafka** | many consumers, can't lose it |
-| Notifications / analytics / audit | **Kafka** | async, durable, replayable |
+**🔥 Break It:** drop the healthcheck → API races Postgres → `connection refused`. Restore.
 
-You used Pub/Sub first (Day 20) so you'd *feel* why Kafka exists before adopting it.
+**✅** `docker compose up --build` → `/docs` live, schema migrated, DB persists across restarts.
 
 ---
 
-# PHASE 5 — Kafka + Advanced Features (Days 29–35)
+# PHASE 6 — Earn "Distributed" (honest) · Day 29
 
-## Day 29 — Kafka Theory + First Touch
-Watch [Kafka in 100s — Fireship] + [Confluent: Kafka Explained]. Write a 1-page note in your own words: Topic, Partition, Offset, Producer, Consumer, Consumer Group; why Kafka > Pub/Sub (persistence, replay, scaling). Then produce one message via the Kafka UI (after Day 30's compose edit).
-**✅** You can explain Kafka in 2 minutes and saw one message in the UI.
+## Day 29 — Multi-Instance Dispatch + Atomic Claim ⭐  *(this is where "distributed" becomes true)*
+**Goal:** run multiple API replicas and prove no order is double-dispatched — **without losing aging or fairness**.
 
-## Day 30 — Kafka in docker-compose
-Add to `docker-compose.yml`:
-```yaml
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
-    environment: { ZOOKEEPER_CLIENT_PORT: 2181 }
-  kafka:
-    image: confluentinc/cp-kafka:7.5.0
-    depends_on: [zookeeper]
-    ports: ["9092:9092"]
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-  kafka-ui:
-    image: provectuslabs/kafka-ui
-    ports: ["8080:8080"]
-    environment:
-      KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+**Primary path — Postgres `SELECT … FOR UPDATE SKIP LOCKED`:**
+- Today `pick_next_order` reads all PENDING, builds the aged heap, loops to find a serviceable order. With 2+ instances, two could pick the same order.
+- Fix: when claiming the winner, re-fetch that row with `.with_for_update(skip_locked=True)` inside the transaction and re-check it's still PENDING before flipping to ASSIGNED. The row lock means only one instance claims it; `SKIP LOCKED` means the other instance doesn't block — it moves to the next order. **Aging, fairness, and the work-conserving loop all stay exactly as built** — you only added a lock on the claim.
+
+**Demonstrate:**
+```bash
+docker compose up --build --scale api=3
 ```
-`docker compose up` → `localhost:8080`.
-**✅** Kafka running, GUI accessible.
+Fire concurrent dispatch calls; confirm each order assigned exactly once (check `rider_id` uniqueness / no double-assign in logs).
 
-## Day 31 — Kafka Producer
+**The war story:** "Two instances raced on the same PENDING order. I claim with `SELECT … FOR UPDATE SKIP LOCKED` — the lock serializes the claim, SKIP LOCKED keeps the other instance working instead of blocking. Chose it over a Redis sorted set because the sorted set's static score can't express my wait-time aging, and I'd lose the fairness loop."
+
+> **Optional alt (mention, don't necessarily build):** Redis sorted set + `ZREM` atomic claim. Faster, but the score is fixed at insert so aging needs re-scoring, and it hides the heap. Know the tradeoff; the SKIP LOCKED version is the one that keeps your DSA story intact.
+
+**Also surfaces here:** the rate-limiter is already atomic (Day 25), so it's multi-instance-safe. The rider-sync dual-writes are per-rider and idempotent enough for this scale (note reconciliation as the recovery path).
+
+**✅** `--scale api=3`, concurrent dispatch, every order assigned exactly once; "distributed" is earned and demonstrable.
+
+---
+
+# PHASE 7 — Event Streaming (Kafka) · Days 30–33
+
+## Day 30 — Kafka Theory + Compose
+**Goal:** understand Kafka vs Pub/Sub, get a broker running in Compose.
+- 1-page note: Topic, Partition, Offset, Producer, Consumer, Consumer Group; why Kafka > Pub/Sub (durable, replayable, consumer groups).
+- Add Kafka to `docker-compose.yml`. **Prefer KRaft mode (no Zookeeper)** with a modern `confluentinc/cp-kafka` — simpler than the Zookeeper combo. Add `kafka-ui` for inspection.
+
+**Gotcha:** `KAFKA_ADVERTISED_LISTENERS` must expose both an in-network listener (`kafka:9092`, used by the API container) and a host listener (`localhost:9092`, for your shell). Getting these wrong is the #1 Kafka-in-Docker failure.
+
+**✅** Kafka + UI up; you can explain it in 2 minutes.
+
+---
+
+## Day 31 — Producer (config-driven)
+**Goal:** publish `order.dispatched` to Kafka instead of Redis Pub/Sub.
 ```bash
 pip install confluent-kafka
 ```
-`app/core/kafka_producer.py`:
-```python
-import json
-from confluent_kafka import Producer
+- `app/core/kafka_producer.py`: `Producer({"bootstrap.servers": settings.kafka_bootstrap})`.
+- In `dispatch.py`, replace `redis_client.publish(...)` with `publish_event("order.dispatched", {...})`.
 
-producer = Producer({"bootstrap.servers": "localhost:9092"})
+**Gotcha:** `settings.kafka_bootstrap` = `kafka:9092` inside Compose, `localhost:9092` from your shell. **Never hardcode** (the v3.2 bug). Keep the Redis-publish git history — it's the "felt the flaw, then upgraded" story.
 
-def publish_event(topic: str, event: dict):
-    producer.produce(topic, json.dumps(event).encode("utf-8"))
-    producer.flush()
-```
-Replace Redis `publish` with `publish_event("order.dispatched", {...})`.
-**✅** Events appear in Kafka UI.
-
-## Day 32 — Kafka Consumer
-`app/workers/notification_consumer.py`:
-```python
-import json
-from confluent_kafka import Consumer
-
-consumer = Consumer({
-    "bootstrap.servers": "localhost:9092",
-    "group.id": "notifications",
-    "auto.offset.reset": "earliest",
-})
-consumer.subscribe(["order.dispatched"])
-print("Listening to Kafka...")
-while True:
-    msg = consumer.poll(1.0)
-    if msg is None or msg.error():
-        continue
-    event = json.loads(msg.value())
-    print(f"[Kafka] order {event['order_id']} → rider {event['rider_id']}")
-```
-`python -m app.workers.notification_consumer`.
-**✅** Producer + consumer working.
-
-## Day 33 — Multiple Consumers (Power Move)
-Three workers, same topic, different consumer groups: `notifications`, `analytics` (writes DB), `audit-log` (writes file). Each gets its own copy and fails independently.
-### 📝 Interview Answer
-```
-"I replaced Redis Pub/Sub with Kafka because Pub/Sub is fire-and-forget — if the
-consumer is down, the message is lost. Kafka persists events to disk and allows
-replay from any offset. I run 3 independent consumer groups on order.dispatched —
-notifications, analytics, audit — each processing independently; one can fail
-without affecting the others. That's event-driven architecture."
-```
-**✅** 3 workers reading one topic, doing different things.
-
-## Day 34 — Idempotency Keys ⭐ (Razorpay gold)
-```python
-import json
-from fastapi import Request
-from fastapi.responses import JSONResponse
-from app.core.redis_client import redis_client
-
-async def idempotency_middleware(request: Request, call_next):
-    if request.method != "POST":
-        return await call_next(request)
-    key = request.headers.get("Idempotency-Key")
-    if not key:
-        return await call_next(request)
-    cached = redis_client.get(f"idempotency:{key}")
-    if cached:
-        return JSONResponse(content=json.loads(cached), status_code=200)
-    response = await call_next(request)
-    redis_client.setex(f"idempotency:{key}", 86400, response.body.decode())
-    return response
-```
-### 📝 Interview Answer
-```
-"Idempotency keys make retries safe. The client sends an Idempotency-Key UUID; the
-server caches the response in Redis for 24h. A duplicate key returns the cached
-response instead of reprocessing — critical for payment APIs where double-charging
-is unacceptable."
-```
-**✅** Same key returns the same response on retry.
-
-## Day 35 — JWT Authentication
-```bash
-pip install "python-jose[cryptography]" "passlib[bcrypt]"
-```
-Add `/auth/register`, `/auth/login`; protect `/admin/stats` with a JWT bearer dependency.
-### ✅ End of Week 5
-Kafka producer + 3 consumers, idempotency, JWT auth.
+**✅** Dispatch produces an event visible in kafka-ui.
 
 ---
 
-# PHASE 6 — Deployment + Observability (Days 36–42)
+## Day 32 — Consumer
+**Goal:** a Kafka consumer replaces the Pub/Sub worker.
+- `app/workers/notification_consumer.py`: `group.id="notifications"`, `auto.offset.reset="earliest"`, poll loop.
+
+**Prove durability (the Day-20 flaw, now fixed):** stop the consumer, dispatch, restart → it **replays the missed event from its offset**. This is the concrete payoff of the Kafka migration.
+
+**✅** Producer + consumer working; missed-while-down events replay.
+
+---
+
+## Day 33 — Multiple Consumer Groups
+**Goal:** `notifications`, `analytics` (writes DB), `audit` (writes file) — three groups, one topic, independent offsets/failure.
+- Interview answer (already in plan) about consumer groups + replay.
+
+**✅** Three workers, one topic, each independent.
+
+---
+
+# PHASE 8 — Reliability + Auth · Days 34–35
+
+## Day 34 — Idempotency Keys (fixed middleware)
+**Goal:** safe retries — duplicate `Idempotency-Key` returns the cached response, no reprocessing.
+
+**The fix (v3.2's bug):** in `BaseHTTPMiddleware` you can't read `response.body` directly — consume the iterator and rebuild:
+```python
+response = await call_next(request)
+body = b"".join([chunk async for chunk in response.body_iterator])
+redis_client.setex(f"idempotency:{key}", 86400, body)
+# rebuild because the iterator is now exhausted:
+return Response(content=body, status_code=response.status_code,
+                headers=dict(response.headers), media_type=response.media_type)
+```
+- Only for POST; only when the header is present.
+- **Middleware order:** request_id (outer) → idempotency → rate limit, or document the chosen order and why.
+
+**Gotcha:** caching a dispatch response on replay is *desirable* (prevents double-dispatch) but the cached body is a snapshot — note that in interviews. Razorpay gold.
+
+**✅** Same key returns the identical cached response; the body is actually captured (not empty).
+
+---
+
+## Day 35 — JWT Auth + User model + the deferred Day-19 authz
+**Goal:** authentication **and** the ownership/role checks Day 19 deferred — not just locking one endpoint.
+```bash
+pip install "pyjwt" "passlib[bcrypt]"
+```
+- **User model + Alembic migration** (id, email, hashed_password, role ∈ {customer, rider, ops}). This is a schema change → real migration, not skipped.
+- `/auth/register`, `/auth/login` (bcrypt hash, JWT issue). A `get_current_user` bearer dependency.
+- **Protect `/admin/stats`** (role = ops).
+- **Fulfil the Day-19 promise on `PATCH /orders/{id}/status`:** the assigned rider may advance their own order; ops may cancel; a customer may not touch status. This is the *permitted-actor* guard layered on top of the *legal-transition* guard. Two orthogonal checks, both now present.
+
+**Gotcha:** `passlib[bcrypt]` has a known `bcrypt 4.x` warning on newer Pythons — pin `bcrypt<4.1` or use `pyjwt`+`bcrypt` directly if it errors. The User table is the project's third migration — review the autogenerate.
+
+**✅** Login issues a JWT; `/admin/stats` requires ops; status transitions enforce both legality *and* actor.
+
+> **Rider penalty (Day-19 deferred) — decide here:** either (a) add a `penalty_count` column to riders + increment on ASSIGNED→CANCELLED-by-rider (small migration + one line in the status handler), or (b) explicitly drop it and keep it a "what I'd add next" talking point. Don't leave it implied-but-absent.
+
+---
+
+# PHASE 9 — Observability + Deploy · Days 36–40
 
 ## Day 36 — Prometheus Metrics
-```bash
-pip install prometheus-fastapi-instrumentator
-```
-```python
-from prometheus_fastapi_instrumentator import Instrumentator
-Instrumentator().instrument(app).expose(app)
-```
-Visit `/metrics`.
-**✅** Metrics endpoint live.
+- `prometheus-fastapi-instrumentator` → `/metrics`. **✅** endpoint live.
 
 ## Day 37 — Grafana Dashboard
-Add to `docker-compose.yml`:
-```yaml
-  prometheus:
-    image: prom/prometheus
-    ports: ["9090:9090"]
-    volumes: ["./prometheus.yml:/etc/prometheus/prometheus.yml"]
-  grafana:
-    image: grafana/grafana
-    ports: ["3000:3000"]
-```
-`prometheus.yml`:
-```yaml
-global:
-  scrape_interval: 15s
-scrape_configs:
-  - job_name: 'deliveriq'
-    static_configs:
-      - targets: ['api:8000']
-```
-Grafana (`admin`/`admin`) → add Prometheus data source → dashboard: request rate, p95/p99 latency, error rate, active orders. **Screenshot for README.**
-**✅** Grafana dashboard screenshot — interview gold.
+- Prometheus + Grafana in Compose; dashboard: request rate, p95/p99, error rate, active orders. Screenshot. **✅**
 
-## Day 38 — Health Checks
-```python
-from sqlalchemy import text
-from sqlalchemy.orm import Session
-from fastapi import Depends
-from fastapi.responses import JSONResponse
-from app.core.database import get_db
-from app.core.redis_client import redis_client
+## Day 38 — Health Checks (DB + Redis + **Kafka**)
+- `/health` checks all three (v3.2 omitted Kafka). `db.execute(text("SELECT 1"))`, `redis_client.ping()`, and a Kafka broker metadata/ping. 503 if any down.
+- Replaces the trivial `/health` from Day 6/12.
 
-@app.get("/health")
-def health(db: Session = Depends(get_db)):
-    checks = {}
-    try:
-        db.execute(text("SELECT 1"))   # CORRECTED: text() required on SQLAlchemy 2.0
-        checks["db"] = "up"
-    except Exception:
-        checks["db"] = "down"
-    try:
-        redis_client.ping()
-        checks["redis"] = "up"
-    except Exception:
-        checks["redis"] = "down"
-    all_up = all(v == "up" for v in checks.values())
-    return JSONResponse(
-        content={"status": "ok" if all_up else "degraded", **checks},
-        status_code=200 if all_up else 503,
-    )
-```
-> 🐛 **Corrected from v3:** bare `db.execute("SELECT 1")` raises on SQLAlchemy 2.0 — raw SQL must be wrapped in `text(...)`.
-**✅** Health check covers DB + Redis.
+**Gotcha:** Kafka liveness = fetch cluster metadata with a short timeout; don't block the health endpoint waiting on a dead broker. **✅** `/health` reflects all three.
 
-## Day 39 — Deploy to Railway
-1. Push to GitHub `main`. 2. railway.app → New Project → Deploy from GitHub (auto-detects Dockerfile). 3. Add Postgres plugin (auto-sets `DATABASE_URL`). 4. Add Redis plugin (auto-sets `REDIS_URL`). 5. Kafka: [Upstash Kafka](https://upstash.com) free tier. 6. Set env vars. 7. Get URL like `deliveriq-production.up.railway.app/docs`.
-> 🔐 **Now is when the rate-limiter `X-Forwarded-For` work lands.** Behind Railway's proxy, `request.client.host` is the proxy IP — read the real client IP from `X-Forwarded-For`, but only after confirming the request came from the trusted proxy (else the header is spoofable).
-**✅** Live public URL.
-
-## Day 40 — GitHub Actions CI/CD
+## Day 39 — CI/CD (env-driven so it actually passes)  *(moved before deploy — green tests gate the deploy)*
 `.github/workflows/ci.yml`:
-```yaml
-name: CI
-on: [push, pull_request]
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:18
-        env: { POSTGRES_PASSWORD: password }
-        ports: ["5432:5432"]
-      redis:
-        image: redis:7
-        ports: ["6379:6379"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.14' }
-      - run: pip install -r requirements.txt
-      - run: pytest --cov=app
-```
-> 🧠 **Optional stretch (if time):** the sliding-window rate limiter parked on Day 16. ~20 lines with a Redis sorted set. Build only as hardening or if interviewers ask for live coding.
-**✅** Green CI badge; tests run on every PR.
+- Postgres + Redis service containers.
+- **Create the test DB/user** in a step (or point `DATABASE_URL`/`REDIS_URL` env at the CI services — this is why Day 23 made them env-driven). Without this, the hardcoded conftest URL fails in CI.
+- Run `pytest --cov=app`, then `black --check`, `flake8` (matches interview Q14's claim).
+
+**Gotcha:** the conftest reads `DATABASE_URL`/`REDIS_URL` from env (Day 23), so CI just sets them to its service containers — no code change. **✅** Green CI badge; tests + lint on every PR.
+
+## Day 40 — Deploy to Railway
+- Deploy from GitHub (Dockerfile auto-detected). Postgres + Redis plugins set `DATABASE_URL`/`REDIS_URL`.
+- **Migrations:** the Dockerfile entrypoint already runs `alembic upgrade head` on boot — so deploy migrates automatically. (Confirm Railway doesn't parallel-boot replicas that race the migration; if so, use a one-off release command.)
+- **Kafka on deploy:** Upstash Kafka free tier → set `kafka_bootstrap` + **SASL_SSL** credentials in config (local was PLAINTEXT; managed needs SASL). If this is heavy, it's acceptable to demo Kafka **locally** and note it in the README — don't let Kafka block the live URL.
+- **X-Forwarded-For:** behind Railway's proxy, read the real client IP from `X-Forwarded-For` **only after** confirming a trusted proxy; else it's spoofable. This is where the Day-25 limiter's keying finalizes.
+
+**Gotcha:** managed Kafka auth ≠ local PLAINTEXT — the producer/consumer config branches on environment. **✅** Live public `/docs`; `/health` green.
+
+---
+
+# PHASE 10 — Polish + Interview Prep · Days 41–45
 
 ## Day 41 — README + Architecture Diagram
-Draw architecture in [Excalidraw](https://excalidraw.com) → `architecture.png`. README: description, badges, live URL, diagram, quickstart, design decisions, load-test results, Grafana screenshot.
-```bash
-git clone https://github.com/you/deliveriq
-cp .env.example .env
-docker compose up --build      # API at http://localhost:8000/docs
-```
-**✅** README looks like a product page.
+- Excalidraw architecture (now accurate: API replicas, SKIP LOCKED claim, Kafka groups, Redis index, Prometheus/Grafana). README: desc, badges, live URL, diagram, quickstart, **design decisions** (SKIP LOCKED vs sorted set, token-bucket, Kafka vs Pub/Sub), load numbers, Grafana shot. **✅**
 
 ## Day 42 — Demo Video
-3-min Loom: Swagger (15s) → create order (30s) → DB row in DBeaver (15s) → Kafka event in UI (30s) → Grafana updating (45s) → trigger rate limiter (30s). Link in README + LinkedIn.
-**✅** Demo video live.
-
----
-
-# PHASE 7 — Polish + Interview Prep (Days 43–45)
+- 3-min Loom: Swagger → create/dispatch → DBeaver row → Kafka event in UI → Grafana → trigger rate limiter → **scale api=3 + concurrent dispatch with no double-assign**. **✅**
 
 ## Day 43 — Code Quality Sweep
-```bash
-pip install black flake8 mypy
-black app/ && flake8 app/ && mypy app/
-```
-Fix warnings, delete dead code, add docstrings to every function, squash messy commits with `git rebase -i`.
-**✅** Clean, formatted, type-checked, documented.
+- `black app/ && flake8 app/ && mypy app/`. Fix the SQLAlchemy `Mapped[]` annotations to clear the `# type: ignore`s (Day-43 commitment). Remove dead code (the `last_assigned_at` write nobody reads). Docstrings. **✅**
 
 ## Day 44 — Interview Drills
-Consolidate `INTERVIEW_NOTES.md` (Days 16, 17, 18, 33, 34). Answer the bank below out loud, timed. Record the 2-minute pitch. Sketch the architecture from memory in 2 minutes.
-
-### The Question Bank
-**System Design**
-1. **FastAPI over Flask/Django?** Async by default, Pydantic validation, auto-OpenAPI, near-Go I/O performance.
-2. **Your rate limiter — why token-bucket?** Allows bursts up to bucket size, caps average rate, avoids fixed-window's boundary-burst flaw. Redis hash of tokens + last_refill, lazy refill per request, ~O(1).
-3. **Redis for the queue, not Postgres?** Sub-ms reads; sorted sets are purpose-built (ZADD/ZREVRANGE) vs an index scan. (Note: you built the in-process heap first; Redis is the scale-up.)
-4. **If Redis dies?** Dispatch falls back to Postgres with a latency penalty; rate limiter fails open with logging.
-5. **Geohashing?** Encodes lat/lon to a base-32 string; adjacent cells share a prefix; check home cell + 8 neighbours for boundaries.
-6. **Kafka over Pub/Sub?** Pub/Sub is fire-and-forget; Kafka persists to disk, replays from offsets, supports consumer groups, scales horizontally.
-
-**DSA**
-7. **Min-heap for dispatch?** O(log n) insert/extract vs O(n) scan. Priority = value (+ wait-time aging).
-8. **End-to-end dispatch complexity?** Rate check O(1), heap/sorted-set pop O(log n), geohash O(1) → O(log n).
-9. **Tie on priority?** Break by created_at (FIFO) — encode as `priority*1e6 + (MAX_TS - created_at)`.
-10. **At 10M concurrent orders, first thing to break?** Single-node Redis sorted set → Redis Cluster sharded by zone; Kafka partitioned by region.
-
-**Database**
-11. **Schema?** orders(id, customer_id, restaurant_id, value, status, created_at, coords). Indexes on status, created_at. Audit table for transitions.
-12. **Postgres over Mongo?** Relational integrity (orders→riders/zones), ACID transactions.
-13. **Concurrent dispatch of the same order?** Atomic Redis `ZREM` (returns 1 if claimed, 0 if gone) or `SELECT ... FOR UPDATE`. Prefer ZREM — faster.
-
-**Production**
-14. **CI/CD?** GitHub Actions runs pytest + black + flake8 on every PR; merge to main deploys to Railway; health check gates traffic.
-15. **DDoS?** Per-key token bucket + Cloudflare L7 + gateway IP limits.
-16. **Debug a slow endpoint?** Grafana p99 → structured logs by request_id → cProfile → timing logs around the suspect path.
-17. **Idempotency — why/how?** Retries cause duplicate POSTs; client sends Idempotency-Key UUID; cache response in Redis 24h; repeat key returns cached. Critical for payments.
-
-**Behavioural**
-18. **Hardest part?** Geohash boundary conditions — an edge order needs the 8 neighbours; initially I only checked the home cell and missed riders 100 m away.
-19. **More time?** Circuit breaker, OpenTelemetry tracing, saga for payments, chaos testing.
-20. **What did you learn?** Event-driven architecture deeply (offsets, consumer groups, partitioning) and production hygiene (logs, metrics, health checks).
-
-**Differentiation**
-21. **Different from real Swiggy/Zomato?** Theirs optimizes pure ETA; mine adds a bounded fairness constraint — within a distance band of the nearest, assign to whoever has the fewest orders today. Greedy-nearest reframed as constrained assignment.
-22. **What real problem does the band solve?** Naive nearest starves some riders and overloads others — a real gig-economy issue. The band spreads earnings while Δ guarantees SLA. Honest social-impact angle.
-23. **Band vs a blended score (α·dist+β·fairness)?** A blend can silently send a far rider (cold food). The band makes the SLA guarantee explicit and tunable — fairness only operates inside Δ.
-
-**✅** All answers cold; 2-minute pitch from memory.
+- Consolidate `Interview_prep.md` (not "INTERVIEW_NOTES.md"). Update the question bank to match what got built:
+  - **Q13 (concurrent dispatch):** answer is now **SKIP LOCKED** (primary) with ZREM as the alt — not "prefer ZREM".
+  - Add: request_id tracing, the atomic Lua limiter, the SKIP LOCKED race story.
+- Time the 2-min pitch; sketch the architecture from memory. **✅**
 
 ## Day 45 — Final Buffer
-Fix last bugs. `git tag v1.0.0 && git push --tags`. Pin the repo. Update LinkedIn + resume. **Rest. You did it.**
+- `git tag v1.0.0`, pin repo, update LinkedIn + resume. **Resume "distributed" is now earned** (Day 29). **✅**
 
 ---
 
-# Git Workflow
+## Resume / pitch deltas to make after this plan
+- "distributed" is **true** once Day 29 ships (SELECT … FOR UPDATE SKIP LOCKED across `--scale api=3`). If you skip Day 29, soften to "designed for horizontal scaling".
+- Swap the dispatch-concurrency line in the pitch/bank from "ZREM" to "SKIP LOCKED" (keeps aging + fairness — a stronger, more honest answer).
+- Load numbers are now defensible (limiter toggled/keyed for the test).
 
-**Daily loop**
-```bash
-git checkout dev && git pull
-git checkout -b feature/kafka-consumer
-# code + tests
-git add -p
-git commit -m "feat: add Kafka consumer for order.dispatched"
-git push origin feature/kafka-consumer
-# PR → review → merge to dev; Sundays: dev → main
-```
-**Commit prefixes:** `feat` `fix` `docs` `test` `refactor` `chore` `perf`.
-**Branches:** `main` (deployable, protected) · `dev` (integration) · `feature/*` · `fix/*`.
-**Pro tip:** 50+ commits over 45 days — recruiters check the contribution graph.
-
----
-
-# Resume Bullets (under "Projects")
-```
-DeliverIQ — Order Dispatch API   [GitHub] [Live Demo]
-Python · FastAPI · PostgreSQL · Redis · Kafka · Docker
-• Designed a food-delivery dispatch system with a min-heap priority queue
-  (O(log n)) and geohash-based rider matching (O(1) zone lookup), handling
-  500 concurrent requests at p99 < 50ms.
-• Built fairness-aware rider assignment balancing rider earnings within a
-  bounded distance band — reframing greedy-nearest as a constrained
-  assignment problem without breaching delivery SLA.
-• Built a token-bucket rate limiter in Redis with <1ms overhead per request;
-  cut abusive traffic by 99% in load tests.
-• Implemented event-driven architecture with Kafka topics for order-lifecycle
-  events, enabling async notifications and decoupled analytics.
-• Added idempotency keys for safe retries; deployed the full stack
-  (API + PostgreSQL + Redis + Kafka) via Docker Compose and GitHub Actions
-  CI/CD to Railway.
-```
-**Rules:** quantify (ms, RPS, %, Big-O) · use real vocabulary (dispatch, idempotency, event-driven, geohash) · link GitHub + live URL · "built/designed/implemented", never "learned/explored".
-
----
-
-# The 2-Minute Pitch (memorize)
-> "I built DeliverIQ — a backend that solves the order-dispatch problem companies like Zomato and Uber Eats face. The core challenge: given hundreds of incoming orders and available riders, assign them optimally in real time. I use a min-heap priority queue scoring each order by value and wait time, and geohashing to find nearby riders in O(1) instead of computing distance to every rider. What's mine: dispatch is fairness-aware — among riders within a distance band of the nearest, I assign to whoever has the fewest orders today, so earnings stay balanced without delivering cold food. The API has a token-bucket rate limiter in Redis with sub-millisecond overhead and an event-driven Kafka pipeline — when an order dispatches, notifications, analytics, and audit consume the event independently. The whole stack runs in Docker Compose with Prometheus + Grafana, deployed on Railway with GitHub Actions CI/CD. What I'm proudest of: every design decision has a clear reason — I can tell you exactly why token-bucket over leaky-bucket, and Kafka over Redis Pub/Sub."
-
-**Do:** draw the architecture first · lead with the problem · quote numbers · volunteer tradeoffs · have one war story (the geohash boundary bug).
-**Don't:** say "I followed a tutorial" · apologize for missing features · list tech alphabetically · monologue past 2 min without pausing.
-
----
-
-# Final Checklist
-**Code:** no hardcoded secrets · docstrings everywhere · no dead code · black/flake8/mypy clean · pinned `requirements.txt` · coverage ≥60%.
-**GitHub:** README (desc, badges, live URL, diagram, quickstart, design decisions) · 50+ commits · CI badge · `.env.example` present, `.env` ignored · tag `v1.0.0` · Loom linked · repo pinned.
-**Deploy:** `/docs` works · `/health` returns DB+Redis+Kafka · auto-restart · HTTPS · Grafana screenshot.
-**Interview:** explain every file · Big-O of every algorithm · "what breaks at 10x" · "what's next" · sketch architecture in 2 min · pitch memorized · 5 war stories ready.
-
----
-
-# Common Pitfalls
-1. **Tutorial hell** — read docs, build immediately. 2. **Refactoring too early** — make it work first (refactor Day 43). 3. **Skipping tests** — silent breakage. 4. **Hardcoding secrets** — `.env` from Day 24. 5. **Big commits** — one logical change each. 6. **Ignoring errors** — read the exact last line (Stuck Protocol). 7. **Not asking for help** — stuck >45 min, ask. 8. **Comparing to others** — your only competition is yesterday-you.
-
----
-
-# Closing
-You're a Codeforces Expert and LeetCode Knight — the algorithmic muscle is already there. This project wraps that muscle in the production skin interviewers want: APIs, databases, caching, queues, events, deployment. Discipline > motivation. Build > watch. Depth > breadth.
-
-On Day 45 you'll have something rare: a project you can defend in any interview because every line came from your fingers — and now every line is correct.
-
-🚀 *See you on Day 45.*
+## Still optional (know, don't necessarily build)
+- Sliding-window rate limiter (~20 lines, Redis sorted set) — talking point only.
+- Redis sorted-set dispatch — the alt to SKIP LOCKED; mention the tradeoff.
+- Circuit breaker, OpenTelemetry tracing, saga for payments — "what's next" answers.
