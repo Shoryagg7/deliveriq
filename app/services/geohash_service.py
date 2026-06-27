@@ -74,3 +74,8 @@ def update_rider_location(rider_id: int, lat: float, lon: float):
     redis_client.hset(
         f"rider:{rider_id}:loc", mapping={"lat": lat, "lon": lon, "cell": new_cell}
     )
+
+def remove_rider_from_index(rider_id: int):
+    cell = redis_client.hget(f"rider:{rider_id}:loc", "cell")
+    if cell:
+        redis_client.srem(f"geohash:{cell}", rider_id)

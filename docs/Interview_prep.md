@@ -540,6 +540,7 @@ Orders live in **Postgres only**. The dispatch heap is rebuilt from Postgres eac
 8. Why does `orders_today` never show up in DBeaver?
 
 *Shaky on any? That's your next review target.*
+
 # DeliverIQ — Interview Prep, Part 5 (Day 19)
 
 > Companion to the main guide. Covers the order state machine — enforcing a legal
@@ -608,3 +609,96 @@ The state machine answers "is this transition legal *at all*?" It does **not** a
 10. Why is 400 (not 422) the right code for an illegal-but-well-formed transition?
 
 *Shaky on any? That's your next review target.*
+---
+# DeliverIQ — Interview Prep, Part 6 (Day 20)
+
+> Rider lifecycle (BUSY↔AVAILABLE), dual-store availability enforcement, and
+> the Pub/Sub fire-and-forget flaw that motivates Kafka.
+
+---
+
+## 21. Rider Lifecycle + Pub/Sub
+
+### Availability enforced in Redis, recorded in Postgres
+A rider's availability lives in **both** stores, each doing a different job:
+`rider.status` in Postgres is the durable truth ("why" — this rider is
+delivering); the rider's *presence in a geohash cell* in Redis is the
+enforcement ("now" — `select_rider` can only pick riders in cells). Assigning
+sets `status="BUSY"` AND `srem`s them from their cell; freeing sets
+`status="AVAILABLE"` AND re-adds them.
+
+**Soundbite:** "Availability is dual-store. Postgres `status` is the record;
+Redis cell-membership is the enforcement. I don't filter BUSY riders inside
+`select_rider` — I remove them from the index entirely, so a busy rider is
+*structurally* unselectable. `select_rider` needed zero changes."
+
+**Gotcha — the asymmetry:** going BUSY only needs `srem` (drop from index).
+Going AVAILABLE needs full `update_rider_location` (`srem` old + `sadd` new +
+update hash) because the rider may have *moved* — a delivered rider is now at
+the drop, not the pickup. Removal needs no location; re-adding does.
+
+### orders_today counts at assignment, not delivery
+`orders_today` answers "who's earned the least today?" — fairness for
+*spreading work*. It increments when a rider is **assigned** (in `select_rider`),
+not when they deliver. A rider assigned 5 orders has had 5 earning
+opportunities regardless of delivery progress; counting at delivery would let a
+mid-delivery rider keep looking idle and get piled on.
+
+**The orthogonality:** BUSY vs orders_today are independent axes.
+BUSY = "can take work *now*?" (exclusion). orders_today = "earned least
+*today*?" (fairness ranking). Same shape as legal-transition vs permitted-actor
+(Day 19) — two guards that look related but answer different questions.
+
+**Soundbite:** "BUSY and orders_today are orthogonal — one is current
+availability, the other is daily fairness. BUSY already stops pile-on by
+removing the rider from the pool, so the counter doesn't need to; it just tracks
+the day's share, incremented at assignment because that's when the earning
+opportunity was handed out."
+
+### Commit before publish — no phantom events
+The event announces a *durable fact*. Publishing before `db.commit()` risks a
+listener reacting to an assignment that then rolls back. Order is always:
+mutate → commit (truth) → publish (announce).
+
+**Soundbite:** "I publish after commit, never before — an event should only
+describe state that's already persisted, or a consumer acts on a phantom."
+
+### Order→rider coupling = the motivation for events
+The status endpoint now does *rider* side-effects (free + re-index on
+DELIVERED/CANCELLED). That's legitimate coupling — the rider's freedom depends
+on the order finishing — but it's also exactly what an event-driven design
+*decouples*. Building it coupled first, then feeling the coupling, is why the
+Pub/Sub subscriber exists: it shows where the side-effect *wants* to move.
+
+### Pub/Sub fire-and-forget — the flaw that motivates Kafka ⭐
+Redis Pub/Sub delivers a message only to subscribers **alive at publish time**.
+No queue, no persistence, no replay. Stop the worker, dispatch, restart — the
+event is gone with no record it existed.
+
+**Soundbite:** "Redis Pub/Sub is fire-and-forget — if no subscriber is alive
+when you publish, the message is lost, no replay. I used it first deliberately
+so I'd feel that limitation firsthand, then moved order events to Kafka, which
+persists to disk and lets a recovered consumer replay from its last offset."
+
+**Gotcha:** the first frame from `SUBSCRIBE` is a `type="subscribe"`
+confirmation whose `data` is the subscription *count*, not a payload. Guard with
+`if msg["type"] != "message": continue` or the first `json.loads` parses an
+integer and crashes.
+
+---
+
+## 22. Self-Test — Day 20 (answer out loud)
+
+1. Why enforce availability by removing from the geohash cell instead of
+   filtering inside `select_rider`?
+2. What's the srem-vs-update_rider_location asymmetry between going BUSY and
+   going AVAILABLE?
+3. Why does `orders_today` increment at assignment, not delivery?
+4. BUSY vs orders_today — what does each answer, and why are they orthogonal?
+5. Why publish the event after commit, never before?
+6. Why capture the reindex tuple before `db.commit()`?
+7. What does Pub/Sub lose, and what exactly does Kafka add that fixes it?
+8. What's the `type="subscribe"` frame, and why must you skip it?
+
+*Shaky on any? That's your next review target.*
+```

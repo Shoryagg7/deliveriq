@@ -1,7 +1,7 @@
 # app/models/order.py
 from datetime import UTC, datetime
 
-from sqlalchemy import Column, DateTime, Float, Integer, String
+from sqlalchemy import Column, DateTime, Float, Integer, String, ForeignKey
 
 from app.core.database import Base
 
@@ -19,3 +19,4 @@ class Order(Base):
     drop_lon = Column(Float, nullable=False)
     status = Column(String, default="PENDING", index=True)
     created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+    rider_id = Column(Integer, ForeignKey("riders.id"), nullable=True)

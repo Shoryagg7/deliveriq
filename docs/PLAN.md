@@ -1360,19 +1360,64 @@ Then dispatch a fresh PENDING order and confirm PENDING→ASSIGNED still flips (
 Illegal transitions return 400; dispatch's flip routes through the same state machine; `OrderStatus` lives in one file; auth gap tracked for Day 35. *(Concept depth — state machine as a graph, the two-failure-semantics distinction, legal-vs-permitted — is in `Interview_prep.md` §19.)*
 ---
 
-## Day 20 — Redis Pub/Sub (Pre-Kafka Practice)
+## Day 20 — Rider Lifecycle + Redis Pub/Sub (Pre-Kafka)
 
-### 💻 Tasks
-Publish on dispatch:
+### 🎯 Goal
+Wire dispatch → rider assignment with a full BUSY↔AVAILABLE lifecycle, then
+publish an `order.dispatched` event and consume it — to *feel* Pub/Sub's
+fire-and-forget flaw before adopting Kafka.
+
+### Step 1 — rider goes BUSY on assignment (dual-store)
+`geohash_service.py` — new helper:
+```python
+def remove_rider_from_index(rider_id: int):
+    cell = redis_client.hget(f"rider:{rider_id}:loc", "cell")
+    if cell:
+        redis_client.srem(f"geohash:{cell}", rider_id)
+```
+`dispatch.py` — after assigning, before commit:
+```python
+rider = db.query(Rider).filter(Rider.id == rider_id).first()
+rider.status = "BUSY"               # Postgres truth
+remove_rider_from_index(rider_id)   # Redis mirror: out of geohash cells
+db.commit()
+```
+> Availability is enforced in Redis: a BUSY rider isn't in any cell, so
+> `select_rider` can't see them. `select_rider` itself needs zero changes.
+
+### Step 2 — rider freed on DELIVERED / CANCELLED
+`orders.py` `update_status`, after applying the new status:
+```python
+reindex = None
+if body.status in (OrderStatus.DELIVERED, OrderStatus.CANCELLED) and order.rider_id:
+    rider = db.query(Rider).filter(Rider.id == order.rider_id).first()
+    if rider:
+        rider.status = "AVAILABLE"
+        if body.status == OrderStatus.DELIVERED:
+            rider.current_lat = order.drop_lat   # rider is at the drop now
+            rider.current_lon = order.drop_lon
+        reindex = (rider.id, rider.current_lat, rider.current_lon)  # capture pre-commit
+db.commit()
+if reindex:
+    update_rider_location(*reindex)   # rider re-enters a geohash cell → selectable
+```
+> Capture `reindex` BEFORE commit — commit expires attributes, so reading
+> `rider.current_lat` after would fire a surprise reload.
+> DELIVERED relocates to the drop; CANCELLED keeps current location.
+
+### Step 3 — publish the event (after commit)
+`dispatch.py`, after `db.commit()`:
 ```python
 import json, time
-redis_client.publish("order.dispatched", json.dumps({
-    "order_id": order_id, "rider_id": rider_id, "timestamp": time.time()
-}))
+redis_client.publish(
+    "order.dispatched",
+    json.dumps({"order_id": order_id, "rider_id": rider_id, "ts": time.time()}),
+)
 ```
-```bash
-mkdir app/workers && touch app/workers/__init__.py
-```
+> Publish AFTER commit — only announce a fact that's already durable, or a
+> listener could react to an assignment that then rolls back.
+
+### Step 4 — the subscriber
 `app/workers/notification_worker.py`:
 ```python
 import json
@@ -1380,20 +1425,69 @@ from app.core.redis_client import redis_client
 
 pubsub = redis_client.pubsub()
 pubsub.subscribe("order.dispatched")
-print("Listening...")
+print("Notification worker listening on 'order.dispatched'...")
 for msg in pubsub.listen():
-    if msg["type"] == "message":
-        data = json.loads(msg["data"])
-        print(f"Notify customer: order {data['order_id']} → rider {data['rider_id']}")
+    if msg["type"] != "message":   # skip the subscribe-confirmation frame
+        continue
+    data = json.loads(msg["data"])
+    print(f"[notify] order {data['order_id']} → rider {data['rider_id']}")
 ```
-Run in a second terminal: `python -m app.workers.notification_worker`. Dispatch an order, watch it log.
+Run in a 2nd terminal: `python -m app.workers.notification_worker`
 
-🐧 **Ubuntu Note:** New terminal tab = **Ctrl+Shift+T** (keep uvicorn in one, the worker in another).
+### 🔥 Break It On Purpose — feel fire-and-forget
+1. Worker running → dispatch → worker prints the event.
+2. Stop the worker → dispatch again (200 OK) → restart worker → it prints
+   **nothing** about the missed event. The event is gone forever.
+> Pub/Sub delivers only to listeners alive at publish time. No queue, no
+> replay, no record. That permanent loss is exactly why Kafka comes next.
 
 ### ✅ End of Day
-Pub/Sub works — and you feel its limitation: **if the worker is off, the message is lost.** That's exactly why Kafka comes next.
-
+Full rider lifecycle (AVAILABLE→BUSY→AVAILABLE with re-indexing), event
+published on dispatch, consumed by a worker — and you've felt why Pub/Sub
+loses events when the consumer is down.
 ---
+
+## DeliverIQ — end-to-end flow as of Day 20
+## Dispatch (priority heap + fairness match + BUSY) and order completion
+## (free rider + re-index), plus the fire-and-forget Pub/Sub edge.
+
+flowchart TD
+    subgraph DISPATCH["POST /orders/dispatch"]
+        A[Query PENDING orders from Postgres] --> B{Any pending?}
+        B -- no --> B404[404: no pending orders]
+        B -- yes --> C["Build max-heap<br/>priority = value + wait_minutes x AGING_WEIGHT"]
+        C --> D[Pop highest-priority order]
+        D --> E["select_rider<br/>home cell + 8 neighbours<br/>haversine rank<br/>fairness band &#916;<br/>fewest orders_today, then nearest"]
+        E --> F{"Rider found?<br/>(only AVAILABLE riders<br/>are present in cells)"}
+        F -- no --> G{Heap empty?}
+        G -- "no (try next order)" --> D
+        G -- yes --> H404[404: orders exist but no rider available]
+        F -- yes --> I["transition PENDING to ASSIGNED<br/>order.rider_id = rider<br/>orders_today++ (inside select_rider)"]
+        I --> J["rider.status = BUSY (Postgres truth)<br/>srem rider from geohash cell (Redis enforce)"]
+        J --> K[(db.commit)]
+        K --> L[["publish order.dispatched<br/>{order_id, rider_id, ts}"]]
+        L --> M[return order_id + rider_id]
+    end
+
+    L -. fire-and-forget .-> N{Worker alive<br/>at publish time?}
+    N -- yes --> O["notification_worker prints<br/>[notify] order to rider"]
+    N -- no --> P["event lost forever<br/>no queue, no replay<br/>(this is why Kafka comes next)"]
+
+    M -. rider is now BUSY,<br/>out of the pool .-> Q
+
+    subgraph FINISH["PATCH /orders/{id}/status"]
+        Q[validate transition] --> R{"DELIVERED or CANCELLED<br/>and order.rider_id set?"}
+        R -- no --> S[(commit status only)]
+        R -- yes --> T[rider.status = AVAILABLE]
+        T --> U{DELIVERED?}
+        U -- yes --> V[move rider to drop coords]
+        U -- no --> W[keep current coords]
+        V --> X[(db.commit)]
+        W --> X
+        X --> Y["update_rider_location<br/>srem old + sadd new cell<br/>rider selectable again"]
+    end
+
+
 
 ## Day 21 — Integration Testing
 
