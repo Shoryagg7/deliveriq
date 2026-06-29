@@ -20,7 +20,6 @@ def add_rider(rider_id: int, lat: float, lon: float):
         f"rider:{rider_id}:loc", mapping={"lat": lat, "lon": lon, "cell": cell}
     )
 
-
 def find_nearby_riders(lat: float, lon: float) -> list[int]:
     cell = geohash.encode(lat, lon, PRECISION)
     cells_to_check = [cell] + geohash.neighbors(cell)  # home + 8 neighbours
