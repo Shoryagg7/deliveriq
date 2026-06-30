@@ -15,7 +15,6 @@
 # array of objects
 # dogs = [Dog("Fido", 3), Dog("Rex", 5)]
 # print(dogs[0].get_age())
-
 # q2
 # class students:
 #     def __init__(self,name,age,grade):
@@ -84,8 +83,6 @@
 # pet1.speak()
 # pet2.show()
 # pet2.speak()
-
-
 # class person:
 #     number_of_people = 0
 
