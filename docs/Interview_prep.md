@@ -701,7 +701,7 @@ integer and crashes.
 8. What's the `type="subscribe"` frame, and why must you skip it?
 
 *Shaky on any? That's your next review target.*
-```
+---
 # DeliverIQ — Interview Prep, Part 7 (Day 21)
 
 > Integration testing with proper isolation — a throwaway test DB, a swapped
