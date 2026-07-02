@@ -4,29 +4,6 @@
 **For:** Shorya Gupta — final-year CSE (Thapar, grad 2027) · Codeforces **Expert** · CodeChef 3★ · LeetCode Knight · 1500+ problems. Strong C++/DSA, learning backend.
 **System:** Ubuntu Linux (every command here is Ubuntu-specific).
 **Stack:** Python 3.14 · FastAPI · SQLAlchemy 2.0 · Pydantic · Alembic · PostgreSQL 18 · Redis · Kafka · Docker.
-
----
-
-## What changed in v3.2 (read this first)
-
-This version fixes real bugs and reconciles the plan with what was actually built on Days 15–18. The corrections:
-
-1. **Day 16 "Break It" was factually wrong** and is rewritten. The old version claimed deleting the `expire` line makes the token bucket "permanently empty" so requests fail after 3 minutes. That is false for a *token bucket* — it recovers from the **elapsed-time refill math**, not from the key's TTL. The `expire` line is **memory housekeeping** (it garbage-collects buckets of clients who vanish), not the recovery mechanism. The old claim confused token-bucket with fixed-window (where the TTL *is* the reset). Corrected exercise is in Day 16.
-
-2. **Day 9 latitude boundary bug.** Old: `Field(gt=-90, le=90)`. Latitude **−90** (south pole) is valid, and `gt` wrongly rejects it. Fixed to `ge=-90` (closed interval), applied symmetrically to **both** pickup and drop coordinates.
-
-3. **Day 17 dispatch reconciled to what was built.** The primary implementation is now a **Python `heapq` over PENDING orders pulled from PostgreSQL** (which is what you built and what showcases your DSA), with the **Redis sorted-set** version reframed as the *distributed scale-up* — a strong interview talking point rather than a contradiction.
-
-4. **`datetime.utcnow()` is deprecated on Python 3.14.** Replaced everywhere with `datetime.now(UTC)` (timezone-aware).
-
-5. **`OrderStatus` enum defined once.** It previously appeared in both `schemas/order.py` (Day 9) and `services/order_state.py` (Day 19) — two definitions of the same thing. Now it lives in `app/core/enums.py` and is imported everywhere.
-
-6. **Day 38 health check** used `db.execute("SELECT 1")`, which errors on SQLAlchemy 2.0. Fixed to `db.execute(text("SELECT 1"))`.
-
-7. **Naming consistency.** Routers and models both use the **singular** filename (`order.py`, `rider.py`). The filename is arbitrary — what matters is that the import path matches.
-
-8. **Rate-limiter hardening notes added** (Day 16): `request.client` None-guard now; `X-Forwarded-For` / trusted-proxy handling is explicitly a **deployment-phase** concern (the header is spoofable without a trusted proxy in front). Sliding-window is parked as an optional **Day-40 stretch** — you understand the fixed-window vs sliding-window tradeoff well enough to *speak* to it without building it.
-
 ---
 
 ## How This Plan Is Structured
@@ -1172,7 +1149,7 @@ select_rider(28.6139, 77.2090, band_m=50)   # band 50:  rider 2 outside band →
 Same riders, same loads — only Δ changed, and the winner inverts. **That's the tunable knob:** wide band = more fairness (spread earnings), narrow band = tighter SLA. Fairness only ever operates *inside* the band.
 
 ### 📝 Interview Answer
-> Full concept→soundbite→gotcha writeup is in [Interview_notes](docs/Interview_prep.md) §14–15. One-line summary: geohash for a coarse O(1)-ish candidate set (home cell + 8 neighbours), haversine to rank it, then a fairness band — among riders within Δ of the nearest, assign the least-loaded. Reframes greedy-nearest as a bounded constrained-assignment problem; the hard band makes the SLA guarantee explicit and tunable (a blended score could silently send a far rider).
+> Full concept→soundbite→gotcha writeup is in Interview_notes §14–15. One-line summary: geohash for a coarse O(1)-ish candidate set (home cell + 8 neighbours), haversine to rank it, then a fairness band — among riders within Δ of the nearest, assign the least-loaded. Reframes greedy-nearest as a bounded constrained-assignment problem; the hard band makes the SLA guarantee explicit and tunable (a blended score could silently send a far rider).
 
 ### ✅ End of Day
 Riders seeded → `POST /riders/match` returns the fairly-chosen nearby rider; fairness convergence and the band/SLA tradeoff both demonstrated live.
