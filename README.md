@@ -13,23 +13,36 @@ constrained assignment problem.
 ```mermaid
 flowchart TD
     Client["Client<br/>POST /orders"]
-    Gateway["Gateway<br/>Rate limit + JWT"]
-    API["FastAPI service<br/>Routers, validation"]
-    Dispatch["Dispatch<br/>Priority queue · O(log n)"]
-    Match["Rider matching<br/>Geohash + fairness band"]
-    Kafka["Kafka producer<br/>Emits order events"]
 
-    Redis[("Redis<br/>Token bucket · geo · counts")]
-    Postgres[("PostgreSQL<br/>Orders · riders")]
-    Obs["Prometheus + Grafana<br/>Scrapes /metrics"]
+    subgraph MW["FastAPI middleware chain (per request)"]
+        ReqID["request_id<br/>(outermost, contextvars)"]
+        Idem["Idempotency<br/>(POST, cached response)"]
+        RL["Rate limit<br/>(token bucket, atomic Lua)"]
+    end
 
-    Notif["Notification<br/>Push, SMS"]
-    Analytics["Analytics<br/>Order metrics"]
-    Audit["Audit log<br/>Durable trail"]
+    subgraph REPLICAS["API replicas (--scale api=3)"]
+        API["FastAPI service<br/>Routers · validation · JWT dep (authz)"]
+        Dispatch["Dispatch<br/>Priority heap + aging · O(log n)"]
+        Match["Rider matching<br/>Geohash + fairness band"]
+    end
 
-    Client --> Gateway --> API --> Dispatch --> Match --> Kafka
-    Gateway -.-> Redis
+    Kafka["Kafka producer<br/>order.dispatched (config-driven bootstrap)"]
+    Redis[("Redis<br/>Token bucket · geo index · orders_today · idempotency")]
+    Postgres[("PostgreSQL<br/>orders · riders · users")]
+    Obs["Prometheus + Grafana<br/>scrapes /metrics"]
+
+    Notif["Notifications<br/>consumer group"]
+    Analytics["Analytics<br/>consumer group → DB"]
+    Audit["Audit log<br/>consumer group → file"]
+
+    Client --> ReqID --> Idem --> RL --> API
+    API --> Dispatch
+    Dispatch -->|"claim: SELECT … FOR UPDATE SKIP LOCKED"| Postgres
+    Dispatch --> Match
     Match -.-> Redis
+    Dispatch -->|"after db.commit"| Kafka
+    RL -.-> Redis
+    Idem -.-> Redis
     API -.-> Postgres
     API -.-> Obs
     Kafka --> Notif
