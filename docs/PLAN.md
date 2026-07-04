@@ -1785,13 +1785,23 @@ logger.info(f"[notify] order {data['order_id']} → rider {data['rider_id']}")
 registered last runs outermost → every downstream log (incl. rate limiter)
 carries the id. contextvars (not a global) keeps ids from bleeding across
 concurrent async requests.
-
-**Test:**
+## Day 22 — Testing
 ```bash
+# 1. start server, confirm clean boot
+uvicorn app.main:app --reload      # wait for "Application startup complete"
+
+# 2. header + JSON log with non-null request_id
 curl -i http://localhost:8000/health
-# response has X-Request-ID header
-# terminal shows JSON log with a non-null request_id inside a request,
-# null on out-of-request lines (startup, watchfiles)
+# → response headers contain: x-request-id: <uuid>
+# → uvicorn terminal shows:
+#   {"timestamp":"...","level":"INFO","logger":"deliveriq",
+#    "message":"health check hit","request_id":"<same-uuid-family>"}
+
+# 3. null case (log outside a request) — save any file, watchfiles logs:
+#   {"...","logger":"watchfiles.main","request_id":null}   ← correct, not a bug
+
+# 4. regression
+python -m pytest -q                # all green
 ```
 
 **✅** Every log line is JSON with a request_id; one request is greppable across
@@ -1887,13 +1897,22 @@ os.environ["REDIS_URL"] = "redis://localhost:6379/15"
 **Gotcha:** `settings = Settings()` runs at import, so conftest must set env
 *before* importing the app. Same import-time seam as Day 21, now for both stores.
 
-**Verify:**
+## Day 23 — Testing
 ```bash
-grep -rn "postgresql://" app/     # only config.py default (none in real code)
-grep -rn "localhost:6379" app/    # only config.py default
-python -m pytest -q               # 7 passed
-```
+# 1. no hardcoded URLs outside config.py
+grep -rn "postgresql://" app/      # only app/core/config.py (default) may match
+grep -rn "localhost:6379" app/     # same
 
+# 2. .env exists and is gitignored
+ls -la .env .env.example
+git check-ignore .env              # prints ".env" → ignored
+
+# 3. app still boots reading .env
+uvicorn app.main:app --reload      # no "field required" pydantic error
+
+# 4. tests hit the TEST stores (env set in conftest before import)
+python -m pytest -q                # 7 passed at this point
+```
 **✅** No hardcoded URLs outside config; tests green; env-driven for Docker/CI.
 ---
 ## Day 24 — Custom Exceptions (integrated) ✅
@@ -1945,13 +1964,31 @@ raise RiderUnavailable("Orders are pending but no rider is available nearby")
 
 **Gotcha:** InvalidTransition is now a DeliverIQError → the 400 comes from the
 base handler, not a manual HTTPException. no-rider is 409 (conflict), not 404.
-
-**Test:** update `test_busy_rider_not_dispatched_again` → assert 409.
 Optional envelope test:
 ```python
 def test_error_envelope(client):
     r = client.get("/orders/999")
     assert r.json() == {"error": "ORDER_NOT_FOUND", "message": "Order 999 not found"}
+```
+
+## Day 24 — Testing
+```bash
+# 1. envelope shape on a missing order
+curl -s http://localhost:8000/orders/999 | python -m json.tool
+# → {"error": "ORDER_NOT_FOUND", "message": "Order 999 not found"}
+
+# 2. illegal transition → 400 through the SAME envelope
+curl -s -X PATCH http://localhost:8000/orders/1/status \
+  -H "Content-Type: application/json" -d '{"status":"DELIVERED"}'
+# → 400 {"error":"INVALID_TRANSITION", ...}
+
+# 3. dispatch failure reasons are now distinct
+curl -s -X POST http://localhost:8000/orders/dispatch
+# empty DB        → 404 {"error":"NO_PENDING_ORDERS", ...}
+# orders, no rider → 409 {"error":"RIDER_UNAVAILABLE", ...}
+
+# 4. regression (updated: busy-rider test asserts 409 now)
+python -m pytest -q                # 8 passed (envelope test added)
 ```
 
 **✅** Missing order → `{"error":"ORDER_NOT_FOUND",...}`; every router uses typed
@@ -2028,8 +2065,24 @@ async def rate_limit_middleware(request: Request, call_next):
 → parse with `float(result)`. `register_script` uses EVALSHA (sends hash, not
 body).
 
-**Test:** burst 105 → ~100×200 then 429. `python -m pytest -q` → 8 passed.
+## Day 25 — Testing
+```bash
+# 1. burst → throttle (proves Lua path works end-to-end)
+URL=http://localhost:8000/health
+for i in $(seq 1 105); do curl -s -o /dev/null -w "%{http_code} " "$URL"; done; echo
+# → ~100 × 200, then 429s
 
+# 2. header still present on allowed requests
+curl -i http://localhost:8000/health | grep -i x-ratelimit
+# → x-ratelimit-remaining: <n>
+
+# 3. verify ONE round-trip (optional): watch Redis commands live
+redis-cli monitor            # in a 2nd terminal; curl once →
+# a single EVALSHA line (not HGETALL+HSET+EXPIRE separately). Ctrl+C to exit.
+
+# 4. regression
+python -m pytest -q                # 8 passed (9 after boundary-coord test)
+```
 **✅** One atomic round-trip per request; concurrent requests can't desync the
 bucket; multi-instance-safe for Day 29.
 ---
@@ -2067,7 +2120,21 @@ Register: `app.include_router(admin.router)`
 
 **Gotcha:** `func.avg` → None on empty table (guard it); `group_by` omits
 zero-count statuses.
+## Day 26 — Testing
+```bash
+# 1. empty-ish DB
+curl -s http://localhost:8000/admin/stats | python -m json.tool
+# → {"total_orders": 0, "avg_order_value": 0, "orders_by_status": {}, ...}
 
+# 2. seed + re-check counts move
+curl -s -X POST http://localhost:8000/orders -H "Content-Type: application/json" \
+  -d '{"customer_id":1,"restaurant_id":1,"value":500,"pickup_lat":28.61,"pickup_lon":77.20,"drop_lat":28.7,"drop_lon":77.1}'
+curl -s http://localhost:8000/admin/stats | python -m json.tool
+# → total_orders +1, orders_by_status shows PENDING
+
+# 3. regression
+python -m pytest -q
+```
 **✅** `/admin/stats` returns live counts (open now; locked Day 35).
 ---
 
