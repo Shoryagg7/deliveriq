@@ -1957,18 +1957,81 @@ def test_error_envelope(client):
 **✅** Missing order → `{"error":"ORDER_NOT_FOUND",...}`; every router uses typed
 exceptions; dispatch failures are specific (404 vs 409). 8 tests pass.
 ---
+## Day 25 — Rate-Limiter Hardening (atomic Lua) ✅
 
-## Day 25 — Rate-Limiter Hardening (atomic + toggleable)  *(prereq for scaling AND load test)*
-**Goal:** kill the read-write race and make the limiter controllable — so multi-instance (Day 28) is safe and the load test (Day 27) produces real numbers.
+**Goal:** kill the read-write race — collapse refill+check+decrement into one
+atomic Lua script. (Toggle + config already done Day 23.)
 
-1. **Atomic check** — collapse HGETALL→compute→HSET into one **Lua script** (or a `pipeline`/`WATCH`), so two concurrent requests can't both read the same token count. One round-trip, no interleave. (This is the "at scale I'd use Lua" line — now built.)
-2. **Toggle + config** — `if not settings.rate_limit_enabled: return await call_next(request)`. Capacity/refill from `settings`.
-3. **Per-key for load tests** — Locust can send a unique `X-API-Key` per simulated user so each gets its own bucket; otherwise one IP throttles the whole test.
+**Why:** 3 separate Redis ops (HGETALL→compute→HSET) let two concurrent requests
+read the same count and both pass. Redis runs a Lua script atomically → one
+indivisible operation.
 
-**Gotcha:** the Lua script runs server-side in Redis, which is *why* it's atomic — Redis executes a script without interleaving other commands. This is the senior version of the Day-16 limiter.
+### `app/middleware/rate_limiter.py`
+```python
+import time
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from app.core.config import settings
+from app.core.redis_client import redis_client
 
-**✅** Concurrent requests can't desync the bucket; `RATE_LIMIT_ENABLED=false` disables it; per-API-key buckets work.
+BUCKET_SIZE = settings.rate_limit_capacity
+REFILL_RATE = settings.rate_limit_refill_per_min / 60
+TTL = 120
 
+RATE_LIMIT_LUA = """
+local data = redis.call('HMGET', KEYS[1], 'tokens', 'last_refill')
+local tokens = tonumber(data[1])
+local last = tonumber(data[2])
+local cap = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+if tokens == nil then
+  tokens = cap
+  last = now
+else
+  tokens = math.min(cap, tokens + (now - last) * rate)
+end
+if tokens < 1 then
+  return -1
+end
+tokens = tokens - 1
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'last_refill', now)
+redis.call('EXPIRE', KEYS[1], ttl)
+return tostring(tokens)
+"""
+
+_rate_limit = redis_client.register_script(RATE_LIMIT_LUA)
+
+
+async def rate_limit_middleware(request: Request, call_next):
+    if not settings.rate_limit_enabled:
+        return await call_next(request)
+
+    client_key = request.headers.get("X-API-Key") or request.client.host  # type: ignore
+    bucket_key = f"rate_limit:{client_key}"
+    now = time.time()
+
+    result = _rate_limit(keys=[bucket_key], args=[BUCKET_SIZE, REFILL_RATE, now, TTL])
+
+    if result == "-1" or result == -1:
+        return JSONResponse(
+            status_code=429, content={"error": "Rate limit exceeded. Try again later."}
+        )
+
+    response = await call_next(request)
+    response.headers["X-RateLimit-Remaining"] = str(int(float(result)))
+    return response
+```
+
+**Gotcha:** script returns `tostring(tokens)` (Lua/Redis truncates bare numbers)
+→ parse with `float(result)`. `register_script` uses EVALSHA (sends hash, not
+body).
+
+**Test:** burst 105 → ~100×200 then 429. `python -m pytest -q` → 8 passed.
+
+**✅** One atomic round-trip per request; concurrent requests can't desync the
+bucket; multi-instance-safe for Day 29.
 ---
 
 ## Day 26 — Admin Analytics Endpoint

@@ -1027,3 +1027,68 @@ conflict Day 34) so none are dead code.
 
 *Shaky on any? That's your next review target.*
 ---
+# DeliverIQ — Interview Prep, Part 11 (Day 25)
+
+> Atomic rate limiter via Lua. concept / soundbite / gotcha.
+
+---
+
+## 31. Atomic Rate Limiting (Lua)
+
+### The race being fixed
+The Day-16 limiter did three separate Redis ops: HGETALL (read tokens) →
+compute refill in Python → HSET (write). Between the read and the write, a
+concurrent request can read the **same** token count, so two requests both see
+"1 token left" and both pass — the bucket desyncs and the limit is breached.
+This is a classic read-modify-write race, and it's real the moment you run more
+than one worker.
+
+**Soundbite:** "The original check was three Redis calls with a gap between read
+and write, so two concurrent requests could both read the same count and both
+pass. I collapsed refill + check + decrement into one Lua script — Redis runs a
+script atomically, no other command interleaves — so the whole operation is a
+single indivisible round-trip."
+
+### Why Lua is atomic
+Redis is single-threaded for command execution and runs a Lua script to
+completion before serving any other client. So everything inside the script —
+the HMGET, the refill math, the HSET, the EXPIRE — happens with no interleave.
+That's the exact property a token bucket's read-modify-write needs.
+
+**Soundbite:** "Redis executes a Lua script start-to-finish without interleaving,
+because command execution is single-threaded. That turns my three-op sequence
+into one atomic step — the senior version of the naive limiter."
+
+### register_script vs raw eval
+`redis_client.register_script(LUA)` loads the script once and returns a callable
+that uses `EVALSHA` (send the hash, not the whole body, each call) — less
+bandwidth than re-sending the script every request. Called as
+`script(keys=[...], args=[...])`.
+
+**Gotcha:** Lua numbers are floats but Redis integer-truncates a bare numeric
+return, so the script returns `tostring(tokens)` and Python parses it back with
+`float(result)`. Return a raw number and your remaining-tokens header loses the
+fraction.
+
+**Gotcha:** the toggle (`rate_limit_enabled`, Day 23) still short-circuits before
+the script — off for load tests so one IP's 100-token cap doesn't turn the whole
+test into 429s.
+
+### Cost now
+One round-trip per request (EVALSHA), still sub-millisecond, and now correct
+under concurrency. This is what makes the limiter safe at `--scale api=3`
+(Day 29) — multiple instances hit the same Redis, and the atomic script means
+they can't desync the shared bucket.
+
+---
+
+## 32. Self-Test — Day 25
+
+1. What's the read-modify-write race in the 3-op limiter?
+2. Why is a Lua script atomic in Redis?
+3. Why register_script instead of eval every time?
+4. Why does the script return a string, not a number?
+5. Why does this matter specifically at multiple API instances?
+
+*Shaky on any? That's your next review target.*
+---
