@@ -886,3 +886,61 @@ logs.
 
 *Shaky on any? That's your next review target.*
 ---
+# DeliverIQ — Interview Prep, Part 9 (Day 23)
+
+> Centralized config. Same format: concept / soundbite / gotcha.
+
+---
+
+## 27. Centralized Config (Settings + .env)
+
+### The concept
+One `Settings` object (pydantic-settings `BaseSettings`) reads all config from
+env vars / `.env`. Nothing hardcodes a URL. `database.py`, `redis_client.py`,
+and the rate limiter all import `settings` instead of holding their own strings.
+
+**Soundbite:** "All config lives in one pydantic-settings object read from env.
+Local reads `.env`; Docker, CI, and Railway inject their own values — so moving
+between environments is a config change, not a code change. That's what makes
+the app portable and 12-factor."
+
+### Why it matters downstream
+- **Docker/CI/Railway** each set different `DATABASE_URL`/`REDIS_URL` — same
+  image, different env.
+- **Test seam:** conftest sets `DATABASE_URL` (test DB) and `REDIS_URL`
+  (redis db 15) *before* the app imports config, so tests hit isolated stores.
+- **Feature flags:** `rate_limit_enabled` toggles the limiter off for load tests
+  without touching code.
+
+### How pydantic-settings works
+`BaseSettings` auto-loads env vars by field name (case-insensitive: field
+`database_url` ← env `DATABASE_URL`) and coerces types (`"100"` → `int 100`,
+`"true"` → `bool`). A field with no default (`database_url: str`) is **required**
+— the app won't start if it's missing, which is the right fail-fast behavior for
+a critical secret.
+
+**Soundbite:** "pydantic-settings maps env vars to typed fields automatically
+and coerces types. A field with no default is required, so a missing DATABASE_URL
+fails startup loudly instead of silently running against the wrong DB."
+
+**Gotcha:** the test env vars must be set in conftest *before* the first import
+that pulls in `settings` — `settings = Settings()` runs at import time, so if the
+app imports first, it binds to the wrong values. Same import-time seam as the
+Day-21 REDIS_DB trick, now for both stores via full URLs.
+
+**Gotcha:** `.env` is gitignored (secrets); commit `.env.example` with blank/
+safe values as the template so a new dev knows what to fill in.
+
+---
+
+## 28. Self-Test — Day 23
+
+1. Why centralize config instead of hardcoding URLs?
+2. How does pydantic-settings know which env var fills which field?
+3. Why is `database_url: str` (no default) the right choice for a secret?
+4. Why must conftest set env vars before importing the app?
+5. What's committed — `.env` or `.env.example` — and why?
+
+*Shaky on any? That's your next review target.*
+
+---

@@ -1,7 +1,9 @@
 import os
 
-os.environ["REDIS_DB"] = "15"  # MUST be set before app imports redis_client
-
+os.environ["DATABASE_URL"] = (
+    "postgresql://deliveriq_user:password@localhost:5432/deliveriq_test_db"
+)
+os.environ["REDIS_URL"] = "redis://localhost:6379/15"
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -13,10 +15,7 @@ from app.main import app
 from app.models.order import Order  # noqa: F401 — register tables on Base
 from app.models.rider import Rider  # noqa: F401
 
-TEST_DATABASE_URL = (
-    "postgresql://deliveriq_user:password@localhost:5432/deliveriq_test_db"
-)
-engine = create_engine(TEST_DATABASE_URL)
+engine = create_engine(os.environ["DATABASE_URL"])
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 

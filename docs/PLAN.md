@@ -1797,38 +1797,104 @@ curl -i http://localhost:8000/health
 **✅** Every log line is JSON with a request_id; one request is greppable across
 the app and the worker.
 ---
+## Day 23 — Centralized Config (.env + Settings) ✅
 
-## Day 23 — Centralized Config (.env + Settings)  *(moved up — everything downstream reads it)*
-**Goal:** one config object; zero hardcoded URLs; test seams env-driven so Docker and CI work later.
+**Goal:** one config object; zero hardcoded URLs; env-driven test seams so
+Docker and CI work later.
 
 ```bash
-pip install pydantic-settings python-dotenv
+pip install pydantic-settings python-dotenv && pip freeze > requirements.txt
 ```
-`app/core/config.py`:
+
+### 1. `app/core/config.py`
 ```python
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
     database_url: str
     redis_url: str = "redis://localhost:6379/0"
-    kafka_bootstrap: str = "localhost:9092"
     rate_limit_enabled: bool = True
     rate_limit_capacity: int = 100
     rate_limit_refill_per_min: int = 100
 
+
 settings = Settings()
 ```
-**Then actually consume it (the step v3.2 skipped):**
-- `database.py`: `create_engine(settings.database_url)`.
-- `redis_client.py`: `redis.Redis.from_url(settings.redis_url, decode_responses=True)` — **but keep the test seam**: tests point `REDIS_URL` at db 15 (`redis://localhost:6379/15`). The `REDIS_DB` env from Day 21 is replaced by a full `redis_url` override in conftest.
-- `rate_limiter.py`: read capacity/refill/enabled from `settings`.
-- `.env` (gitignored) + `.env.example` (committed, blank values).
 
-**Gotcha:** conftest must set `os.environ["DATABASE_URL"]` and `os.environ["REDIS_URL"]` to the **test** values *before* importing the app — same import-time seam as before, now for both stores. This is what makes CI (Day 36) pass without hardcoding.
+### 2. Consume it
 
-**✅** `grep -r "postgresql://" app/` and `localhost:6379` return nothing outside config; tests still green.
+`app/core/database.py`:
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from app.core.config import settings
 
+engine = create_engine(settings.database_url)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+```
+
+`app/core/redis_client.py`:
+```python
+import redis
+from app.core.config import settings
+
+redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+```
+
+`app/middleware/rate_limiter.py` (top):
+```python
+from app.core.config import settings
+
+BUCKET_SIZE = settings.rate_limit_capacity
+REFILL_RATE = settings.rate_limit_refill_per_min / 60
+
+# inside middleware, first line:
+    if not settings.rate_limit_enabled:
+        return await call_next(request)
+```
+
+### 3. `.env` (gitignored) + `.env.example` (committed)
+```
+# .env
+DATABASE_URL=postgresql://deliveriq_user:password@localhost:5432/deliveriq_db
+REDIS_URL=redis://localhost:6379/0
+
+# .env.example
+DATABASE_URL=
+REDIS_URL=redis://localhost:6379/0
+```
+
+### 4. conftest — env before import (replaces Day-21 REDIS_DB)
+```python
+import os
+os.environ["DATABASE_URL"] = "postgresql://deliveriq_user:password@localhost:5432/deliveriq_test_db"
+os.environ["REDIS_URL"] = "redis://localhost:6379/15"
+# ... then imports; engine = create_engine(os.environ["DATABASE_URL"])
+```
+
+**Gotcha:** `settings = Settings()` runs at import, so conftest must set env
+*before* importing the app. Same import-time seam as Day 21, now for both stores.
+
+**Verify:**
+```bash
+grep -rn "postgresql://" app/     # only config.py default (none in real code)
+grep -rn "localhost:6379" app/    # only config.py default
+python -m pytest -q               # 7 passed
+```
+
+**✅** No hardcoded URLs outside config; tests green; env-driven for Docker/CI.
 ---
 
 ## Day 24 — Custom Exceptions (integrated, not dead code)
