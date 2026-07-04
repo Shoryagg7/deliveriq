@@ -2033,17 +2033,42 @@ body).
 **✅** One atomic round-trip per request; concurrent requests can't desync the
 bucket; multi-instance-safe for Day 29.
 ---
+## Day 26 — Admin Analytics Endpoint ✅
 
-## Day 26 — Admin Analytics Endpoint
-**Goal:** aggregation endpoint (its own router, since JWT will protect it on Day 31).
+**Goal:** `GET /admin/stats` aggregation on its own router (JWT locks it Day 35).
 
-- `app/routers/admin.py` — `GET /admin/stats`: total orders, count by status, avg value, count of BUSY vs AVAILABLE riders.
-- Register the router.
+### `app/routers/admin.py`
+```python
+from fastapi import APIRouter, Depends
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.models.order import Order
+from app.models.rider import Rider
 
-**Gotcha:** give it its **own router** now so the JWT bearer dependency attaches cleanly later. `func.count`, `group_by` are SQLAlchemy aggregates.
+router = APIRouter(prefix="/admin", tags=["admin"])
 
-**✅** `/admin/stats` returns live counts (open for now; locked on Day 31).
 
+@router.get("/stats")
+def get_stats(db: Session = Depends(get_db)):
+    total_orders = db.query(func.count(Order.id)).scalar()
+    avg_value = db.query(func.avg(Order.value)).scalar()
+    status_rows = db.query(Order.status, func.count(Order.id)).group_by(Order.status).all()
+    rider_rows = db.query(Rider.status, func.count(Rider.id)).group_by(Rider.status).all()
+    return {
+        "total_orders": total_orders,
+        "avg_order_value": round(avg_value, 2) if avg_value else 0,
+        "orders_by_status": {s: c for s, c in status_rows},
+        "riders_by_status": {s: c for s, c in rider_rows},
+    }
+```
+
+Register: `app.include_router(admin.router)`
+
+**Gotcha:** `func.avg` → None on empty table (guard it); `group_by` omits
+zero-count statuses.
+
+**✅** `/admin/stats` returns live counts (open now; locked Day 35).
 ---
 
 # PHASE 5 — Containerization (done right) · Days 27–28
