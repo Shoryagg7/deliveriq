@@ -1,4 +1,5 @@
 from app.core.enums import OrderStatus
+from app.core.exceptions import InvalidTransition
 
 VALID_TRANSITIONS = {
     OrderStatus.PENDING: {OrderStatus.ASSIGNED, OrderStatus.CANCELLED},
@@ -7,10 +8,6 @@ VALID_TRANSITIONS = {
     OrderStatus.DELIVERED: set(),  # terminal
     OrderStatus.CANCELLED: set(),  # terminal
 }
-
-
-class InvalidTransition(Exception):
-    pass
 
 
 def transition(current: OrderStatus, target: OrderStatus) -> None:

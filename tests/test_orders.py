@@ -88,7 +88,7 @@ def test_busy_rider_not_dispatched_again(client):
     assert first.status_code == 200  # rider takes order 1, goes BUSY
 
     second = client.post("/orders/dispatch")
-    assert second.status_code == 404  # no AVAILABLE rider for order 2
+    assert second.status_code == 409  # orders pending but no AVAILABLE rider
 
 
 def test_delivery_frees_rider(client):
@@ -124,3 +124,8 @@ def test_illegal_transition_rejected(client):
     # PENDING → DELIVERED skips ASSIGNED/PICKED_UP → illegal
     r = client.patch(f"/orders/{order_id}/status", json={"status": "DELIVERED"})
     assert r.status_code == 400
+
+def test_error_envelope(client):
+    r = client.get("/orders/999")
+    assert r.status_code == 404
+    assert r.json() == {"error": "ORDER_NOT_FOUND", "message": "Order 999 not found"}

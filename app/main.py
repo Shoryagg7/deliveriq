@@ -1,6 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from app.core.database import Base, engine
+from app.core.exceptions import DeliverIQError
 from app.core.logging_config import setup_logging
 from app.middleware.rate_limiter import rate_limit_middleware
 from app.middleware.request_id import request_id_middleware
@@ -23,3 +25,11 @@ logger = logging.getLogger("deliveriq")
 def health():
     logger.info("health check hit")
     return {"status": "ok"}
+
+
+@app.exception_handler(DeliverIQError)
+async def deliveriq_error_handler(request: Request, exc: DeliverIQError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.code, "message": exc.message},
+    )

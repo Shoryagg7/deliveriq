@@ -1896,18 +1896,66 @@ python -m pytest -q               # 7 passed
 
 **✅** No hardcoded URLs outside config; tests green; env-driven for Docker/CI.
 ---
+## Day 24 — Custom Exceptions (integrated) ✅
 
-## Day 24 — Custom Exceptions (integrated, not dead code)
-**Goal:** a clean JSON error envelope, wired into the **existing** raises — not a parallel set of unused classes.
+**Goal:** one JSON error envelope, wired into real raises — not dead classes.
 
-- `app/core/exceptions.py`: `DeliverIQError` base + `OrderNotFound`, `RiderNotFound`, `RiderUnavailable`. **Do not** redefine state-transition errors — reuse the existing `InvalidTransition` from `order_state.py` (the v3.2 `InvalidStateTransition` was a name clash).
-- Register `@app.exception_handler(...)` for each → `{"error": "CODE", "message": ...}`.
-- **Refactor existing endpoints** to raise these instead of bare `HTTPException(404, ...)`. If you don't refactor, the day is dead code — that's the whole point of doing it now.
+### 1. `app/core/exceptions.py`
+```python
+class DeliverIQError(Exception):
+    status_code = 500
+    code = "INTERNAL_ERROR"
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
 
-**Gotcha:** keep `InvalidTransition` → 400 mapping (the Day-19 semantics: well-formed but illegal). The handler just standardizes the body shape.
+class OrderNotFound(DeliverIQError):     status_code = 404; code = "ORDER_NOT_FOUND"
+class RiderNotFound(DeliverIQError):     status_code = 404; code = "RIDER_NOT_FOUND"
+class NoPendingOrders(DeliverIQError):   status_code = 404; code = "NO_PENDING_ORDERS"
+class RiderUnavailable(DeliverIQError):  status_code = 409; code = "RIDER_UNAVAILABLE"
+class InvalidTransition(DeliverIQError): status_code = 400; code = "INVALID_TRANSITION"
+```
 
-**✅** A missing order returns `{"error":"ORDER_NOT_FOUND","message":...}`, no stack traces leak, and every router uses the typed exceptions.
+### 2. `main.py` — one base handler
+```python
+@app.exception_handler(DeliverIQError)
+async def deliveriq_error_handler(request: Request, exc: DeliverIQError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.code, "message": exc.message},
+    )
+```
 
+### 3. `order_state.py` — import InvalidTransition (remove local class)
+```python
+from app.core.exceptions import InvalidTransition
+```
+
+### 4. `dispatch.py` — raise specific errors instead of returning None
+```python
+if not pending:
+    raise NoPendingOrders("No pending orders to dispatch")
+# ... after the while-loop finds no rider:
+raise RiderUnavailable("Orders are pending but no rider is available nearby")
+```
+
+### 5. Routers — typed raises, no try/except
+- `orders.py`: `OrderNotFound`; `transition()` raises `InvalidTransition` → base handler → 400 (no try/except).
+- `riders.py`: `RiderNotFound`, `RiderUnavailable` (match).
+
+**Gotcha:** InvalidTransition is now a DeliverIQError → the 400 comes from the
+base handler, not a manual HTTPException. no-rider is 409 (conflict), not 404.
+
+**Test:** update `test_busy_rider_not_dispatched_again` → assert 409.
+Optional envelope test:
+```python
+def test_error_envelope(client):
+    r = client.get("/orders/999")
+    assert r.json() == {"error": "ORDER_NOT_FOUND", "message": "Order 999 not found"}
+```
+
+**✅** Missing order → `{"error":"ORDER_NOT_FOUND",...}`; every router uses typed
+exceptions; dispatch failures are specific (404 vs 409). 8 tests pass.
 ---
 
 ## Day 25 — Rate-Limiter Hardening (atomic + toggleable)  *(prereq for scaling AND load test)*

@@ -83,7 +83,6 @@ Instead of naive nearest-rider, among riders within a distance band Δ of the ne
 "Some of these (Kafka, Prometheus) are more than a small project strictly needs. I added them deliberately to learn the production patterns my target companies use, and I can defend each one's trade-off rather than just listing it."
 
 ---
-
 ## 3. REST & HTTP Basics
 
 ### Status codes — what they signal
@@ -91,6 +90,7 @@ Instead of naive nearest-rider, among riders within a distance band Δ of the ne
 - `201 Created` — success, a new resource was created (use for POST that creates).
 - `400 Bad Request` — the request is well-formed but **illegal given current state** (e.g. an illegal order-status transition). *Your* logic raised it.
 - `404 Not Found` — the resource doesn't exist.
+- `409 Conflict` — request conflicts with current state (orders pending but no rider free — `RiderUnavailable`). *Added Day 24.*
 - `422 Unprocessable Entity` — input failed **validation** (wrong type, missing field, constraint broken). FastAPI raises this automatically.
 - `429 Too Many Requests` — rate limit exceeded (the token bucket).
 - `503 Service Unavailable` — health check degraded (a dependency is down). *Upcoming, Day 38.*
@@ -110,7 +110,21 @@ Both are "client's request didn't work," but they mean different things:
 - **PATCH** — **partial** update of an existing resource (rider location, order status — change a few fields).
 - **PUT** — **full** replace of a resource (send the whole object). Idempotent.
 - **DELETE** — remove a resource. Idempotent.
+### The QUERY method — GET's body limitation (know it, don't build it)
+GET is safe + idempotent but **can't carry a request body**. Complex searches
+(big nested filter payloads) then force a bad choice: cram everything into query
+strings, or misuse POST for a read (POST implies mutation). The new **QUERY**
+method (IETF draft) is the fix: safe + idempotent like GET, but *with* a body —
+"read with a payload."
 
+**Soundbite:** "For a search with a large structured filter, GET can't take a
+body and POST wrongly implies a write. The QUERY method solves it — GET's
+semantics plus a body. FastAPI has no first-class support yet (no `@app.query`),
+so I'd wire it via `api_route(methods=['QUERY'])` or wait for the decorator.
+DeliverIQ's filters are simple query params, so I didn't need it."
+
+**Gotcha:** it's still a draft — Swagger/OpenAPI tooling doesn't fully render it,
+so it's a talking point, not a production choice today.
 **Soundbite:** "Verb follows semantics. `/match` and `/dispatch` are POST even though they don't 'create' anything — they have side effects (incrementing a counter, flipping status), and side effects can't sit behind a GET, which must stay safe and idempotent. Location and status updates are PATCH because they're partial edits, not full replacements."
 
 **Gotcha:** putting a mutation behind a GET is the classic violation — a crawler or a retry could silently fire it. Safe/idempotent is a *contract*, not a suggestion.
@@ -124,9 +138,11 @@ Both are "client's request didn't work," but they mean different things:
 **Gotcha:** an optional filter like `status` should be a query param, not `/orders/{status}` — putting it in the path makes it required and reads as identity.
 
 ### The error envelope
-`422` responses look like: `{"detail":[{"type","loc","msg","input"}]}`.
-`loc` tells you *where* it failed — `["body","value"]`, `["query","status"]`, `["path","order_id"]`.
+Two shapes coexist:
+- **Pydantic validation (`422`)** — automatic, malformed input: `{"detail":[{"type","loc","msg","input"}]}`. `loc` tells you *where* it failed — `["body","value"]`, `["query","status"]`, `["path","order_id"]`.
+- **Domain errors (Day 24)** — raised `DeliverIQError`: `{"error": CODE, "message": ...}`, e.g. `{"error":"ORDER_NOT_FOUND","message":"Order 999 not found"}`.
 
+**Soundbite:** "Two envelopes: Pydantic's `422 {"detail":[...]}` for malformed input, and my `DeliverIQError` envelope `{"error":CODE,"message":...}` for domain failures. A client checks `error` for domain codes, `detail` for validation."
 ---
 
 ## 4. Validation (FastAPI + Pydantic)
@@ -943,4 +959,71 @@ safe values as the template so a new dev knows what to fill in.
 
 *Shaky on any? That's your next review target.*
 
+---
+# DeliverIQ — Interview Prep, Part 10 (Day 24)
+
+> Custom exceptions + unified error envelope. concept / soundbite / gotcha.
+
+---
+
+## 29. Custom Exceptions
+
+### The concept
+A base `DeliverIQError` carries a `status_code` + `code`; each domain error
+subclasses it (`OrderNotFound` 404, `RiderNotFound` 404, `NoPendingOrders` 404,
+`RiderUnavailable` 409, `InvalidTransition` 400). One `@app.exception_handler`
+on the base catches all subclasses and returns a consistent JSON envelope:
+`{"error": CODE, "message": ...}`. No stack traces leak; every error looks the
+same to a client.
+
+**Soundbite:** "Every domain error subclasses one base with its own status_code
+and code, and a single handler turns any of them into the same JSON envelope. A
+client parses one shape for every error instead of guessing per-endpoint."
+
+### Why raise from the service, not the router
+`pick_next_order` used to return `None` for two different failures — no pending
+orders vs orders-exist-but-no-rider — and the router collapsed both into a vague
+404. Now the service raises the *specific* exception (`NoPendingOrders` 404 vs
+`RiderUnavailable` 409), so the caller gets the real reason and the right code.
+The service knows *why* it failed; the router shouldn't have to reverse-engineer
+it from a `None`.
+
+**Soundbite:** "The service raises the specific error because it's the only layer
+that knows the reason. Returning None forced the router to guess, and I was
+merging two different failures into one status code. Now no-orders is 404 and
+no-rider is 409 — a conflict, not a missing resource."
+
+### Why 409 for no-rider (not 404)
+404 = the resource doesn't exist. But orders *do* exist and riders *do* exist —
+they're just all BUSY. That's a **conflict with current state**, which is 409.
+Same family of reasoning as 400-vs-422 on the state machine: the code should
+describe *what kind* of failure it is.
+
+### One base handler, not one per subclass
+Registering the handler on `DeliverIQError` (the base) means every current and
+future subclass is covered automatically — add a new exception, it's handled
+without touching `main.py`. The handler just reads `exc.status_code`/`exc.code`
+off whichever subclass was raised.
+
+**Gotcha:** `InvalidTransition` moved into `exceptions.py` and became a
+`DeliverIQError` subclass — so the router's old `try/except → HTTPException(400)`
+is gone; raising it now flows through the base handler and still yields 400.
+Keeping it as a bare `Exception` would have made it a 500.
+
+**Gotcha:** don't invent exceptions for conditions you don't have yet.
+Validation is already 422 (Pydantic), generic bugs are 500 (base default). Add
+each custom exception the day its feature lands (auth errors Day 35, idempotency
+conflict Day 34) so none are dead code.
+
+---
+
+## 30. Self-Test — Day 24
+
+1. Why a base exception + one handler instead of per-endpoint HTTPException?
+2. Why does the service raise instead of returning None?
+3. Why is no-rider 409 and no-orders 404?
+4. Why did InvalidTransition need to become a DeliverIQError subclass?
+5. Why not pre-create every exception you might ever need?
+
+*Shaky on any? That's your next review target.*
 ---

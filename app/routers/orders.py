@@ -1,15 +1,16 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.enums import OrderStatus
+from app.core.exceptions import OrderNotFound
 from app.models.order import Order
 from app.models.rider import Rider
 from app.schemas.order import OrderCreate, OrderResponse
 from app.services.dispatch import pick_next_order
 from app.services.geohash_service import update_rider_location
-from app.services.order_state import InvalidTransition, transition
+from app.services.order_state import transition
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -27,7 +28,7 @@ def create_order(order: OrderCreate, db: Session = Depends(get_db)):
 def get_order(order_id: int, db: Session = Depends(get_db)):
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
-        raise HTTPException(404, "Order not found")
+        raise OrderNotFound(f"Order {order_id} not found")
     return order
 
 
@@ -41,12 +42,7 @@ def list_orders(status: OrderStatus | None = None, db: Session = Depends(get_db)
 
 @router.post("/dispatch")
 def dispatch_order(db: Session = Depends(get_db)):
-    result = pick_next_order(db)
-    if result is None:
-        raise HTTPException(
-            404,
-            "No order could be dispatched (no pending orders, or no riders available)",
-        )
+    result = pick_next_order(db)  # raises NoPendingOrders / RiderUnavailable
     return {"dispatched": result}
 
 
@@ -58,16 +54,13 @@ class StatusUpdate(BaseModel):
 def update_status(order_id: int, body: StatusUpdate, db: Session = Depends(get_db)):
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
-        raise HTTPException(404, "Order not found")
+        raise OrderNotFound(f"Order {order_id} not found")
     current = OrderStatus(order.status)  # str from DB → enum
-    try:
-        transition(current, body.status)  # validate; raises if illegal
-    except InvalidTransition as e:
-        raise HTTPException(400, str(e))
+    transition(current, body.status)  # validate; raises InvalidTransition if illegal
     order.status = body.status.value  # type: ignore # enum → str for the DB
     # terminal states free the assigned rider + put them back in the index
     reindex = None
-    if body.status in (OrderStatus.DELIVERED, OrderStatus.CANCELLED) and order.rider_id: # type: ignore
+    if body.status in (OrderStatus.DELIVERED, OrderStatus.CANCELLED) and order.rider_id:  # type: ignore
         rider = db.query(Rider).filter(Rider.id == order.rider_id).first()
         if rider:
             rider.status = "AVAILABLE"  # type: ignore
