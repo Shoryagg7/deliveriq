@@ -1685,18 +1685,117 @@ Minor cleanups folded in: routers are **plural** in real code (`orders.py`, `rid
 
 # PHASE 4 — Production Hardening (local) · Days 22–26
 
-## Day 22 — Structured Logging + request_id correlation
-**Goal:** JSON logs, and a `request_id` on every log line so you can trace one request end-to-end (the thing interview Q16 claims).
+## Day 22 — Structured Logging + request_id correlation ✅
 
-- `app/core/logging_config.py` — `JsonFormatter` (timestamp via `datetime.now(UTC)`, level, logger, message, **request_id**), `setup_logging()`.
-- `app/middleware/request_id.py` — middleware that generates a UUID per request, stashes it in a `contextvars.ContextVar`, and the formatter reads it. Add `X-Request-ID` to the response.
-- Replace the `print()` in `notification_worker.py` (and any others) with `logger.info(...)`.
-- Register `setup_logging()` in `main.py`.
+**Goal:** JSON logs, and a `request_id` on every log line so you can trace one
+request end-to-end.
 
-**Gotcha:** middleware order — request_id must run **outermost** so every downstream log (including the rate limiter) carries the id. `contextvars` (not a global) is what makes the id correct under async concurrency.
+**Why:** JSON logs are queryable in an aggregator (Loki/ELK); `print()` is a dead
+string. request_id ties every line of one request together so interleaved
+requests are untangleable.
 
-**✅** Every log line is JSON with a request_id; one request is greppable across the app and the worker.
+### 1. `app/core/request_context.py` — the contextvar + log filter
+```python
+import contextvars
+import logging
 
+request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "request_id", default=None
+)
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_var.get()
+        return True
+```
+
+### 2. `app/core/logging_config.py` — JSON formatter + setup
+```python
+import json
+import logging
+from datetime import UTC, datetime
+
+from app.core.request_context import RequestIdFilter
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        log = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "request_id": getattr(record, "request_id", None),
+        }
+        return json.dumps(log)
+
+
+def setup_logging():
+    handler = logging.StreamHandler()          # logs → stdout
+    handler.addFilter(RequestIdFilter())
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    root.handlers.clear()                       # drop uvicorn's default text handler
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+```
+
+### 3. `app/middleware/request_id.py` — UUID per request
+```python
+import uuid
+from fastapi import Request
+from app.core.request_context import request_id_var
+
+
+async def request_id_middleware(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    request_id_var.set(request_id)              # store for this request's context
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+```
+
+### 4. `app/main.py` — wire it (request_id registered LAST = outermost)
+```python
+from app.core.logging_config import setup_logging
+from app.middleware.rate_limiter import rate_limit_middleware
+from app.middleware.request_id import request_id_middleware
+
+setup_logging()
+app = FastAPI(title="DeliverIQ")
+# ... include_routers ...
+app.middleware("http")(rate_limit_middleware)   # inner
+app.middleware("http")(request_id_middleware)    # outer (registered last)
+```
+
+### 5. `app/workers/notification_worker.py` — print() → logger
+```python
+import logging
+from app.core.logging_config import setup_logging
+
+setup_logging()
+logger = logging.getLogger("deliveriq.worker")
+# ...
+logger.info(f"[notify] order {data['order_id']} → rider {data['rider_id']}")
+```
+> The worker doesn't run through main.py, so it calls setup_logging() itself.
+
+**Gotcha:** FastAPI runs middleware last-registered-first, so request_id
+registered last runs outermost → every downstream log (incl. rate limiter)
+carries the id. contextvars (not a global) keeps ids from bleeding across
+concurrent async requests.
+
+**Test:**
+```bash
+curl -i http://localhost:8000/health
+# response has X-Request-ID header
+# terminal shows JSON log with a non-null request_id inside a request,
+# null on out-of-request lines (startup, watchfiles)
+```
+
+**✅** Every log line is JSON with a request_id; one request is greppable across
+the app and the worker.
 ---
 
 ## Day 23 — Centralized Config (.env + Settings)  *(moved up — everything downstream reads it)*

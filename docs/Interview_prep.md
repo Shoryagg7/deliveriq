@@ -804,4 +804,85 @@ just exercises error branches. The 'Missing' column is the actionable part."
 8. Why is the busy-rider-404 test the most valuable one?
 9. How do you read a coverage report — what's the actionable part?
 
+---
 *Shaky on any? That's your next review target.*
+# DeliverIQ — Interview Prep, Part 8 (Day 22)
+
+> Structured JSON logging + request_id correlation. Same format:
+> **concept (why)**, **soundbite (how to say it)**, **gotcha (what trips people up)**.
+
+---
+
+## 25. Structured Logging + request_id
+
+### Why JSON logs, not print()
+A `print("order 5 dispatched")` is a dead string — a log aggregator
+(Grafana Loki, ELK, Datadog) can't filter or query it. Emitting each line as
+JSON (`{"level","logger","message","request_id",...}`) makes every field
+queryable: "show me all ERROR lines for request X" becomes a real query, not a
+grep-and-pray. Production logs are data, not prose.
+
+**Soundbite:** "I log structured JSON, not plain strings, so logs are queryable
+in an aggregator — filter by level, logger, or request_id instead of scanning
+text. `print()` is fine for a script; a service needs machine-readable logs."
+
+### Why request_id — tracing one request end-to-end
+Under load, hundreds of requests interleave and their log lines mix together in
+one stream. A per-request UUID stamped on every line lets you pull out *just
+that request's* trail — middleware → endpoint → service → worker. That's what
+"trace a request end-to-end" concretely means. The id also goes back to the
+client as an `X-Request-ID` response header, so a user reporting a bug can quote
+the id and you find their exact request.
+
+**Soundbite:** "Every request gets a UUID stored in a contextvar; the log
+formatter stamps it on every line, so one request is greppable across the whole
+app. I also return it as an X-Request-ID header — a client hitting an error can
+quote that id and I pull their exact trail."
+
+### Why contextvars, not a global ⭐ (the senior detail)
+Async runs many requests concurrently on one thread. A plain global variable
+would be overwritten by whichever request touched it last — ids would bleed
+across interleaved requests. A `contextvars.ContextVar` holds a **separate value
+per async context**, so each request sees only its own id. That isolation is the
+entire reason contextvars exist.
+
+**Soundbite:** "The id lives in a contextvar, not a global, because async
+interleaves requests on one thread — a global would leak one request's id into
+another's logs. A contextvar is per-context, so each request's id stays its
+own."
+
+**Gotcha:** the formatter reads `getattr(record, "request_id", None)` with a
+default — logs emitted *outside* any request (startup, file-watch events) have
+no id, so `request_id` is `null`. That's correct, not a bug: null means "not
+inside a request."
+
+### Middleware order — request_id must be outermost
+FastAPI runs middleware in **reverse registration order**, so request_id is
+registered *last* to run *first* (outermost). If it ran after the rate limiter,
+the limiter's own logs would have no id. Outermost = the id is set before any
+other middleware or handler runs, so everything downstream carries it.
+
+**Soundbite:** "request_id is the outermost middleware — registered last, since
+FastAPI runs middleware last-registered-first. That way even the rate limiter's
+logs carry the id; if it ran inner, anything logged before it would be
+un-correlated."
+
+**Gotcha:** the root logger's handlers must be cleared and replaced in
+`setup_logging()`, or you get double lines (uvicorn's default text handler plus
+your JSON one). Note uvicorn's own access logs (`uvicorn.access`) don't
+propagate to root, so they stay plain text — that's fine, they're not your app's
+logs.
+
+---
+
+## 26. Self-Test — Day 22 (answer out loud)
+
+1. Why JSON logs instead of print() — what does it buy you?
+2. What does request_id let you do that you can't without it?
+3. Why a contextvar and not a global variable? What breaks with a global?
+4. Why is request_id null on some log lines, and is that a bug?
+5. Why must request_id middleware be registered last?
+6. Why clear the root logger's handlers in setup_logging()?
+
+*Shaky on any? That's your next review target.*
+---
