@@ -1,7 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.core.database import Base, engine
 from app.core.exceptions import DeliverIQError
 from app.core.logging_config import setup_logging
 from app.middleware.rate_limiter import rate_limit_middleware

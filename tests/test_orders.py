@@ -34,6 +34,23 @@ def test_invalid_value_rejected(client):
     assert r.status_code == 422
 
 
+def test_boundary_coordinates_accepted(client):
+    # south pole (-90) and antimeridian (-180/180) are valid coordinates
+    r = client.post(
+        "/orders",
+        json={
+            "customer_id": 1,
+            "restaurant_id": 1,
+            "value": 100,
+            "pickup_lat": -90,
+            "pickup_lon": -180,
+            "drop_lat": 90,
+            "drop_lon": 180,
+        },
+    )
+    assert r.status_code == 201
+
+
 def test_get_missing_order_404(client):
     r = client.get("/orders/999")
     assert r.status_code == 404

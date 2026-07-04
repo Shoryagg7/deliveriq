@@ -1,7 +1,7 @@
 # app/models/order.py
 from datetime import UTC, datetime
 
-from sqlalchemy import Column, DateTime, Float, Integer, String, ForeignKey
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String
 
 from app.core.database import Base
 
