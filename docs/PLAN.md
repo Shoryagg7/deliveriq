@@ -972,13 +972,35 @@ Push `(-priority, id)`. The longer an order waits, the higher it climbs until it
 
 ### Honest complexity note (good interview material)
 This rebuilds the heap from the DB each call and pops one element — O(n) build to extract one max, so for a *single* pick a plain `max()` does equal work. The heap earns its keep when you pop many in sequence or keep it warm across calls. State that openly.
+### 📈 The distributed scale-up — ⚠️ scheduled for Day 29, NOT optional
 
-### 📈 The distributed scale-up (Redis sorted set) — ⚠️ scheduled for Phase 4, NOT optional
-At scale the queue shouldn't live inside one API process. Move it into a **Redis sorted set**: `ZADD orders:pending {id: priority}` on create, `ZREVRANGE ... 0 0` to peek the max, `ZREM` to claim it atomically. Benefits: O(log n) ops, shared across multiple API instances, and `ZREM` returning `1`-or-`0` is your **concurrent-dispatch guard** (two workers can't claim the same order). This is the natural "what breaks at scale, and how you'd fix it" answer.
+At scale the queue shouldn't live inside one API process. With 2+ API replicas,
+two instances could pop and claim the **same** PENDING order — a race.
 
-> 🔑 **Why "later," not "now":** today you run a single uvicorn process — there's no second instance to share state with, so the sorted set would solve a problem you don't yet have (and you couldn't *demonstrate* the `ZREM` race-guard with only one worker). The heapq version is also the one that actually showcases your DSA; the sorted set *hides* the heap inside Redis. So heapq first, by design.
+**Primary path (v4): Postgres `SELECT … FOR UPDATE SKIP LOCKED`.**
+When claiming the winner, re-fetch the row `.with_for_update(skip_locked=True)`,
+re-check it's still PENDING, then flip to ASSIGNED. The row lock serializes the
+claim (only one instance wins); `SKIP LOCKED` means the other instance doesn't
+block — it moves to the next order. This **preserves the wait-time aging formula,
+the fairness band, and the work-conserving rider loop** exactly as built.
 
-> 🟥 **Resume dependency — do not skip.** Your resume says **"distributed."** That word is only earned once this is built and you've shown the multi-instance race + `ZREM` fix. **Build it in Phase 4** (Day 26, Docker Compose) by running the API with 2+ replicas and moving the queue here — *then* "distributed" is true and demonstrable, and the race becomes one of your best war stories. If you finish the project without doing it, **soften the resume** ("designed for horizontal scaling" / "stateless API with externalized state") rather than leave an indefensible claim. Don't ship the word "distributed" with a single-instance heap behind it.
+> 🔑 **Why SKIP LOCKED over the Redis sorted set:** a sorted set's score is fixed
+> at insert, so it **can't express wait-time aging** (the score would have to
+> change every second). It also hides the heap inside Redis. SKIP LOCKED keeps
+> the heap logic in the app and adds only the concurrent-claim guard. The sorted
+> set (ZADD/ZREVRANGE/ZREM, ZREM as the atomic claim) is now just the "optional
+> alt — know the tradeoff" mention.
+
+> 🔑 **Why "later," not "now":** today you run a single uvicorn process — no
+> second instance to race with, so there's nothing to demonstrate yet. heapq
+> first, by design (it showcases your DSA).
+
+> 🟥 **Resume dependency — do not skip.** Your resume says "distributed." That
+> word is only earned once this is built (Day 29) and you've shown the
+> multi-instance race + SKIP LOCKED fix, run via `docker compose --scale api=3`.
+> If you finish without it, soften the wording ("designed for horizontal
+> scaling" / "stateless API with externalized state") rather than leave an
+> indefensible claim.
 
 ### 📝 Interview Answer — save to `INTERVIEW_NOTES.md`
 ```
