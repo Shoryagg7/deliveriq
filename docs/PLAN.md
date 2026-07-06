@@ -2161,34 +2161,113 @@ python -m pytest -q
 ---
 
 # PHASE 5 — Containerization (done right) · Days 27–28
+## Day 27 — DONE (exact commands + what we did)
 
-## Day 27 — Dockerize (with migrations) + Load Test
-**Goal:** the app runs in a container **with its schema applied**, then measure real throughput.
+**1. Install Docker** (official apt repo):
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker $USER   # then LOG OUT + back in for group to apply
+docker run --rm hello-world     # verify
+```
 
-`Dockerfile`:
+**2. Dockerfile** (root):
 ```dockerfile
 FROM python:3.14-slim
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 EXPOSE 8000
 CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
 ```
-> **The migration fix:** `alembic upgrade head` runs **before** uvicorn, so the container always has the current schema. Without this the container has no tables.
+- deps installed before code → dep layer stays cached on code edits
+- CMD migrates before serving → container always has current schema
 
-**Load test** (after the container runs, or against local):
+**3. .dockerignore** (root): `venv/`, `__pycache__/`, `*.pyc`, `.env`, `.git/`,
+`.pytest_cache/`, `*.egg-info/`, `.mypy_cache/`
+
+**4. Build:**
+```bash
+docker build -t deliveriq:latest .
+```
+
+**5. Migration portability** — `alembic/env.py`, after `config = context.config`:
+```python
+import os
+db_url = os.getenv("DATABASE_URL")
+if db_url:
+    config.set_main_option("sqlalchemy.url", db_url)
+```
+Why: `alembic.ini` hardcodes `localhost`; inside a container that = the container,
+not the host. Env-var override → works in Docker + Railway. **Rebuilt after this
+edit** (COPY had baked in the old file):
+```bash
+docker build -t deliveriq:latest .
+```
+
+**6. Host services opened for Docker** (all removed by Day 28 Compose):
+```bash
+sudo nano /etc/postgresql/18/main/postgresql.conf   # listen_addresses = '*'
+sudo nano /etc/postgresql/18/main/pg_hba.conf        # add: host all all 172.17.0.0/16 scram-sha-256
+sudo systemctl restart postgresql
+sudo nano /etc/redis/redis.conf                      # bind 127.0.0.1 172.17.0.1  +  protected-mode no
+sudo systemctl restart redis-server
+```
+
+**7. Run the container** (against host DB/Redis, pre-Compose):
+```bash
+docker run --rm --name deliveriq -p 8000:8000 \
+  --add-host=host.docker.internal:host-gateway \
+  -e DATABASE_URL="postgresql://deliveriq_user:password@host.docker.internal:5432/deliveriq_db" \
+  -e REDIS_URL="redis://host.docker.internal:6379/0" \
+  deliveriq:latest
+```
+Verify (new terminal):
+```bash
+curl -s http://localhost:8000/admin/stats | python -m json.tool
+```
+→ live JSON = boots, migrates, connects, serves.
+
+**Container lifecycle** (why port 8000 kept sticking: `--rm` deletes on exit, not
+on next run):
+```bash
+docker ps                       # list running
+docker stop deliveriq           # stop by name
+docker images                   # deliveriq:latest → 606MB
+```
+
+**8. Load test:**
 ```bash
 pip install locust
+# locustfile.py = 50 users POST /orders
+locust -f locustfile.py --host http://localhost:8000
+# browser → http://localhost:8089 → 50 users, ramp 10, Start
 ```
-- Locust task posts orders; **set a unique `X-API-Key` per user** (or run with `RATE_LIMIT_ENABLED=false`) so the limiter doesn't turn the test into a wall of 429s.
-- Screenshot p99/RPS for the README.
+First run: 97% 429s (limiter working, not real capacity). Restart with limiter off:
+```bash
+docker stop deliveriq
+docker run --rm --name deliveriq -p 8000:8000 \
+  --add-host=host.docker.internal:host-gateway \
+  -e DATABASE_URL="postgresql://deliveriq_user:password@host.docker.internal:5432/deliveriq_db" \
+  -e REDIS_URL="redis://host.docker.internal:6379/0" \
+  -e RATE_LIMIT_ENABLED=false \
+  deliveriq:latest
+```
+Re-ran Locust (50 users).
 
-**Gotcha:** `libpq-dev`/`gcc` in the image because `psycopg2-binary` *usually* ships a wheel but the source build needs them; safe to include. The rate-limit toggle is why your numbers are now honest.
+**Results (honest, limiter off):** ~123 RPS @ 50 users · p99 220ms · p95 180ms ·
+median 93ms · 0% errors. Image 606MB disk / 153MB content.
 
-**✅** Container boots, migrates, serves; load test shows real p99/RPS (not 429s).
-
+**✅** Container boots → migrates → connects → serves; load numbers defensible.
 ---
 
 ## Day 28 — Docker Compose (full local stack, multi-instance ready)

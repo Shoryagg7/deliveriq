@@ -1587,3 +1587,145 @@ worth knowing if a consumer expects all keys.
 3. Why give admin its own router now?
 
 *Shaky on any? That's your next review target.*
+
+---
+# DeliverIQ — Interview Prep, Part 13 (Day 27)
+
+> Docker from zero, migrations on boot, load testing. concept / soundbite / gotcha.
+
+---
+
+## 35. What Docker Actually Is (the basics)
+
+### The problem it solves
+Your app needs Python 3.14, a specific FastAPI version, psycopg2, and dozens of
+other pinned packages. On another machine — a teammate's laptop, a server, Railway —
+any of those might be a different version or missing. That's the classic
+"works on my machine" failure.
+
+Docker packages the app **together with its exact environment** (OS libraries,
+Python, every pip package) into one sealed unit. That unit runs the same
+everywhere. You're not shipping code and hoping the target machine matches — you
+ship the whole environment.
+
+### The three words
+- **Image** = the blueprint. A frozen snapshot: base OS + Python + your deps + your
+  code. Read-only. Built from the `Dockerfile`.
+- **Container** = a running copy of an image. You can start/stop many from one image.
+- **Dockerfile** = the recipe that builds the image, step by step.
+
+Analogy: image = a class, container = an object (instance). Dockerfile = the class
+definition.
+
+### How the Dockerfile builds up
+Each line is a **layer**, cached independently:
+1. `FROM python:3.14-slim` — start from a minimal official Python image.
+2. `WORKDIR /app` — work inside `/app` in the container.
+3. `RUN apt-get install gcc libpq-dev` — OS build tools some Python packages need.
+4. `COPY requirements.txt` then `RUN pip install` — deps.
+5. `COPY . .` — your code.
+6. `CMD [...]` — the command that runs when the container starts.
+
+**Why deps are copied before code:** Docker caches each layer. If you only change
+code, layers 1–4 are unchanged, so Docker reuses the cached dependency install
+instead of redownloading everything. Copy code first and every code edit would
+reinstall all packages — slow.
+
+**Soundbite:** "Docker packages the app with its whole environment so it runs
+identically anywhere. An image is the read-only blueprint, a container is a running
+instance. I order the Dockerfile so dependencies install before code is copied —
+that keeps the dependency layer cached, so a code change doesn't trigger a full
+reinstall."
+
+---
+
+## 36. Migrations on Boot (why the CMD matters)
+
+### The concept
+A fresh container has the app but an **empty** database schema — no tables. My
+`CMD` runs `alembic upgrade head` **before** starting uvicorn. So the moment the
+container boots, it brings the database up to the latest schema, then serves. No
+separate manual "run the migration" step in any environment.
+
+**Soundbite:** "The container's start command runs `alembic upgrade head` before
+launching the server, so it always boots with the current schema — the same one
+step works locally, in CI, and on Railway."
+
+**Gotcha (the bug I hit):** Alembic was reading the database URL from
+`alembic.ini`, which was hardcoded to `localhost`. Inside a container, `localhost`
+means the container itself — not my host machine where Postgres runs. So migrations
+failed with "connection refused." I fixed `env.py` to prefer the `DATABASE_URL`
+environment variable and fall back to the ini. Same config-from-environment
+principle the app already used for its own DB connection.
+
+---
+
+## 37. Container Networking (why localhost broke)
+
+### The concept
+Each container has its **own** network namespace. Inside it, `localhost` = the
+container, not the host. My Postgres and Redis were running natively on the host,
+so the container couldn't reach them via `localhost`.
+
+Two things had to change:
+- **Address:** point the container at the host using `host.docker.internal` (on
+  Linux you add it explicitly with `--add-host=host.docker.internal:host-gateway`).
+- **The host services had to accept the connection.** Postgres and Redis default
+  to loopback-only. I opened Postgres (`listen_addresses='*'` + a `pg_hba.conf`
+  rule for Docker's `172.17.0.0/16` subnet) and Redis (`bind` the bridge IP,
+  disable protected mode).
+
+**Soundbite:** "A container has its own network namespace, so `localhost` inside
+it isn't the host. I reached the host's Postgres and Redis through
+`host.docker.internal` and opened those services to Docker's bridge subnet. That's
+exactly the friction Docker Compose removes — it puts every service on one shared
+network so they address each other by name."
+
+**Gotcha:** This host-config juggling is temporary. Day 28 (Compose) runs the app,
+Postgres, and Redis as containers on one Docker network; they reach each other by
+service name (`db`, `redis`) and none of these host edits are needed.
+
+---
+
+## 38. Load Testing (Locust)
+
+### The concept
+Load testing = simulate many users hitting the API at once and measure how it
+holds up. Locust spawns virtual users (I used 50) that repeatedly POST orders,
+then reports **throughput** (requests/sec) and **latency percentiles**.
+
+**Percentiles, plainly:** p99 = 220ms means 99% of requests finished within 220ms;
+only the slowest 1% took longer. Percentiles matter more than the average because
+the average hides the slow tail — a few very slow requests are what users notice.
+
+### Two runs, on purpose
+- **Limiter ON:** 97% of requests got 429 (Too Many Requests). That's the rate
+  limiter working — one IP is capped at 100 tokens. Correct behavior, but it
+  measures the limiter, not the app's real capacity.
+- **Limiter OFF** (`RATE_LIMIT_ENABLED=false`): ~123 RPS, p99 220ms, 0% errors.
+  Those are the honest capacity numbers.
+
+**Soundbite:** "I load-tested with Locust at 50 concurrent users: about 123
+requests/sec, p99 latency 220ms, zero errors. I ran it twice — once with the rate
+limiter on, which correctly floods 429s and proves the limiter engages under load,
+and once off to get the true throughput, since the limiter-on run measures the
+limiter rather than the API."
+
+**Gotcha:** Always report *which* configuration a load number came from. A big RPS
+with the limiter silently off, or a low one with it on, is a misleading number in
+an interview.
+
+---
+
+## 39. Self-Test — Day 27
+1. In one sentence, what problem does Docker solve?
+2. Image vs container — what's the difference?
+3. Why copy requirements.txt before the code in the Dockerfile?
+4. Why did migrations fail with "localhost connection refused" inside the container?
+5. Why doesn't `localhost` inside a container reach host Postgres?
+6. What does p99 = 220ms mean? Why care about it over the average?
+7. Why run the load test with the limiter both on and off?
+
+*Shaky on any? That's your next review target.*
+
+---
