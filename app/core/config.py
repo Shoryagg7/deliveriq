@@ -10,5 +10,4 @@ class Settings(BaseSettings):
     rate_limit_capacity: int = 100
     rate_limit_refill_per_min: int = 100
 
-
 settings = Settings() # type: ignore
