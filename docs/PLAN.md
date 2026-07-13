@@ -2294,21 +2294,24 @@ Meaningful load test is Day 29 (`--scale api=3`, throughput scaling).
 ---
 
 # PHASE 6 — Earn "Distributed" (honest)
-## Day 29 — DONE (distributed dispatch: 2-phase claim + migrate job)
+## Day 29 — Distributed Dispatch: 2-Phase Claim + Migrate Job — DONE ✅
 
-**Goal:** run multiple API instances against one Postgres with NO double-dispatch.
-Earns the resume word "distributed" — only after the concurrent test passes.
+### 🎯 Goal
+Run 3 API instances against ONE Postgres with zero double-dispatch. This is the
+day the resume word **"distributed"** is earned — and only once the testing
+gate at the bottom passes.
 
-**Two bugs found and fixed today (neither was a broken lock).**
+> **The enemy — the lost update:** two instances both `SELECT` the same PENDING
+> order (reads don't block reads), both assign it. The in-memory `transition()`
+> check can't help — each instance validates the stale status it read at scan
+> time, not the current row. Nothing errors; the second commit silently wins.
 
----
-
-**A. Migration race (all replicas migrate on boot)**
-Symptom: `docker compose up --scale api=3` → api-2 Exited(1),
-`duplicate key ... alembic_version` — all 3 replicas ran `alembic upgrade head`
-simultaneously, collided on CREATE TABLE alembic_version.
-
-Fix — dedicated one-shot migrate service in docker-compose.yml:
+### Step 1 — Scale out, hit the migration race
+`docker compose up --build -d --scale api=3` fails twice, both environmental:
+- 3 replicas can't all publish host port 8000 → publish a **port range**.
+- `api-2 Exited(1)`: `duplicate key ... alembic_version` — all 3 replicas ran
+  `alembic upgrade head` on boot and collided creating the version table.
+  **Migration is single-writer; serving is many.** Split them:
 ```yaml
   migrate:
     build: .
@@ -2330,84 +2333,149 @@ Fix — dedicated one-shot migrate service in docker-compose.yml:
       redis:
         condition: service_started
 ```
-Migrations run ONCE (migrate job), then all replicas only serve (explicit uvicorn
-command). Dockerfile CMD unchanged (still works for plain `docker run`).
+Migrations run ONCE (the one-shot `migrate` job), then replicas only serve
+(explicit uvicorn command). Dockerfile CMD unchanged — plain `docker run` still
+works.
 
----
+> `service_completed_successfully` (finished AND exited 0) ≠ `service_healthy`
+> (long-running check passing) ≠ plain `depends_on` (merely started).
 
-**B. Double-dispatch — the REAL root cause: mutate-before-claim**
-`FOR UPDATE SKIP LOCKED` was emitting correctly the whole time (verified via
-echo=True). The bug: the code set `winner.status=ASSIGNED` + `winner.rider_id`
-BEFORE locking the rider row. When the rider claim failed → `continue`, those
-ORDER mutations stayed PENDING in the SQLAlchemy session. The eventual
-`db.commit()` of a LATER successful candidate flushed the WHOLE unit of work —
-committing phantom ASSIGNED rows for the abandoned orders.
-Symptom: more orders ASSIGNED in DB than dispatch responses returned; one rider
-holding 2–3 orders.
+### Step 2 — The claim: `SELECT … FOR UPDATE SKIP LOCKED`
+Two-phase dispatch — **scan lock-free, claim row-by-row**:
+- **Phase 1 (unchanged Day 17/18 logic):** load PENDING, build the aging heap.
+- **Phase 2:** for the candidate you pop, re-select JUST that row, locked:
 
-Fix — CLAIM everything first, MUTATE last. Final dispatch.py loop order:
+```python
+winner = (
+    db.query(Order)
+    .filter(Order.id == order_id, Order.status == OrderStatus.PENDING.value)
+    .with_for_update(skip_locked=True)
+    .first()
+)
+if winner is None:
+    continue   # locked by another instance, or no longer PENDING → next candidate
+```
+`FOR UPDATE` = the row is exclusively mine until commit. `SKIP LOCKED` = don't
+wait on someone else's row — act like it isn't there. The `status` re-check in
+the WHERE covers the already-committed case; SKIP LOCKED covers the still-locked
+case. Bonus: SKIP LOCKED never *waits*, so dispatch can't join a lock cycle —
+**deadlock-free by construction**.
+
+> ⚠️ **The trap:** never put `with_for_update` on the Phase-1 `.all()` scan —
+> one instance locks EVERY pending order, the other two see an empty queue and
+> falsely 404. Lock only the row you claim.
+
+### Step 3 — The real bug: mutate-before-claim (the unit-of-work trap)
+The lock was emitting correctly the whole time (verified via `echo=True` SQL
+logging). The double-dispatch came from ORDERING: the loop set
+`winner.status=ASSIGNED` + `winner.rider_id` BEFORE locking the rider row; when
+the rider claim failed → `continue`, those order mutations stayed pending in
+the SQLAlchemy session — and the NEXT successful candidate's `db.commit()`
+flushed the WHOLE unit of work, committing phantom ASSIGNED rows for abandoned
+orders. Symptom: more ASSIGNED rows in the DB than dispatch responses; one
+rider "holding" 2–3 orders.
+
+**Fix — CLAIM everything first, MUTATE last.** Final dispatch loop order:
 1. lock ORDER row (`with_for_update(skip_locked=True)`, still-PENDING) → else continue
-2. `select_rider()` (pure read) → else continue
-3. lock RIDER row (`with_for_update(skip_locked=True)`, status='AVAILABLE') → else continue
+2. `select_rider()` — now a **pure read** → else continue
+3. lock RIDER row (`with_for_update(skip_locked=True)`, `status='AVAILABLE'`) → else retry (Step 4)
 4. ONLY NOW mutate: transition, winner.status/rider_id, rider→BUSY
 5. `db.commit()`
-6. Redis post-commit: remove_rider_from_index, record_rider_assignment, publish
+6. Redis post-commit: `remove_rider_from_index` · `record_rider_assignment` · publish
 
-Also split geohash_service.select_rider into pure-read `select_rider()` +
-`record_rider_assignment()` (orders_today INCR, post-commit).
+The `geohash_service` split (CQS — command–query separation): `select_rider()`
+= pure query, repeatable, mutates nothing; `record_rider_assignment()` = the
+`orders_today` INCR, run post-commit so a rolled-back or lost dispatch never
+bumps fairness.
 
----
+### Step 4 — Burst-proof it: the thundering herd
+First honest burst (15 SIMULTANEOUS dispatches, 10 orders + 10 riders, 3
+instances): only **5/15** succeeded — 10 got 409 while 5 riders sat AVAILABLE.
+Every caller ranks the SAME rider first (the differentiating SREM/INCR land
+post-commit), and losing the rider claim abandoned the whole ORDER — losers
+chased one rider down the entire heap. **Correct, but not live.**
 
-**Verification (clean slate):**
+Fix — rider-level retry, same order:
+```python
+tried: set[int] = set()
+while True:
+    rider_id = select_rider(winner.pickup_lat, winner.pickup_lon, exclude=tried)
+    if rider_id is None:
+        break                    # band exhausted — genuinely nobody
+    rider = ...  # lock rider row: AVAILABLE + FOR UPDATE SKIP LOCKED
+    if rider is not None:
+        break                    # claimed — exclusively ours until commit
+    tried.add(rider_id)          # lost the race → next-best rider, SAME order
+```
+Bounded (finite candidates; every loss shrinks the set), mutation-free (the
+Step-3 invariant survives), and `exclude` filters BEFORE `d_min` so the
+fairness band re-centers on the nearest *eligible* rider. Same burst after:
+**10/15 — full drain in one shot, 0 doubles.**
+
+### Step 5 — Kill the zombie endpoint (`/riders/match`)
+The Step-3 split silently broke `/riders/match`: it calls `select_rider` and
+lost the fairness INCR — no error, no failing test, just quietly wrong.
+**Lesson: when you move a side effect out of a function, grep EVERY caller.**
+Restored, then reviewed: post-dispatch, match only charged riders fairness
+points for orders that never existed (no BUSY flip, no index change) — dead
+code with a LIVE side effect. **Removed** (endpoint + `MatchRequest` + dead
+imports). `POST /riders/match` now returns **405**, not 404: the path still
+pattern-matches `GET /riders/{rider_id}` ("match" as a candidate id) — the
+path exists, the method doesn't.
+
+### 🧪 Testing — every step above, confirmed
 ```bash
+# 0) clean slate + fresh build
 docker compose down -v
 docker compose up --build -d --scale api=3
-docker compose ps -a        # api-1/2/3 Up, migrate Exited(0)
 
-# seed 10 riders + 10 orders (loop), then fire 10 concurrent dispatches:
-for port in 8000 8001 8002 8000 8001 8002 8000 8001 8002 8000; do
-  curl -s -X POST http://localhost:$port/orders/dispatch &
-done; wait
+# 1) stack shape — proves Step 1 (migrations ran ONCE, replicas only serve)
+docker compose ps -a
+# expect: api-1/2/3 Up on 8000-8002, migrate Exited(0), db healthy
 
-# VERDICT — any rider on 2+ orders:
+# 2) regression safety — the fixes broke nothing
+python -m pytest -q                          # expect: 9 passed
+
+# 3) THE concurrency proof — Steps 2+3+4 under a real burst
+python scripts/race_test.py
+# seeds 10 riders + 10 orders, fires 15 SIMULTANEOUS dispatches across the 3
+# ports, asserts no duplicate order_id AND no duplicate rider_id
+# expect: 10 successes (full drain in ONE burst = herd fix), 5×409, ✅ verdict
+
+# 4) DB verdict — zero doubles, independent of the script
 docker compose exec db psql -U deliveriq_user -d deliveriq_db \
   -c "SELECT rider_id, COUNT(*) FROM orders WHERE rider_id IS NOT NULL
       GROUP BY rider_id HAVING COUNT(*) > 1;"
+# expect: (0 rows)
+
+# 5) Postgres↔Redis mirror — Redis reflects committed truth only (Step 3.6)
+docker compose exec db psql -U deliveriq_user -d deliveriq_db \
+  -c "SELECT status, COUNT(*) FROM riders GROUP BY status;"
+docker compose exec redis redis-cli SMEMBERS geohash:<cell>
+# expect: only AVAILABLE rider ids remain in the cell (winners SREM'd)
+docker compose exec redis redis-cli GET rider:<winner_id>:orders:<YYYY-MM-DD>
+# expect: 1 per winner — losers and rolled-back attempts never counted
+
+# 6) failure semantics — losers fail CLEAN and retryable, never corrupt
+curl -s -X POST http://localhost:8000/orders/dispatch
+# after full drain: 404 NO_PENDING_ORDERS; under contention: 409 → a retry wins
+
+# 7) the removal — proves Step 5
+curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+  http://localhost:8000/riders/match -H 'Content-Type: application/json' \
+  -d '{"lat":13.05,"lon":77.65}'
+# expect: 405
 ```
-Result: **(0 rows)** = zero double-assignment across 3 instances. ✅
 
-**Note:** `echo=True` in database.py was a debug aid — removed after.
-**Deferred:** dead `last_assigned_at` write (Day 41–45 sweep).
-
-**✅ "distributed" earned:** `--scale api=3` + SKIP LOCKED + 2-phase claim, races closed.
-
----
-
-**Day 29 follow-up — independent verification + 3 fixes** (full detail:
-`Day29_Verification_Report.md`)
-
-**C. Thundering herd — losing a rider claim lost the whole ORDER.**
-Measured: 15 simultaneous dispatches, 10 orders + 10 riders, 3 instances →
-only **5/15** succeeded; 10 got 409 while 5 riders sat AVAILABLE. All
-concurrent callers rank riders identically (the differentiating SREM/INCR land
-post-commit), so every loser chased the same rider down the whole heap.
-Fix: **rider-level retry** — `select_rider(..., exclude=tried)`; a failed
-rider claim excludes that rider and re-selects for the SAME order. Bounded
-(finite candidates), mutation-free (claim-all-first invariant intact), and the
-fairness band re-centers on the nearest *eligible* rider (exclude runs before
-d_min). Same test after: **10/15 — full drain in one burst, 0 doubles.**
-
-**D. `/riders/match` — silently regressed, then removed.**
-The select_rider split left match without its fairness INCR (silent regression
-— grep every caller when moving side effects out of a function). Restored,
-then reviewed and **removed**: post-dispatch it only charged riders fairness
-points for orders that never existed, without setting BUSY — dead code with a
-live side effect. `POST /riders/match` now 405 (path still pattern-matches
-`GET /riders/{rider_id}`).
-
-**New:** `scripts/race_test.py` — repeatable concurrency proof:
-`docker compose up --build -d --scale api=3 && python scripts/race_test.py`.
-Suite 9/9 green.
+### ✅ End of Day
+Zero double-dispatch across 3 replicas; bursts drain fully (5/15 → 10/15); one
+migration writer; Redis strictly post-commit; repeatable proof in
+`scripts/race_test.py`. **Resume "distributed": earned.**
+- Cleanup: `echo=True` debug SQL logging removed.
+- Deferred: `PATCH /orders/{id}/status` still reads lock-free (Day 35) · dead
+  `last_assigned_at` write (Day 41–45 sweep).
+- Chat-sync detail lives in `Day29_Verification_Report.md` — this section is
+  the canonical build log.
 
 ### 📊 Current end-to-end flow (as of Day 29)
 
