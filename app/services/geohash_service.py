@@ -39,10 +39,19 @@ def _haversine(lat1, lon1, lat2, lon2) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
-def select_rider(order_lat: float, order_lon: float, band_m: float = 500) -> int | None:
+def select_rider(
+    order_lat: float,
+    order_lon: float,
+    band_m: float = 500,
+    exclude: set[int] | None = None,
+) -> int | None:
     """PURE READ — picks a rider but mutates nothing.
-    Fairness counter is bumped in record_rider_assignment() AFTER commit."""
+    Fairness counter is bumped in record_rider_assignment() AFTER commit.
+    `exclude` = riders whose claim already failed this dispatch — skipping
+    them lets the caller retry the SAME order with the next-best rider."""
     candidates = find_nearby_riders(order_lat, order_lon)
+    if exclude:
+        candidates = [rid for rid in candidates if rid not in exclude]
     if not candidates:
         return None
 

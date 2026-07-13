@@ -188,8 +188,8 @@ you can, raise it if you must.'"
 - **GET** — read, **safe** (no side effects) and **idempotent**. Must never
   mutate.
 - **POST** — create a resource, *or* trigger a **side-effecting action**
-  (`/orders/dispatch`, `/riders/match` — they mutate state / increment
-  counters). Not idempotent.
+  (`/orders/dispatch` — it mutates state: assigns a rider, flips statuses,
+  bumps counters). Not idempotent.
 - **PATCH** — **partial** update of an existing resource (rider location, order
   status — change a few fields).
 - **PUT** — **full** replace of a resource (send the whole object). Idempotent.
@@ -209,8 +209,8 @@ DeliverIQ's filters are simple query params, so I didn't need it."
 
 **Gotcha:** it's still a draft — Swagger/OpenAPI tooling doesn't fully render
 it, so it's a talking point, not a production choice today. **Soundbite:** "Verb
-follows semantics. `/match` and `/dispatch` are POST even though they don't
-'create' anything — they have side effects (incrementing a counter, flipping
+follows semantics. `/dispatch` is POST even though it doesn't
+'create' anything — it has side effects (assigning a rider, flipping
 status), and side effects can't sit behind a GET, which must stay safe and
 idempotent. Location and status updates are PATCH because they're partial edits,
 not full replacements."
@@ -827,10 +827,19 @@ key, not from `expire`. Lazy creation too — `incr`/`hincrby` on a missing key
 starts at 0 and creates it, so no explicit init; the read side guards with
 `or 0`.
 
-### The endpoint
-`POST /riders/match` — **POST not GET**, because matching has a side effect (it
-increments the winner's order count). GETs must be safe/idempotent; a mutation
-behind a GET violates HTTP semantics. Same reasoning as `POST /orders/dispatch`.
+### The endpoint that used to be here — and why it's gone (removed Day 29)
+`POST /riders/match` was the Day 18 demo of this algorithm — POST because it
+had a real side effect (incrementing the winner's fairness counter). Once
+dispatch became the only real consumer of `select_rider`, the demo endpoint
+did nothing except distort fairness: it charged a rider an `orders_today`
+point for an order that never existed, without marking them BUSY. Removed in
+the Day 29 review sweep.
+
+**Soundbite:** "I removed my own endpoint. `/riders/match` demoed banded
+matching before dispatch existed, but afterwards its only remaining effect was
+corrupting fairness counters — a match with no order. Dead code with a live
+side effect is worse than dead code: it's a latent bug. Reviewing and deleting
+your own obsolete surface is part of owning a codebase."
 
 ---
 
@@ -847,7 +856,8 @@ behind a GET violates HTTP semantics. Same reasoning as `POST /orders/dispatch`.
 8. Describe the two-phase behaviour (drain imbalance, then revert to nearest).
 9. How does `orders_today` reset daily with no cron job?
 10. Why does each order refresh the TTL, and what does that achieve?
-11. Why is `/riders/match` a POST and not a GET?
+11. `/riders/match` was removed on Day 29 — why was keeping it *worse* than
+    ordinary dead code?
 
 *Shaky on any? That's your next review target.*
 
@@ -1910,7 +1920,53 @@ bumped counter or a stale index entry."
 
 ---
 
-## 48. Self-Test — Day 29
+## 48. The Thundering Herd & Rider-Level Retry ⭐ (post-verification fix)
+
+### The concept — correct is not the same as live
+The verified loop had **zero double-assignments** but measured badly under a
+real burst: 15 simultaneous dispatches, 10 orders + 10 riders, 3 instances →
+only **5 succeeded**; 10 returned 409 while 5 riders sat AVAILABLE. Why: every
+concurrent caller ranks riders identically — the state that would differentiate
+them (the winner's geohash SREM and `orders_today` INCR) only lands
+*post-commit*. So all losers pick the same top rider, fail the claim, and —
+here was the bug — `continue`d to the **next order**, chasing the same rider
+down the entire heap until 409. Losing a *rider* lost the whole *order*.
+
+### The fix — retry the rider, keep the order
+`select_rider(..., exclude=tried)`: on a failed rider claim, add that rider to
+an exclude-set and re-select the next-best **for the same order**. Bounded
+(candidates in the 3×3 cells are finite; every failure shrinks them), and
+**mutation-free** — the claim-all-before-mutate invariant from §45 survives.
+One subtlety done deliberately: exclusion runs *before* `d_min` is computed,
+so the fairness band re-centers on the nearest **eligible** rider — the SLA
+bound stays relative to riders you can actually get. Same test after the fix:
+**10/15 — every order dispatched in one burst, still zero doubles.**
+
+**Soundbite:** "My locking was correct but not live: under a burst, all
+instances chase the same top-ranked rider because the differentiating state
+lands post-commit — I measured 5/15 success with riders idle. The fix is a
+bounded rider-level retry: exclude the contested rider, re-select for the same
+order. Same test after: 10/15, full drain, zero doubles. Losing a race now
+costs one candidate, not the whole request. Correctness and liveness are
+separate properties — you have to measure both."
+
+**Gotcha:** the retry loop must stay mutation-free (mutate only after BOTH
+rows are locked), or the §45 unit-of-work trap comes straight back. Bonus it
+bought for free: a stale BUSY rider stuck in the geohash index (crash after
+commit, before SREM) used to poison every order's selection; now it costs one
+failed claim and gets excluded — self-healing.
+
+### The sibling lesson — the silent side-effect regression
+Splitting `select_rider` into pure-read + `record_rider_assignment` (CQS:
+command–query separation) updated dispatch but **forgot the other caller** —
+`/riders/match` silently stopped counting fairness. No error, no failing test,
+just quietly wrong. Rule: when you move a side effect out of a function,
+**grep every caller** before you're done. (Match was then removed entirely —
+the story is in §15.)
+
+---
+
+## 49. Self-Test — Day 29
 1. Why don't two instances' `SELECT PENDING` block each other, and what fixes it?
 2. Why is locking the entire pending set with FOR UPDATE wrong?
 3. The lock was correct — so what actually caused the double-dispatch? (name it)
@@ -1919,8 +1975,16 @@ bumped counter or a stale index entry."
 6. Why did api-2 crash on `--scale api=3`, and how does the migrate job fix it?
 7. What does `condition: service_completed_successfully` guarantee?
 8. Why must Redis writes come after `db.commit()`?
+9. "Correct but not live" — what did the 15-burst test measure before and after
+   the rider-retry fix, and why did every loser chase the same rider?
+10. Why must the rider-retry loop stay mutation-free? Which earlier bug returns
+    if it doesn't?
+11. Why does excluding contested riders *before* computing `d_min` matter?
+12. What is command–query separation, and where did violating its migration
+    bite silently? (name the forgotten caller)
 
-*Shaky on any? That's your next review target — #3, #4, #5 are the ones that matter.*
+*Shaky on any? That's your next review target — #3, #4, #5, #9 are the ones
+that matter.*
 
 ---
 

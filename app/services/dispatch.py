@@ -49,22 +49,33 @@ def pick_next_order(db: Session):
         if winner is None:
             continue  # another instance has it — next candidate
 
-        rider_id = select_rider(winner.pickup_lat, winner.pickup_lon)  # type: ignore
-        if rider_id is None:
-            continue  # no rider nearby — next candidate (nothing mutated)
-
-        # CLAIM 2 — the rider row (lock + AVAILABLE re-check)
-        rider = (
-            db.query(Rider)
-            .filter(
-                Rider.id == rider_id,
-                Rider.status == "AVAILABLE",
+        # CLAIM 2 — a rider. Losing a rider must NOT lose the order: on a
+        # failed claim (contested by another instance, or stale index entry),
+        # exclude that rider and re-select the next-best for THIS order.
+        tried: set[int] = set()
+        rider = None
+        while True:
+            rider_id = select_rider(
+                winner.pickup_lat, winner.pickup_lon, exclude=tried  # type: ignore
             )
-            .with_for_update(skip_locked=True)
-            .first()
-        )
+            if rider_id is None:
+                break  # band exhausted — genuinely nobody for this order
+
+            rider = (
+                db.query(Rider)
+                .filter(
+                    Rider.id == rider_id,
+                    Rider.status == "AVAILABLE",
+                )
+                .with_for_update(skip_locked=True)
+                .first()
+            )
+            if rider is not None:
+                break  # rider row locked — exclusively ours until commit
+            tried.add(rider_id)  # claim lost — next-best rider, same order
+
         if rider is None:
-            continue  # rider taken — next candidate (nothing mutated)
+            continue  # no claimable rider — next order (nothing mutated)
 
         # BOTH rows are exclusively ours — only NOW do we mutate
         current = OrderStatus(winner.status)

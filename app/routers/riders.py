@@ -4,10 +4,10 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.exceptions import RiderNotFound, RiderUnavailable
+from app.core.exceptions import RiderNotFound
 from app.models.rider import Rider
 from app.schemas.rider import RiderCreate, RiderResponse
-from app.services.geohash_service import add_rider, select_rider, update_rider_location
+from app.services.geohash_service import add_rider, update_rider_location
 
 router = APIRouter(prefix="/riders", tags=["riders"])
 
@@ -36,19 +36,6 @@ def list_riders(status: str | None = None, db: Session = Depends(get_db)):
     if status:
         query = query.filter(Rider.status == status)
     return query.all()
-
-
-class MatchRequest(BaseModel):
-    lat: float
-    lon: float
-
-
-@router.post("/match")
-def match_rider(req: MatchRequest, db: Session = Depends(get_db)):
-    rider_id = select_rider(req.lat, req.lon)
-    if rider_id is None:
-        raise RiderUnavailable("No available rider nearby")
-    return {"assigned_rider_id": rider_id}
 
 
 class LocationUpdate(BaseModel):

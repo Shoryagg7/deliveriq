@@ -1445,48 +1445,13 @@ Full rider lifecycle (AVAILABLE→BUSY→AVAILABLE with re-indexing), event
 published on dispatch, consumed by a worker — and you've felt why Pub/Sub
 loses events when the consumer is down.
 ---
-### 📊 Current end-to-end flow (as of Day 20)
+### 📊 End-to-end flow (as of Day 20)
 
-```mermaid
-%% Dispatch (priority heap + fairness match + BUSY) and order completion
-%% (free rider + re-index), plus the fire-and-forget Pub/Sub edge.
+Diagram: **[diagrams/day20_flow.html](diagrams/day20_flow.html)** — open
+directly in a browser. *(Historical snapshot: single instance, pre-locking,
+`orders_today++` still inside `select_rider`, Redis SREM still pre-commit.
+Superseded by [diagrams/day29_workflow.html](diagrams/day29_workflow.html).)*
 
-flowchart TD
-    subgraph DISPATCH["POST /orders/dispatch"]
-        A[Query PENDING orders from Postgres] --> B{Any pending?}
-        B -- no --> B404[404: no pending orders]
-        B -- yes --> C["Build max-heap<br/>priority = value + wait_minutes x AGING_WEIGHT"]
-        C --> D[Pop highest-priority order]
-        D --> E["select_rider<br/>home cell + 8 neighbours<br/>haversine rank<br/>fairness band &#916;<br/>fewest orders_today, then nearest"]
-        E --> F{"Rider found?<br/>(only AVAILABLE riders<br/>are present in cells)"}
-        F -- no --> G{Heap empty?}
-        G -- "no (try next order)" --> D
-        G -- yes --> H404[404: orders exist but no rider available]
-        F -- yes --> I["transition PENDING to ASSIGNED<br/>order.rider_id = rider<br/>orders_today++ (inside select_rider)"]
-        I --> J["rider.status = BUSY (Postgres truth)<br/>srem rider from geohash cell (Redis enforce)"]
-        J --> K[(db.commit)]
-        K --> L[["publish order.dispatched<br/>{order_id, rider_id, ts}"]]
-        L --> M[return order_id + rider_id]
-    end
-
-    L -. fire-and-forget .-> N{Worker alive<br/>at publish time?}
-    N -- yes --> O["notification_worker prints<br/>[notify] order to rider"]
-    N -- no --> P["event lost forever<br/>no queue, no replay<br/>(this is why Kafka comes next)"]
-
-    M -. rider is now BUSY,<br/>out of the pool .-> Q
-
-    subgraph FINISH["PATCH /orders/{id}/status"]
-        Q[validate transition] --> R{"DELIVERED or CANCELLED<br/>and order.rider_id set?"}
-        R -- no --> S[(commit status only)]
-        R -- yes --> T[rider.status = AVAILABLE]
-        T --> U{DELIVERED?}
-        U -- yes --> V[move rider to drop coords]
-        U -- no --> W[keep current coords]
-        V --> X[(db.commit)]
-        W --> X
-        X --> Y["update_rider_location<br/>srem old + sadd new cell<br/>rider selectable again"]
-    end
-```
 ## Day 21 — Integration Testing (with proper isolation)
 
 ### 🎯 Goal
@@ -2415,6 +2380,41 @@ Result: **(0 rows)** = zero double-assignment across 3 instances. ✅
 **Deferred:** dead `last_assigned_at` write (Day 41–45 sweep).
 
 **✅ "distributed" earned:** `--scale api=3` + SKIP LOCKED + 2-phase claim, races closed.
+
+---
+
+**Day 29 follow-up — independent verification + 3 fixes** (full detail:
+`Day29_Verification_Report.md`)
+
+**C. Thundering herd — losing a rider claim lost the whole ORDER.**
+Measured: 15 simultaneous dispatches, 10 orders + 10 riders, 3 instances →
+only **5/15** succeeded; 10 got 409 while 5 riders sat AVAILABLE. All
+concurrent callers rank riders identically (the differentiating SREM/INCR land
+post-commit), so every loser chased the same rider down the whole heap.
+Fix: **rider-level retry** — `select_rider(..., exclude=tried)`; a failed
+rider claim excludes that rider and re-selects for the SAME order. Bounded
+(finite candidates), mutation-free (claim-all-first invariant intact), and the
+fairness band re-centers on the nearest *eligible* rider (exclude runs before
+d_min). Same test after: **10/15 — full drain in one burst, 0 doubles.**
+
+**D. `/riders/match` — silently regressed, then removed.**
+The select_rider split left match without its fairness INCR (silent regression
+— grep every caller when moving side effects out of a function). Restored,
+then reviewed and **removed**: post-dispatch it only charged riders fairness
+points for orders that never existed, without setting BUSY — dead code with a
+live side effect. `POST /riders/match` now 405 (path still pattern-matches
+`GET /riders/{rider_id}`).
+
+**New:** `scripts/race_test.py` — repeatable concurrency proof:
+`docker compose up --build -d --scale api=3 && python scripts/race_test.py`.
+Suite 9/9 green.
+
+### 📊 Current end-to-end flow (as of Day 29)
+
+Diagram: **[diagrams/day29_workflow.html](diagrams/day29_workflow.html)** —
+open directly in a browser. 3 instances, 2-phase claim, rider-retry loop,
+post-commit Redis catch-up, migrate one-shot job.
+
 ---
 
 # PHASE 7 — Event Streaming (Kafka) · Days 30–33
