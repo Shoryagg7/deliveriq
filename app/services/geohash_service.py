@@ -13,12 +13,14 @@ def _orders_key(rider_id: int) -> str:
     today = datetime.now(UTC).strftime("%Y-%m-%d")
     return f"rider:{rider_id}:orders:{today}"
 
+
 def add_rider(rider_id: int, lat: float, lon: float):
     cell = geohash.encode(lat, lon, PRECISION)
     redis_client.sadd(f"geohash:{cell}", rider_id)
     redis_client.hset(
         f"rider:{rider_id}:loc", mapping={"lat": lat, "lon": lon, "cell": cell}
     )
+
 
 def find_nearby_riders(lat: float, lon: float) -> list[int]:
     cell = geohash.encode(lat, lon, PRECISION)
@@ -38,6 +40,8 @@ def _haversine(lat1, lon1, lat2, lon2) -> float:
 
 
 def select_rider(order_lat: float, order_lon: float, band_m: float = 500) -> int | None:
+    """PURE READ — picks a rider but mutates nothing.
+    Fairness counter is bumped in record_rider_assignment() AFTER commit."""
     candidates = find_nearby_riders(order_lat, order_lon)
     if not candidates:
         return None
@@ -56,13 +60,17 @@ def select_rider(order_lat: float, order_lon: float, band_m: float = 500) -> int
     d_min = min(s[1] for s in scored)
     feasible = [s for s in scored if s[1] <= d_min + band_m]  # within band of nearest
     feasible.sort(key=lambda s: (s[2], s[1]))  # fewest orders, then nearest
-    chosen = feasible[0][0]
+    return feasible[0][0]
 
-    redis_client.hset(f"rider:{chosen}", "last_assigned_at", int(time.time()))
-    key = _orders_key(chosen)
+
+def record_rider_assignment(rider_id: int):
+    """Redis mutations for a CONFIRMED assignment. Call AFTER db.commit()
+    so a rolled-back / lost dispatch never bumps the fairness counter."""
+    redis_client.hset(f"rider:{rider_id}", "last_assigned_at", int(time.time()))
+    key = _orders_key(rider_id)
     redis_client.incr(key)
-    redis_client.expire(key, 172800)   # 48h TTL — auto-cleans old days
-    return chosen
+    redis_client.expire(key, 172800)  # 48h TTL — auto-cleans old days
+
 
 def update_rider_location(rider_id: int, lat: float, lon: float):
     old_cell = redis_client.hget(f"rider:{rider_id}:loc", "cell")
@@ -73,6 +81,7 @@ def update_rider_location(rider_id: int, lat: float, lon: float):
     redis_client.hset(
         f"rider:{rider_id}:loc", mapping={"lat": lat, "lon": lon, "cell": new_cell}
     )
+
 
 def remove_rider_from_index(rider_id: int):
     cell = redis_client.hget(f"rider:{rider_id}:loc", "cell")

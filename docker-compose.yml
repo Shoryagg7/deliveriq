@@ -20,16 +20,26 @@ services:
     ports:
       - "6379:6379"
 
+  migrate:
+    build: .
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
+    depends_on:
+      db:
+        condition: service_healthy
+
   api:
     build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     ports:
-      - "8000:8000"
+      - "8000-8002:8000"
     environment:
       DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
       REDIS_URL: redis://redis:6379/0
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_started
 

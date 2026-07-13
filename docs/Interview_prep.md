@@ -1814,3 +1814,114 @@ the container exits immediately. Version-specific detail worth knowing.
 
 *Shaky on any? That's your next review target.*
 ---
+# DeliverIQ — Interview Prep, Part 15 (Day 29)
+
+> Distributed dispatch safety. concept / soundbite / gotcha. This was the hardest
+> debugging day — the bug was NOT where it looked.
+
+---
+
+## 44. Row Locking: SELECT ... FOR UPDATE SKIP LOCKED
+
+### The concept
+Multiple API instances share one Postgres. Two dispatch calls can run in
+different instances at the same instant, both `SELECT` the same PENDING order
+(reads don't block reads), both try to assign it → double-dispatch (lost update).
+
+`SELECT ... FOR UPDATE` locks the selected row until the transaction ends — no
+other transaction can modify it. `SKIP LOCKED` adds: if a row is already locked,
+don't wait — return nothing. Together = "claim it if free, skip it if taken."
+The loser moves to the next candidate instead of blocking or colliding.
+
+**Soundbite:** "Dispatch runs across multiple instances on one database. To stop
+two instances grabbing the same order, I claim the row with `SELECT FOR UPDATE
+SKIP LOCKED` — the winner locks it until commit, the loser gets nothing and moves
+to the next candidate. It's work-conserving: no blocking, no double-assignment."
+
+**Gotcha:** don't lock the whole candidate set. If you put `FOR UPDATE` on the
+initial `SELECT all PENDING`, one instance locks every order and the others see an
+empty set and wrongly report "no orders." I keep the priority scan lock-free and
+lock only the single row I'm about to claim.
+
+---
+
+## 45. The Unit-of-Work Commit Trap (the real Day 29 bug)
+
+### The concept — the one that actually bit me
+The lock was correct the entire time. The bug was ordering. My loop set
+`order.status = ASSIGNED` and `order.rider_id` BEFORE locking the rider. When the
+rider was already taken, I did `continue` to try the next order — but those order
+mutations were still pending in the SQLAlchemy **session**. A session is a *unit
+of work*: the next successful candidate's `db.commit()` flushes EVERYTHING
+pending, including the abandoned order's mutations. Result: phantom ASSIGNED rows
+for orders no request ever successfully dispatched.
+
+The tell: the DB had more ASSIGNED orders than the API returned success responses.
+
+**The fix:** claim every row first (lock order → pick rider → lock rider), and
+mutate only after both claims succeed. Then a `continue` leaves a clean session —
+nothing pending to be committed by a later iteration.
+
+**Soundbite:** "The subtle bug wasn't the lock — it was that I mutated the order
+before securing the rider. On a failed rider claim I `continue`d, but the ORM
+session still held those pending changes, and the next successful commit flushed
+them — creating phantom assignments. A session commits the whole unit of work, not
+just the changes you 'meant.' Fix: claim all rows first, mutate last."
+
+**Gotcha:** `session.commit()` flushes ALL dirty objects in the session, not the
+one you're focused on. Never leave half-applied mutations on a code path that then
+continues to another commit. Mutate only after every claim in the transaction is
+secured.
+
+---
+
+## 46. Don't Migrate From Every Replica
+
+### The concept
+Migrations are a one-time, single-writer schema change. App instances are many and
+concurrent. If every replica runs `alembic upgrade head` on boot, they race — mine
+collided on `CREATE TABLE alembic_version` and a replica crashed. Coupling
+migration to app startup is fine at 1 instance, broken at N.
+
+**The fix:** a dedicated one-shot `migrate` service that runs once and exits; app
+instances depend on it completing (`condition: service_completed_successfully`)
+and only run the server. Separate the schema change from the app lifecycle.
+
+**Soundbite:** "Running migrations from every replica is a race — they collide on
+the schema. I split migration into a one-shot job that runs once before the app
+starts; the app replicas depend on it completing and only serve. Migration is
+single-writer, serving is many — they shouldn't share a startup command."
+
+**Gotcha:** `depends_on: condition: service_completed_successfully` waits for the
+job to *finish and exit 0*, unlike `service_healthy` (a long-running check) or
+plain `depends_on` (just "started").
+
+---
+
+## 47. Redis Mutations After Commit (recap, reinforced here)
+`select_rider` is now a pure read. The fairness INCR (`orders_today`), the geohash
+SREM, and the pub/sub publish all run AFTER `db.commit()`. If the transaction rolls
+back or a claim fails, Redis is never touched — Postgres stays the single source of
+truth and Redis only mirrors committed reality.
+
+**Soundbite:** "Redis is a cache and index, not the source of truth. Every Redis
+write happens after the Postgres commit, so a rolled-back dispatch never leaves a
+bumped counter or a stale index entry."
+
+---
+
+## 48. Self-Test — Day 29
+1. Why don't two instances' `SELECT PENDING` block each other, and what fixes it?
+2. Why is locking the entire pending set with FOR UPDATE wrong?
+3. The lock was correct — so what actually caused the double-dispatch? (name it)
+4. Why does a failed rider claim + `continue` corrupt data if you mutated first?
+5. What does "a session commits the whole unit of work" mean, concretely?
+6. Why did api-2 crash on `--scale api=3`, and how does the migrate job fix it?
+7. What does `condition: service_completed_successfully` guarantee?
+8. Why must Redis writes come after `db.commit()`?
+
+*Shaky on any? That's your next review target — #3, #4, #5 are the ones that matter.*
+
+---
+
+

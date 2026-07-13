@@ -2328,29 +2328,93 @@ Meaningful load test is Day 29 (`--scale api=3`, throughput scaling).
 **✅** Clone → `docker compose up` → full stack, schema migrated, zero manual setup.
 ---
 
-# PHASE 6 — Earn "Distributed" (honest) · Day 29
+# PHASE 6 — Earn "Distributed" (honest)
+## Day 29 — DONE (distributed dispatch: 2-phase claim + migrate job)
 
-## Day 29 — Multi-Instance Dispatch + Atomic Claim ⭐  *(this is where "distributed" becomes true)*
-**Goal:** run multiple API replicas and prove no order is double-dispatched — **without losing aging or fairness**.
+**Goal:** run multiple API instances against one Postgres with NO double-dispatch.
+Earns the resume word "distributed" — only after the concurrent test passes.
 
-**Primary path — Postgres `SELECT … FOR UPDATE SKIP LOCKED`:**
-- Today `pick_next_order` reads all PENDING, builds the aged heap, loops to find a serviceable order. With 2+ instances, two could pick the same order.
-- Fix: when claiming the winner, re-fetch that row with `.with_for_update(skip_locked=True)` inside the transaction and re-check it's still PENDING before flipping to ASSIGNED. The row lock means only one instance claims it; `SKIP LOCKED` means the other instance doesn't block — it moves to the next order. **Aging, fairness, and the work-conserving loop all stay exactly as built** — you only added a lock on the claim.
+**Two bugs found and fixed today (neither was a broken lock).**
 
-**Demonstrate:**
-```bash
-docker compose up --build --scale api=3
+---
+
+**A. Migration race (all replicas migrate on boot)**
+Symptom: `docker compose up --scale api=3` → api-2 Exited(1),
+`duplicate key ... alembic_version` — all 3 replicas ran `alembic upgrade head`
+simultaneously, collided on CREATE TABLE alembic_version.
+
+Fix — dedicated one-shot migrate service in docker-compose.yml:
+```yaml
+  migrate:
+    build: .
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000   # overrides Dockerfile CMD
+    ports:
+      - "8000-8002:8000"        # port RANGE so --scale api=3 doesn't collide on 8000
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
 ```
-Fire concurrent dispatch calls; confirm each order assigned exactly once (check `rider_id` uniqueness / no double-assign in logs).
+Migrations run ONCE (migrate job), then all replicas only serve (explicit uvicorn
+command). Dockerfile CMD unchanged (still works for plain `docker run`).
 
-**The war story:** "Two instances raced on the same PENDING order. I claim with `SELECT … FOR UPDATE SKIP LOCKED` — the lock serializes the claim, SKIP LOCKED keeps the other instance working instead of blocking. Chose it over a Redis sorted set because the sorted set's static score can't express my wait-time aging, and I'd lose the fairness loop."
+---
 
-> **Optional alt (mention, don't necessarily build):** Redis sorted set + `ZREM` atomic claim. Faster, but the score is fixed at insert so aging needs re-scoring, and it hides the heap. Know the tradeoff; the SKIP LOCKED version is the one that keeps your DSA story intact.
+**B. Double-dispatch — the REAL root cause: mutate-before-claim**
+`FOR UPDATE SKIP LOCKED` was emitting correctly the whole time (verified via
+echo=True). The bug: the code set `winner.status=ASSIGNED` + `winner.rider_id`
+BEFORE locking the rider row. When the rider claim failed → `continue`, those
+ORDER mutations stayed PENDING in the SQLAlchemy session. The eventual
+`db.commit()` of a LATER successful candidate flushed the WHOLE unit of work —
+committing phantom ASSIGNED rows for the abandoned orders.
+Symptom: more orders ASSIGNED in DB than dispatch responses returned; one rider
+holding 2–3 orders.
 
-**Also surfaces here:** the rate-limiter is already atomic (Day 25), so it's multi-instance-safe. The rider-sync dual-writes are per-rider and idempotent enough for this scale (note reconciliation as the recovery path).
+Fix — CLAIM everything first, MUTATE last. Final dispatch.py loop order:
+1. lock ORDER row (`with_for_update(skip_locked=True)`, still-PENDING) → else continue
+2. `select_rider()` (pure read) → else continue
+3. lock RIDER row (`with_for_update(skip_locked=True)`, status='AVAILABLE') → else continue
+4. ONLY NOW mutate: transition, winner.status/rider_id, rider→BUSY
+5. `db.commit()`
+6. Redis post-commit: remove_rider_from_index, record_rider_assignment, publish
 
-**✅** `--scale api=3`, concurrent dispatch, every order assigned exactly once; "distributed" is earned and demonstrable.
+Also split geohash_service.select_rider into pure-read `select_rider()` +
+`record_rider_assignment()` (orders_today INCR, post-commit).
 
+---
+
+**Verification (clean slate):**
+```bash
+docker compose down -v
+docker compose up --build -d --scale api=3
+docker compose ps -a        # api-1/2/3 Up, migrate Exited(0)
+
+# seed 10 riders + 10 orders (loop), then fire 10 concurrent dispatches:
+for port in 8000 8001 8002 8000 8001 8002 8000 8001 8002 8000; do
+  curl -s -X POST http://localhost:$port/orders/dispatch &
+done; wait
+
+# VERDICT — any rider on 2+ orders:
+docker compose exec db psql -U deliveriq_user -d deliveriq_db \
+  -c "SELECT rider_id, COUNT(*) FROM orders WHERE rider_id IS NOT NULL
+      GROUP BY rider_id HAVING COUNT(*) > 1;"
+```
+Result: **(0 rows)** = zero double-assignment across 3 instances. ✅
+
+**Note:** `echo=True` in database.py was a debug aid — removed after.
+**Deferred:** dead `last_assigned_at` write (Day 41–45 sweep).
+
+**✅ "distributed" earned:** `--scale api=3` + SKIP LOCKED + 2-phase claim, races closed.
 ---
 
 # PHASE 7 — Event Streaming (Kafka) · Days 30–33
