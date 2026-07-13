@@ -1,5 +1,11 @@
 # DeliverIQ — Interview Prep & Concept Guide
 
+> **Companion:** this file is the *project-specific*, day-by-day guide. For the
+> full zero-to-master backend curriculum (foundations → SQL/concurrency →
+> distributed systems → system-design frameworks, with diagrams), see
+> [Backend_Interview_Zero_to_Master.md](Backend_Interview_Zero_to_Master.md) —
+> it cross-references sections here as `IP §n`.
+
 > A self-study reference for everything built so far. Each topic has: **the
 > concept (why)**,
 > the **interview soundbite** (how to say it out loud), and the **gotcha** (what
