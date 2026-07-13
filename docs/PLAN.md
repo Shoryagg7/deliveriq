@@ -2269,20 +2269,63 @@ median 93ms · 0% errors. Image 606MB disk / 153MB content.
 
 **✅** Container boots → migrates → connects → serves; load numbers defensible.
 ---
+### Day 28 — DONE (Docker Compose, exact steps)
 
-## Day 28 — Docker Compose (full local stack, multi-instance ready)
-**Goal:** one command brings up API + Postgres + Redis, with readiness gating and migrations.
+**Goal:** one command brings up API + Postgres + Redis as containers on one
+network. Removes ALL of Day 27's host-config edits.
 
-- `docker-compose.yml`: `api`, `db` (postgres:18, named volume), `redis`. Env from Compose → `settings`.
-- **Healthcheck on `db`** + `depends_on: { db: { condition: service_healthy } }` — so the API waits for Postgres to actually accept connections, not just "started". (v3.2's `depends_on` alone doesn't wait for readiness.)
-- The API's entrypoint already runs `alembic upgrade head`, so the schema lands on first `up`.
+**1. Freed ports** (native services were holding 5432/6379):
+```bash
+sudo systemctl stop postgresql redis-server
+sudo ss -tlnp | grep -E '5432|6379'   # empty = free
+```
 
-**Gotcha:** stop native services first (`sudo systemctl stop postgresql redis-server`) to free 5432/6379. Kafka is **not** here yet — it joins on Day 33.
+**2. Wrote docker-compose.yml** — 3 services (db, redis, api) + named volume.
+Key ideas:
+- db/redis use official images (postgres:18, redis:7); api uses `build: .`
+- API reaches datastores by SERVICE NAME: `db:5432`, `redis:6379` (Compose DNS)
+  → replaces `host.docker.internal` + all host config edits
+- `pgdata` named volume persists Postgres data across restarts
+- healthcheck (`pg_isready`) + `depends_on: condition: service_healthy` → API
+  waits until Postgres is truly READY before migrating, not just "started"
 
-**🔥 Break It:** drop the healthcheck → API races Postgres → `connection refused`. Restore.
+**3. Postgres 18 volume gotcha:** mount at `/var/lib/postgresql` (parent), NOT
+`/var/lib/postgresql/data`. The 18 image stores data in a version-specific
+subdir; old `/data` path → container exits code 1.
 
-**✅** `docker compose up --build` → `/docs` live, schema migrated, DB persists across restarts.
+**4. Brought it up:**
+```bash
+docker compose down -v      # wipe half-init volume after the fix
+docker compose up --build
+```
+Boot sequence observed: redis ready → db Healthy → api runs both migrations
+(a672f251ffaf, b4d0116aefb1) on fresh DB → uvicorn serving.
 
+**5. Verified:**
+```bash
+curl -s http://localhost:8000/admin/stats | python -m json.tool
+# {"total_orders": 0, ...}  → fresh DB, migrations ran, API serving
+```
+
+**Stop / lifecycle:**
+```bash
+# Ctrl+C in the up terminal, then:
+docker compose down       # stops all, KEEPS pgdata volume
+docker compose down -v    # also wipes the volume (fresh DB next up)
+```
+
+**Three separate Postgres/Redis worlds (do not conflate):**
+1. Host native (stopped) — Compose doesn't touch
+2. Compose containers (db:5432, redis:6379/0) — what runs now, fresh + isolated
+3. Test DB (deliveriq_test_db, Redis DB 15) — pytest only
+
+**Day 27 host edits:** now dormant (native services stopped). Not undone; clean
+up `protected-mode` in redis.conf during Day 41–45 sweep.
+
+**Load test:** skipped — Compose doesn't change per-request perf (same image).
+Meaningful load test is Day 29 (`--scale api=3`, throughput scaling).
+
+**✅** Clone → `docker compose up` → full stack, schema migrated, zero manual setup.
 ---
 
 # PHASE 6 — Earn "Distributed" (honest) · Day 29

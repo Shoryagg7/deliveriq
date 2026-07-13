@@ -1729,3 +1729,82 @@ an interview.
 *Shaky on any? That's your next review target.*
 
 ---
+# DeliverIQ — Interview Prep, Part 14 (Day 28)
+
+> Docker Compose: multi-service orchestration. concept / soundbite / gotcha.
+
+---
+
+## 40. Docker Compose (environment as code)
+
+### The concept
+Compose defines a multi-container stack in one YAML file. `docker compose up`
+brings up the API, Postgres, and Redis together on a shared private network.
+Containers address each other by **service name** — the API connects to
+`db:5432` and `redis:6379`, where `db`/`redis` are Compose's built-in DNS names
+for those containers. No host networking, no `host.docker.internal`, none of the
+Day 27 config edits.
+
+**Soundbite:** "The whole environment is defined as code in a compose file — API,
+Postgres, Redis. A new developer goes from clone to a running stack with schema
+migrated in one command, `docker compose up`, with zero manual setup. Services
+find each other by name over the Compose network, so there's no host-specific
+configuration."
+
+### Why service names replace host.docker.internal
+Day 27 the container reached *out* to host services — needed the host's address
+plus opening Postgres/Redis to Docker's subnet. Compose runs Postgres and Redis
+as containers *on the same network*, so they're reachable by name. The
+portability win: the stack carries its own datastores and runs identically on any
+machine or on Railway — the host doesn't need Postgres or Redis installed at all.
+
+---
+
+## 41. Readiness vs Started (healthcheck + depends_on)
+
+### The concept
+A container being *started* isn't the same as its service being *ready*. Postgres
+takes a moment after launch before it accepts connections. If the API migrated
+the instant the DB container started, it could hit a not-yet-ready database.
+
+The `db` service has a healthcheck (`pg_isready` every 5s). The `api` service
+declares `depends_on: db: condition: service_healthy` — so the API doesn't boot
+(and doesn't run `alembic upgrade head`) until the healthcheck actually passes.
+
+**Soundbite:** "I gate the API on a Postgres healthcheck, not just container
+start. `depends_on` with `condition: service_healthy` means migrations never race
+a database that hasn't finished coming up — the API waits for `pg_isready` to
+pass first."
+
+**Gotcha:** without the healthcheck, `depends_on` only waits for the container to
+*start*, which is not the same as ready. That's the difference between a flaky
+boot and a reliable one.
+
+---
+
+## 42. Volumes (why data survives)
+
+### The concept
+Containers are ephemeral — stop one and its filesystem is gone. A **named volume**
+(`pgdata`) is storage Docker manages *outside* the container, mounted into
+Postgres's data directory. Data written there survives `docker compose down` and
+reappears on the next `up`. Only `down -v` deletes the volume.
+
+**Soundbite:** "Postgres data lives in a named volume, so the database persists
+across restarts. `down` keeps it; `down -v` is the explicit wipe for a clean slate."
+
+**Gotcha (Postgres 18):** the 18 image expects the volume at
+`/var/lib/postgresql`, not the older `/var/lib/postgresql/data` — wrong path and
+the container exits immediately. Version-specific detail worth knowing.
+
+---
+
+## 43. Self-Test — Day 28
+1. How does the API reach Postgres without host.docker.internal?
+2. What's the difference between a container being started vs ready? How is it enforced?
+3. What does the pgdata volume do? What survives `down` vs `down -v`?
+4. In one sentence: what does a new developer have to do to run the whole stack?
+5. Why is "environment as code" a stronger claim than "I containerized the app"?
+
+*Shaky on any? That's your next review target.*
+---
