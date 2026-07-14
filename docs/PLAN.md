@@ -2324,9 +2324,12 @@ gate at the bottom passes.
 
   api:
     build: .
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000   # overrides Dockerfile CMD
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     ports:
-      - "8000-8002:8000"        # port RANGE so --scale api=3 doesn't collide on 8000
+      - "8000-8002:8000"
+    environment:
+      DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
+      REDIS_URL: redis://redis:6379/0
     depends_on:
       migrate:
         condition: service_completed_successfully
