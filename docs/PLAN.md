@@ -2477,8 +2477,8 @@ migration writer; Redis strictly post-commit; repeatable proof in
 - Cleanup: `echo=True` debug SQL logging removed.
 - Deferred: `PATCH /orders/{id}/status` still reads lock-free (Day 35) · dead
   `last_assigned_at` write (Day 41–45 sweep).
-- Chat-sync detail lives in `Day29_Verification_Report.md` — this section is
-  the canonical build log.
+- Verification was double-checked by an independent Claude Code session
+  (report since folded into this section — this is the canonical build log).
 
 ### 📊 Current end-to-end flow (as of Day 29)
 
