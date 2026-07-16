@@ -2752,7 +2752,10 @@ docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
 ---
 
 ### Step 7 — kafka-ui (http://localhost:8080)
-
+```bash
+docker compose up -d kafka kafka-ui
+docker compose ps
+```
 First client to actually exercise `PLAINTEXT://kafka:19092` — a separate container
 on the Compose network, exactly like Day 31's API. **Cluster green = internal
 listener verified**, a day before the producer needs it.
