@@ -2489,16 +2489,295 @@ post-commit Redis catch-up, migrate one-shot job.
 ---
 
 # PHASE 7 — Event Streaming (Kafka) · Days 30–33
+## Day 30 — Kafka Theory + KRaft Compose — DONE ✅
 
-## Day 30 — Kafka Theory + Compose
-**Goal:** understand Kafka vs Pub/Sub, get a broker running in Compose.
-- 1-page note: Topic, Partition, Offset, Producer, Consumer, Consumer Group; why Kafka > Pub/Sub (durable, replayable, consumer groups).
-- Add Kafka to `docker-compose.yml`. **Prefer KRaft mode (no Zookeeper)** with a modern `confluentinc/cp-kafka` — simpler than the Zookeeper combo. Add `kafka-ui` for inspection.
+### 🎯 Goal
+Understand Kafka vs Pub/Sub, get a broker running in Compose, and **prove
+replay** — the Day-20 fire-and-forget flaw, killed on camera. No app code today.
 
-**Gotcha:** `KAFKA_ADVERTISED_LISTENERS` must expose both an in-network listener (`kafka:9092`, used by the API container) and a host listener (`localhost:9092`, for your shell). Getting these wrong is the #1 Kafka-in-Docker failure.
+> **Plan corrections made this day (v4 text was wrong twice):**
+> 1. v4 said `confluentinc/cp-kafka` in KRaft mode. **Kafka 4.x is KRaft-only** —
+>    ZooKeeper was *removed* in 4.0, not deprecated. "Prefer KRaft" is no longer
+>    a choice. Used `apache/kafka:4.1.2` (official ASF, ~235MB vs cp-kafka's ~3×,
+>    no CLUSTER_ID formatting dance, CLI at `/opt/kafka/bin`).
+> 2. v4's gotcha said advertise `kafka:9092` **and** `localhost:9092`. **That
+>    config does not start** — one listener can't advertise two addresses on one
+>    port. Correct shape = **two listeners on two ports** (below).
 
-**✅** Kafka + UI up; you can explain it in 2 minutes.
+---
 
+### Step 1 — the compose service
+
+```yaml
+  kafka:
+    image: apache/kafka:4.1.2
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft: one process, both roles. No ZooKeeper (removed in Kafka 4.0).
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      # LISTENERS = where I bind.  ADVERTISED = what I tell clients to dial.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:19092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # single-broker facts of life
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      KAFKA_NUM_PARTITIONS: 3          # default is 1 — would make group demos untestable
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+
+  kafka-ui:
+    image: kafbat/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: deliveriq-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092   # NOT localhost — different container
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      - kafka
+```
+
+Plus `kafkadata:` under top-level `volumes:`.
+
+**The listener table — the whole day in four rows:**
+
+| Listener | Binds | Advertises | Who dials it | Published to host |
+|---|---|---|---|---|
+| `PLAINTEXT` | `0.0.0.0:19092` | `kafka:19092` | API container (Day 31), kafka-ui | no |
+| `PLAINTEXT_HOST` | `0.0.0.0:9092` | `localhost:9092` | your shell | **yes** |
+| `CONTROLLER` | `0.0.0.0:9093` | — | the broker itself (KRaft quorum) | no |
+
+**Why two:** a Kafka client bootstraps, gets told *"the leader is at address X"*,
+then **dials X**. So the advertised address must be reachable from where the
+client stands — and clients stand in two places. `kafka` doesn't resolve on the
+host; `localhost` inside the API container is the API container. Wrong value =
+connect succeeds, then client **hangs and times out**.
+
+**Deliberate choices:**
+- `api` does **not** `depends_on: kafka` — the API doesn't touch Kafka until Day 31.
+  Declaring it today would be a lie in YAML.
+- `CLUSTER_ID` pinned, not auto-generated → identity lives in git, not in a volume.
+- `KAFKA_LOG_DIRS` set explicitly. Image default is `/tmp/kraft-combined-logs`.
+  Every blog that mounts a volume at `/var/lib/kafka/data` **without** this line
+  mounts a volume Kafka never writes to — data still dies with the container.
+- RF=1 everywhere. One broker can't replicate to itself. `__consumer_offsets`
+  defaults to RF=3 — leave it and the topic can't be created, so **your first
+  consumer hangs forever with no obvious error**.
+  *Honest note:* RF=1 = single point of failure. Production = 3 brokers,
+  `replication.factor=3`, `min.insync.replicas=2`, producer `acks=all`.
+- `kafka-ui` is the only unpinned image — dev tooling, never ships. `kafbat/`
+  not `provectuslabs/` (provectus archived it; kafbat is the maintained fork).
+
+---
+
+### Step 2 — bring up, verify
+
+```bash
+docker compose config >/dev/null && echo "YAML OK"   # parse BEFORE up: separates
+                                                     # "bad YAML" from "bad Kafka"
+docker compose up -d kafka        # only kafka — no depends_on, nothing else starts
+docker compose logs -f kafka      # want: Kafka Server started
+docker compose ps                 # want: Up, NOT Restarting
+```
+
+`PORTS` shows only `0.0.0.0:9092->9092` — 19092 and 9093 stay inside the network.
+The listener design, visible as fact.
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --list
+```
+**Empty *and instant* = pass** (full bootstrap → metadata → response round trip).
+A dead broker hangs ~60s then throws `TimeoutException`. Empty-instant vs
+hang-and-die is the tell.
+
+---
+
+### Step 3 — topic, and prove the config took
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --topic order.dispatched
+
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic order.dispatched
+```
+No `--partitions` flag on `--create` **on purpose** — testing whether
+`KAFKA_NUM_PARTITIONS: 3` took, not whether I can type a flag.
+
+Got `PartitionCount: 3`, `ReplicationFactor: 1`, three `Partition:` lines,
+`Leader: 1`, `Isr: 1`.
+
+> **Topic-naming warning fires on create:** JMX metric names normalize `.` and
+> `_` together, so `order.dispatched` and `order_dispatched` would **collide into
+> one metric**. Rule adopted: **dots only, never underscores**. Cashes out on
+> Day 36–37 (Prometheus/Grafana) — mixed conventions merge dashboards silently.
+
+---
+
+### Step 4 — produce, and watch ordering's real boundary
+
+```bash
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic order.dispatched \
+  --property parse.key=true --property key.separator=: <<'EOF'
+1:{"order_id":1,"rider_id":11}
+2:{"order_id":2,"rider_id":12}
+3:{"order_id":3,"rider_id":13}
+4:{"order_id":4,"rider_id":14}
+5:{"order_id":5,"rider_id":15}
+6:{"order_id":6,"rider_id":16}
+EOF
+```
+`exec -T` disables TTY so the heredoc feeds stdin (with a TTY the producer waits
+for typing). Keyed by `order_id` → `murmur2(key) % 3`.
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic order.dispatched --from-beginning \
+  --property print.partition=true --property print.key=true --timeout-ms 5000
+```
+
+**Observed:**
+```
+P0: 1, 5      P1: 4, 6      P2: 2, 3
+read order: 1, 5, 2, 3, 4, 6      produce order: 1..6
+```
+- Hash placement is **arbitrary but stable** — not the round-robin `1→P0,2→P1`
+  everyone assumes. Round-robin is what you get with **no key** (and then per-key
+  ordering is gone).
+- **Read order ≠ produce order.** Global ordering does not exist.
+- **Inside every partition, produce order is perfect.** That's the guarantee, and
+  its exact boundary.
+- 2/2/2 was **luck**. Later 7,8 both hashed to P0 → 4/2/2.
+
+> `--timeout-ms` exits by throwing `TimeoutException`. Ugly, expected, not a
+> failure. The verdict line is `Processed a total of N messages`.
+
+---
+
+### Step 5 — the bookmark
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic order.dispatched --from-beginning \
+  --group notifications --timeout-ms 10000
+
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group notifications
+```
+```
+Consumer group 'notifications' has no active members.
+GROUP          TOPIC            PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID
+notifications  order.dispatched 0          2               2               0    -
+notifications  order.dispatched 1          2               2               0    -
+notifications  order.dispatched 2          2               2               0    -
+```
+- **"has no active members"**, not "not found" — a group is a *set of rows*, not a
+  process. Processes are transient; the bookmark is durable.
+- **One row per (group, topic, partition)** — not one per group.
+- `CURRENT-OFFSET 2` = **next unread**, not last read. 2 msgs × 3 partitions = 6. ✅
+- `LAG = LOG-END − CURRENT` — the one number you alert on.
+
+---
+
+### 🔥 Break It On Purpose — the Day-20 experiment, opposite verdict
+
+Consumer is **down**. Produce into the void:
+```bash
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic order.dispatched \
+  --property parse.key=true --property key.separator=: <<'EOF'
+7:{"order_id":7,"rider_id":17}
+8:{"order_id":8,"rider_id":18}
+EOF
+```
+`--describe` now: **P0 → CURRENT 2, LOG-END 4, LAG 2.** The damage, *measured* —
+a number Pub/Sub can't express, because there's no log to subtract from.
+
+Restart the consumer — **note the missing flag**:
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic order.dispatched \
+  --group notifications \
+  --property print.partition=true --property print.key=true --timeout-ms 8000
+```
+**No `--from-beginning`** — deliberately. With it, I'd be proving nothing (just
+re-reading from 0). Result: **exactly 2 messages, orders 7 and 8.**
+
+- Not 8 → didn't replay from start; resumed from committed offset.
+- Not 0 → events produced while the consumer was **dead** survived.
+- Exactly 2 → precisely the missed window. Nothing lost, nothing duplicated.
+
+> **Day 20, same experiment: nothing. Forever.** Same sequence, opposite outcome.
+
+---
+
+### Step 6 — `--from-beginning` does nothing (the trap)
+
+```bash
+# same command as the FIRST run, with --from-beginning, same group
+→ Processed a total of 0 messages
+```
+`--from-beginning` sets `auto.offset.reset=earliest`, which is a **fallback, not
+an instruction**. Startup logic: *committed offset exists? → use it, ignore the
+setting. No offset? → now apply it.* It worked once only because the group had
+never existed. **It has never worked twice for the same group.**
+
+**Replay is an admin act — you edit the row:**
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --group notifications --topic order.dispatched \
+  --reset-offsets --to-earliest --dry-run     # prints proposal, changes nothing
+# swap --dry-run → --execute, then consume → all 8 come back
+```
+- `--execute` **fails if the group has active members** — Kafka won't move a
+  bookmark under a running consumer. Stop → reset → restart is the real procedure.
+- `--to-latest` = mark everything read without reading it = the **skip-the-backlog
+  button**. Deliberate data loss; sometimes correct in an incident.
+
+---
+
+### Step 7 — kafka-ui (http://localhost:8080)
+
+First client to actually exercise `PLAINTEXT://kafka:19092` — a separate container
+on the Compose network, exactly like Day 31's API. **Cluster green = internal
+listener verified**, a day before the producer needs it.
+
+Verified: `deliveriq-local` online · 1 broker · `order.dispatched` 3 partitions /
+8 messages · P0=4, P1=2, P2=2 (the skew) · First Offset 0 everywhere (reading
+never deletes) · group `notifications` LAG 0.
+
+Two fields named for later:
+- **`URP 0`** (Under-Replicated Partitions) — *the* production Kafka alert
+  alongside lag. Trivially 0 at RF=1.
+- **`Clean Up Policy: DELETE`** vs `COMPACT` (keep latest value per key forever).
+  `__consumer_offsets` is **compacted** — which is *why* the bookmark survives
+  indefinitely while `order.dispatched` expires on retention.
+
+> Compose is declarative: editing the file + `up` again reconciles the delta.
+> `kafka`'s config hash was unchanged → container untouched, messages intact. You
+> never "restart Compose after an edit." And if a config *had* changed, the
+> messages still survive — they're in the `kafkadata` volume, not the container.
+
+### ✅ End of Day
+Broker up in KRaft, dual listeners verified from both sides, 3 partitions,
+per-partition ordering observed, group offsets durable across process death,
+**replay proven without `--from-beginning`**, kafka-ui green. Day-20's flaw is
+dead. Next: Day 31 — producer, `settings.kafka_bootstrap = kafka:19092`.
 ---
 
 ## Day 31 — Producer (config-driven)

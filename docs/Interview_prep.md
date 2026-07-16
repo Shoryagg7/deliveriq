@@ -1989,3 +1989,393 @@ that matter.*
 ---
 
 
+# DeliverIQ — Interview Prep, Part 11 (Day 30)
+
+> Kafka: the log inversion, partitions, consumer groups, the dumb broker,
+> delivery semantics, and the `auto.offset.reset` trap.
+
+---
+
+## 50. Kafka Is Not a Queue ⭐
+
+### The concept
+Every message broker before Kafka shares one assumption: **the broker's job is to
+deliver a message and then forget it.** Consumption is destructive. The message's
+existence depends on someone receiving it.
+
+Kafka inverts that. The broker appends bytes to a file and moves on. **Reading
+changes nothing.** The message survives being read — by one consumer, by ten. It
+is deleted when a **retention policy** says so (age or size), never because
+someone consumed it.
+
+- Redis Pub/Sub = **loudspeaker**. In the room, or you missed it.
+- Kafka = **a ledger you bookmark**.
+
+Every downstream misunderstanding traces back to missing this.
+
+**Soundbite:** "Kafka isn't a queue, it's a durable append-only log. Reading
+doesn't consume — retention deletes. That single inversion is what makes replay
+possible: the bytes are on disk regardless of who read them, so a consumer that
+was down comes back and reads exactly what it missed."
+
+**Gotcha:** "Kafka is just a more scalable RabbitMQ" — no. RabbitMQ's broker
+tracks per-message state (delivered / acked / in-flight), which buys it
+per-message retry and dead-letter queues, and **costs it replay** — once acked,
+the message is gone. Kafka trades that state for speed and replayability. Two
+different tools, not two tiers of one.
+
+---
+
+## 51. Partitions — Ordering and Parallelism Are the Same Knob ⭐
+
+### The concept
+A topic **is** its partitions — there's no flat log underneath. `order.dispatched`
+with 3 partitions = **three separate files**, each appended independently, each
+with its own offset counter starting at 0. (Offset 2 in P0 and offset 2 in P1 are
+unrelated.)
+
+**Why split at all:** one file can only be read by one process without them
+stepping on each other. Want N workers on the same data → need N files. Partition
+count is *pre-decided parallelism*.
+
+Two consequences, both trades:
+- **Ordering shrinks.** Kafka guarantees order **within** a partition and makes
+  **no promise across partitions**. You bought parallelism with global ordering.
+- **Parallelism is capped** at the partition count (per group).
+
+Which file a message lands in = `murmur2(key) % num_partitions`. **Arbitrary but
+stable** — same key always lands in the same partition, in any language, on any
+broker. No key → round-robin → no ordering guarantee at all.
+
+**DeliverIQ:** key by `order_id`, so `dispatched → picked_up → delivered` for one
+order can never arrive scrambled. Different orders have no ordering relationship —
+and we don't need one.
+
+**Soundbite:** "Partitions are the unit of both ordering and parallelism — order
+holds inside a partition, and a group's max parallelism is its partition count. I
+key events by `order_id` so one order's lifecycle stays ordered; across orders
+there's no guarantee and no need for one. That makes partition count a capacity
+decision you make up front — raising it later rewrites the key→partition hash, so
+per-key ordering breaks across the change."
+
+**Gotcha 1 — "Kafka guarantees ordering."** Unqualified, that's wrong and a good
+interviewer stops you there. Per-partition only.
+
+**Gotcha 2 — hot partitions.** `murmur2` owes you nothing. Observed live: 6 keys
+split 2/2/2 (luck), then 2 more keys **both** hashed to P0 → 4/2/2. Key by
+something skewed (one `restaurant_id` producing 80% of events) and one partition
+eats 80% of the load while two idle. Kafka won't save you from a bad key choice.
+
+**Gotcha 3 — head-of-line blocking.** Unrelated keys share a partition and
+interleave freely. That's harmless for correctness (each key's events are still an
+ordered *subsequence* — deleting other keys' messages never reorders yours). The
+real cost: a poisoned or slow message **stalls every other key in that
+partition**, sequentially. Kafka has no per-message redelivery (dumb broker) — so
+you catch, push to a **dead-letter topic**, commit, and move on. Never retry
+in-line forever.
+
+---
+
+## 52. Consumer Groups — One String Selects Load-Balance vs Broadcast ⭐
+
+### The concept
+`group.id` is a string that decides whether two consumers are **teammates or
+strangers**.
+
+> Within a group, each partition is assigned to **exactly one** consumer.
+> Across groups, **everyone gets everything**.
+
+A group is **not** a subset of the data. Groups don't slice events — *every group
+reads every event*. The slicing happens **inside** a group, between its members.
+
+- **Same `group.id`** → one logical application → Kafka splits the partitions
+  between members → **work queue**.
+- **Different `group.id`** → unrelated applications → each gets a full copy →
+  **fan-out**.
+
+One config field replaces two systems.
+
+**The mapping — coverage never changes, only the division:**
+
+| Group | Members | Partitions covered | Files per member |
+|---|---|---|---|
+| `analytics` | 1 | 3 (all) | 3 |
+| `notifications` | 2 | 3 (all) | 2 and 1 |
+| `audit` | 3 | 3 (all) | 1 each |
+| `audit` + a 4th | 4 | 3 (all) | 1, 1, 1, **and 0** |
+
+"One consumer reads all the partitions" isn't a different mode — it's the same
+rule with a headcount of 1.
+
+Read the same event three ways: **across groups** it's processed 3× (fan-out);
+**within a group** exactly 1× (load balance). Six workers running, **one SMS
+per order**.
+
+**Failure isolation:** kill `analytics` → its offsets freeze, `notifications` and
+`audit` don't notice. Restart → it replays its backlog. **Blast radius = one
+group.** Kill one member of a group → Kafka **rebalances**, survivors absorb the
+orphaned partitions. Coverage is never lost.
+
+**Soundbite:** "`group.id` is the only knob: same id means competing consumers
+splitting partitions — a work queue. Different ids mean independent readers with
+independent offsets — fan-out. Kafka does both from one log, and within a group a
+partition has exactly one owner, so scaling out never duplicates work."
+
+**Gotcha — the per-process group id.** `group_id = f"notifications-{os.getpid()}"`
+makes every worker its own group. Scale to 3 → **the rider gets 3 SMS per order**.
+Looks perfect on one machine in dev. `group.id` is the identity of the
+*application*, not the process.
+
+**Gotcha 2 — more consumers ≠ more throughput.** Beyond the partition count, extra
+members sit idle burning RAM.
+
+---
+
+## 53. The Dumb Broker — Where the Offset Actually Lives ⭐
+
+### The concept
+Apparent contradiction: *"the broker appends and forgets"* vs *"the broker knows
+where group `notifications` was."* Resolution:
+
+> **The broker doesn't know. The consumer told it, and the broker wrote it down
+> the same dumb way it writes everything else.**
+
+`__consumer_offsets` is **a topic**. 50 partitions, sitting on disk next to
+`order.dispatched`. Committing an offset is not a special API — the consumer
+**produces a message**:
+
+```
+topic: __consumer_offsets
+key:   ("notifications", "order.dispatched", 2)
+value: 4271
+```
+
+Append. Forget. On restart the consumer **asks** for the latest value for that
+key. The broker looks up a key in a log and returns bytes. **That's a read, not a
+memory.**
+
+So both statements hold: the broker tracks nothing *and* the offset is durable —
+because a consumer **wrote it as data**, and data survives.
+
+**The proof:** you can put the offset **anywhere**. A common production pattern
+writes it into your own Postgres table **in the same transaction as the work**,
+then `consumer.seek()` on restart. Kafka has zero knowledge of your progress and
+it works perfectly. If offset tracking were a broker function that'd be
+impossible. `__consumer_offsets` is just the **default convenience**.
+
+**Dumb broker, smart consumer.** That's the central design decision — it's why the
+write path is "append to a file" (fast) and why replay is free (nothing deleted,
+bookmark is just data).
+
+**Soundbite:** "Kafka's broker is deliberately dumb — no per-consumer state, no
+delivery tracking, no push. An offset is just a message the consumer produces to
+an internal compacted topic, `__consumer_offsets`, keyed by group/topic/partition.
+That's why the broker scales and why replay is free. It also means commit timing
+*is* your delivery guarantee."
+
+**Gotcha:** `__consumer_offsets` uses **cleanup policy = compact** (keep the latest
+value per key, forever), while your topics use **delete** (retention by age/size).
+That asymmetry is why the bookmark outlives the events it points at.
+
+**Two consequences worth naming:**
+- `--describe --group X` on a group with no running process still returns rows:
+  *"Consumer group 'notifications' has no active members"* — **exists, empty**. A
+  group is a set of rows, not a process.
+- One row **per (group, topic, partition)** — not one per group.
+
+---
+
+## 54. At-Most-Once vs At-Least-Once ⭐
+
+### The concept
+The names are literal: **bounds on how many times one event gets processed.**
+
+Two actions, no way to fuse them: **A** = process (send the SMS), **B** = commit
+(move the bookmark). A crash can land between them, so you only choose the
+**order**, and the order picks your bound.
+
+| Order | Crash outcome | Possible counts | Name |
+|---|---|---|---|
+| **B → A** (commit first) | bookmark moved, work never happened | 0 or 1 | **at-most-once** — no duplicates, loss possible |
+| **A → B** (commit last) | work done, bookmark didn't move → redo | 1, 2, 3… | **at-least-once** — no loss, duplicates possible |
+
+The name states **which failure you refuse**. You must pick one.
+
+**Why exactly-once isn't on the menu:** it requires A and B to be **atomic**. A is
+an SMS gateway, B is a write in Kafka. Two systems, no shared transaction. That's
+the **dual-write problem** — the same shape as the Day-20 lesson (commit Postgres
+*then* publish; you can't do both atomically, so you choose which side eats the
+risk).
+
+**The answer: at-least-once + idempotent handler = effectively-once.** The
+duplicate still arrives; you make it harmless (dedupe on `order_id`). That's
+Day 34, and it's *why* Day 34 exists.
+
+**Soundbite:** "You can't make processing and offset-committing atomic — they're
+different systems. Commit first is at-most-once, you lose on crash. Commit last is
+at-least-once, you duplicate on crash. Everyone picks at-least-once and makes the
+handler idempotent, because a duplicate you can dedupe beats a message you never
+had. Exactly-once only exists when the side effect is inside the same
+transactional system."
+
+**Gotcha:** "Does Kafka support exactly-once?" The trap answer is a flat yes.
+Correct: **yes for Kafka-to-Kafka** via transactions (read-process-write inside one
+topic-to-topic transaction), **no for external side effects** — there you engineer
+it with idempotency.
+
+---
+
+## 55. `auto.offset.reset` Is a Fallback, Not a Rewind ⭐
+
+### The concept
+`--from-beginning` sets `auto.offset.reset=earliest`. It is **not** a
+"start from zero" command. Consumer startup logic:
+
+1. Does a committed offset exist for `(group, topic, partition)`?
+2. **Yes → use it.** `auto.offset.reset` is **ignored entirely**.
+3. No → *now* apply it: `earliest` = offset 0, `latest` = log end.
+
+**Verified live:** `--from-beginning` on a caught-up group →
+`Processed a total of 0 messages`. It worked the first time only because the group
+had never existed. It has **never** worked twice for the same group.
+
+**Why the design is right:** if `earliest` meant "always start at 0," every
+restart would reprocess the entire retention window — every SMS re-sent, every
+deploy. The committed offset **must** win, or offsets would be pointless.
+`auto.offset.reset` answers exactly one question: *"I have no bookmark — where do
+I start?"*
+
+**Replay is an administrative act — you edit the row:**
+```bash
+kafka-consumer-groups.sh --group notifications --topic order.dispatched \
+  --reset-offsets --to-earliest --dry-run    # proposal only
+  #                                --execute # rewrites the rows
+```
+- `--execute` **refuses if the group has active members.** Kafka won't move a
+  bookmark under a running consumer. **Stop → reset → restart** is the procedure.
+- `--to-latest` = mark everything read without reading it = the
+  **skip-the-backlog button**. Deliberate data loss; sometimes correct in an
+  incident (4h of stale lag, get current now).
+
+**Soundbite:** "`auto.offset.reset` only applies when the group has no committed
+offset — it's the bootstrap policy, not a rewind. Once a group has offsets they
+always win, which is why `--from-beginning` silently does nothing on a second run.
+Replay is an admin operation: stop the group, reset-offsets, restart."
+
+**Gotcha (the production version, and it bites the other way):** a new consumer
+deployed with the **default `auto.offset.reset=latest`** silently skips every
+event produced before it booted. No error. Team thinks the pipeline is broken;
+it's doing exactly what it was configured to do.
+
+---
+
+## 56. Consumer Lag — the Only Honest Health Metric
+
+### The concept
+`LAG = LOG-END-OFFSET − CURRENT-OFFSET`, per **(group, partition)**.
+
+- `LOG-END-OFFSET` = where writes append.
+- `CURRENT-OFFSET` = the bookmark = **next unread** (not last read — classic
+  off-by-one).
+
+A consumer can be alive, polling, healthy on CPU, and **falling behind forever**.
+"Is the process up" tells you nothing. **Lag flat at 0 = healthy. Lag climbing =
+you're losing** — and the fix is more consumers (up to the partition count) or a
+faster handler.
+
+**Pub/Sub cannot produce this number.** There's no log end to subtract from,
+because there's no log. Measurability is a *consequence* of durability.
+
+**Soundbite:** "Lag — log-end minus committed offset, per group per partition — is
+the number I'd alert on, because a consumer can be alive and still falling behind
+indefinitely. Alongside it, under-replicated partitions: URP > 0 means a broker is
+behind or dead and you're one failure from data loss."
+
+**Gotcha:** lag is per-partition. A group with LAG 0 on two partitions and 40k on
+a third isn't "mostly fine" — it has a hot partition or a stuck consumer, and
+averaging hides it.
+
+---
+
+## 57. Kafka in Docker — Bind vs Advertise ⭐
+
+### The concept
+Kafka clients don't just talk to whatever they connected to. They **bootstrap**,
+send a metadata request, and the broker replies *"the leader for that partition is
+at address X"* — then the client **dials X**. So the advertised address must be
+reachable **from where the client stands**.
+
+Clients stand in two places: **containers** (for whom the broker is `kafka`) and
+**your host** (for whom it's `localhost`). One value can't be both.
+
+- `KAFKA_LISTENERS` = **where I bind.**
+- `KAFKA_ADVERTISED_LISTENERS` = **what I tell clients to dial.**
+
+Conflating them is the #1 Kafka-in-Docker failure. Answer = **two listeners on two
+ports**: `PLAINTEXT://kafka:19092` (internal) + `PLAINTEXT_HOST://localhost:9092`
+(host, the only one published). A third, `CONTROLLER://…:9093`, is KRaft talking
+to itself.
+
+**KRaft:** Kafka used to need ZooKeeper — a second distributed system holding
+cluster metadata. KRaft moved metadata into a Raft quorum of Kafka controllers and
+stores it **as a Kafka log** (Kafka bootstrapping on Kafka). **Kafka 4.0 removed
+ZooKeeper entirely** — so every ZooKeeper compose file online is stale, and "KRaft
+mode" isn't a mode you pick anymore.
+
+**Soundbite:** "The classic Kafka-in-Docker failure is advertised listeners: the
+client bootstraps, gets redirected to the address the broker advertises, and dials
+it — so that address has to resolve from the client's network, not the broker's.
+Containers and the host are different networks, so you run two listeners on two
+ports and advertise `kafka:19092` internally, `localhost:9092` to the host. Get it
+wrong and the connection succeeds and then hangs, which is the confusing part."
+
+**Gotchas that cost real time:**
+- **RF defaults.** `__consumer_offsets` defaults to `replication.factor=3`. On a
+  single broker the topic can't be created → **your first consumer hangs forever**
+  with no clear error. Set the three RF/ISR vars to 1.
+- **`KAFKA_LOG_DIRS`.** The ASF image defaults to `/tmp/kraft-combined-logs`.
+  Mounting a volume at `/var/lib/kafka/data` **without** setting `KAFKA_LOG_DIRS`
+  mounts a volume Kafka never writes to — data still dies with the container, and
+  nobody notices. (Half the blog posts do this.)
+- **Topic naming.** JMX metric names normalize `.` and `_` together →
+  `order.dispatched` and `order_dispatched` **collide into one metric**. Pick one
+  separator convention and never mix. Bites at Grafana time, not at create time.
+- **Compose is declarative.** Editing the file + `up` again reconciles the delta;
+  unchanged services aren't touched. You never "restart Compose after an edit."
+  And a recreated container doesn't lose data — that's what the named volume is
+  for.
+
+---
+
+## 58. Self-Test — Day 30 (answer out loud)
+
+1. "Kafka is persistent" is half an answer. What are the **two** durable things
+   that make replay work, and why does one without the other fail?
+2. Why is `CURRENT-OFFSET 2` when the partition holds messages at offsets 0 and 1?
+3. A topic has 3 partitions. Group `audit` has 5 consumers. What happens?
+4. Two unrelated orders hash to the same partition. What does that cost you —
+   and what does it *not* cost you?
+5. `--from-beginning` on a group that's caught up. How many messages, and why?
+6. You need to reprocess yesterday's events. Give the exact procedure and the one
+   thing that will make it fail.
+7. Why can't Kafka give you exactly-once when the side effect is an SMS? What do
+   you do instead, and what's the name of the underlying problem?
+8. Explain `KAFKA_LISTENERS` vs `KAFKA_ADVERTISED_LISTENERS` to someone whose
+   producer connects successfully and then hangs.
+9. Why does `__consumer_offsets` use cleanup policy `compact` while
+   `order.dispatched` uses `delete`?
+10. `group.id = f"notifications-{os.getpid()}"`. What breaks, and when do you
+    find out?
+11. Your consumer is alive, CPU is low, no errors in the log. Why might it still
+    be failing? What do you measure?
+12. Why does RabbitMQ let you retry a single message while Kafka doesn't — and
+    what does Kafka get in exchange?
+
+*Shaky on any? That's your next review target.*
+
+---
+
+---
+---
+---
+---

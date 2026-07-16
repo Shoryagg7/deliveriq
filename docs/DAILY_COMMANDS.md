@@ -159,6 +159,35 @@ DNS proof (containers resolve service names via Docker's embedded DNS at 127.0.0
 docker compose exec db getent hosts redis
 ```
 
+### Redis command reference
+
+Redis has 4 value shapes in this project — the command you need follows from the shape:
+
+| shape | commands | used for |
+|---|---|---|
+| string | `GET key` · `SET key val` · `INCR key` | `orders_today` counter |
+| hash (dict-in-a-value) | `HGET key field` · `HSET key f1 v1 f2 v2` · `HMGET key f1 f2` | `rider:{id}:loc` (lat+lon together), rate-limit bucket (tokens+last_refill) |
+| set (unordered, no dupes) | `SADD key member` · `SREM key member` · `SMEMBERS key` | geohash cell membership |
+| — (meta / any type) | `TTL key` · `EXPIRE key seconds` · `KEYS pattern` · `FLUSHDB` | inspection, GC, test resets |
+
+All run inside the container:
+```bash
+docker compose exec redis redis-cli <COMMAND> <args...>
+
+# examples
+docker compose exec redis redis-cli HMGET rate_limit:127.0.0.1 tokens last_refill
+docker compose exec redis redis-cli HSET rider:1:loc lat 28.6139 lon 77.2090
+docker compose exec redis redis-cli SMEMBERS geohash:ttnfuc
+docker compose exec redis redis-cli SADD geohash:ttnfuc 1
+docker compose exec redis redis-cli TTL rate_limit:127.0.0.1     # -2 = gone, -1 = no expiry, else seconds left
+docker compose exec redis redis-cli EXPIRE rate_limit:127.0.0.1 120
+docker compose exec redis redis-cli GET "rider:1:orders:$(date +%F)"
+docker compose exec redis redis-cli INCR "rider:1:orders:$(date +%F)"
+```
+
+`KEYS '*'` is dev-only — O(N), blocks the single-threaded Redis event loop.
+Production/large keyspaces use `SCAN` (cursor-based, non-blocking) instead — not needed at this project's scale, but know the name.
+
 ---
 
 ## 6. Tests
@@ -178,3 +207,49 @@ docker compose restart api        # proof mode bounce (env change; code needs --
 docker compose down               # remove containers+network, KEEP data
 docker compose down -v            # + wipe volumes = wipe Postgres → run §1 "after down -v" steps
 ```
+##8 Kafka important testing commands
+
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --describe --topic order.dispatched
+
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic order.dispatched \
+  --property parse.key=true --property key.separator=: <<'EOF'
+1:{"order_id":1,"rider_id":11}
+2:{"order_id":2,"rider_id":12}
+3:{"order_id":3,"rider_id":13}
+4:{"order_id":4,"rider_id":14}
+5:{"order_id":5,"rider_id":15}
+6:{"order_id":6,"rider_id":16}
+EOF
+
+
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe --group notifications
+
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic order.dispatched \
+  --group notifications \
+  --property print.partition=true --property print.key=true \
+  --timeout-ms 5000
+
+
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --group notifications --topic order.dispatched \
+  --reset-offsets --to-earliest --dry-run
+
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --group notifications --topic order.dispatched \
+  --reset-offsets --to-earliest --execute
+
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --group notifications --topic order.dispatched \
+  --reset-offsets --to-latest --execute
+
