@@ -2782,19 +2782,123 @@ per-partition ordering observed, group offsets durable across process death,
 **replay proven without `--from-beginning`**, kafka-ui green. Day-20's flaw is
 dead. Next: Day 31 — producer, `settings.kafka_bootstrap = kafka:19092`.
 ---
+## Day 31 — Producer (config-driven) — DONE ✅
 
-## Day 31 — Producer (config-driven)
-**Goal:** publish `order.dispatched` to Kafka instead of Redis Pub/Sub.
-```bash
-pip install confluent-kafka
+### 🎯 Goal
+Dispatch produces `order.dispatched` to **Kafka** instead of Redis Pub/Sub.
+Config-driven bootstrap, idempotent producer, post-commit publish. Then break it
+to feel the dual-write hole.
+
+> **Plan corrections made this day (v4/earlier text was wrong twice):**
+> 1. My own Day-31 note said in-network bootstrap = `kafka:9092`. **Wrong** — that's
+>    the `PLAINTEXT_HOST` listener advertising `localhost`. Correct in-network value
+>    is **`kafka:19092`** (the `PLAINTEXT` listener). `kafka:9092` accepts TCP and
+>    hangs — the #1 Kafka-in-Docker trap, felt directly.
+> 2. librdkafka defaults to **CRC32** partitioning; the Java client uses **murmur2**.
+>    Same key → different partition across clients. Pinned
+>    `partitioner=murmur2_random` to match the ecosystem.
+
+---
+
+### Step 1 — config (the day's real trap)
+`app/core/config.py` — add one field, defaulting to the **host** value so local
+shell/tests work with no env set; the container overrides via compose env:
+```python
+    # bootstrap = handshake address only; broker replies with advertised listener.
+    #   host shell -> localhost:9092 (PLAINTEXT_HOST)   in Compose -> kafka:19092 (PLAINTEXT)
+    kafka_bootstrap: str = "localhost:9092"
 ```
-- `app/core/kafka_producer.py`: `Producer({"bootstrap.servers": settings.kafka_bootstrap})`.
-- In `dispatch.py`, replace `redis_client.publish(...)` with `publish_event("order.dispatched", {...})`.
+`.env` / `.env.example`: `KAFKA_BOOTSTRAP=localhost:9092`.
+compose `api` env: `KAFKA_BOOTSTRAP: kafka:19092` + `depends_on: kafka:
+{condition: service_started}` (no healthcheck on kafka → can't use
+`service_healthy`; fire-and-forget producer tolerates a not-yet-ready broker).
+`pip install confluent-kafka && pip freeze > requirements.txt` **before** rebuild.
 
-**Gotcha:** `settings.kafka_bootstrap` = `kafka:9092` inside Compose, `localhost:9092` from your shell. **Never hardcode** (the v3.2 bug). Keep the Redis-publish git history — it's the "felt the flaw, then upgraded" story.
+> **Topic name → enum, not a literal.** Added `Topic` to `core/enums.py`
+> (`ORDER_DISPATCHED = "order.dispatched"`). A typo'd literal auto-creates a
+> silent phantom topic; the consumer then waits forever on the wrong log.
 
-**✅** Dispatch produces an event visible in kafka-ui.
+### Step 2 — the producer — `app/core/kafka_producer.py`
+Singleton (lazy), `publish_event(topic, payload, key)`, delivery callback,
+`flush_producer()`. Config that matters:
+```python
+{
+  "bootstrap.servers": settings.kafka_bootstrap,
+  "acks": "all",                    # RF=1 → free today, right default for prod
+  "enable.idempotence": True,       # dedupe RETRIES (not payloads) — broker handshake
+  "partitioner": "murmur2_random",  # match Java ecosystem, not librdkafka's CRC32
+}
+```
+`produce()` enqueues + returns (no I/O); `poll(0)` after it drains *completed*
+callbacks (non-blocking). Key = `str(order_id)` → same partition → per-order
+ordering for Day 33's `order.delivered`.
 
+### Step 3 — flush on shutdown — `app/main.py`
+Move to `lifespan` (the deprecated `@app.on_event` is gone); `flush_producer()`
+after `yield`. Drains the buffer on SIGTERM. `import logging` lifted to the top
+(kills the `# noqa: E402`, pays a Day-43 debt).
+
+### Step 4 — the swap — `app/services/dispatch.py`
+Post-commit, replace the Redis publish:
+```python
+publish_event(
+    Topic.ORDER_DISPATCHED.value,
+    {"order_id": order_id, "rider_id": rider_id, "ts": time.time()},
+    key=str(order_id),
+)
+```
+Drop `json`, `redis_client` (dispatch's only use was the publish), the string
+literal. **Stays post-commit** — announce only durable facts, or a rollback
+leaves Kafka a permanent replayable phantom. No try/except: `produce()` only
+raises on local queue-full, and guarding it would swallow the very failure
+Step 6 demonstrates. **Commit the Redis-publish version first** — "felt the flaw,
+then upgraded" is the story.
+
+### 🔥 Break It On Purpose — the dual-write hole
+```bash
+docker compose stop kafka
+# seed rider+order, then:
+curl -s -X POST http://localhost:8000/orders/dispatch   # → 200 OK, order ASSIGNED
+docker compose start kafka                                # event retries into reboot gap
+# consumer --from-beginning: outage order's event is GONE; Postgres still says ASSIGNED
+```
+Result: `200` with the broker dead (`produce()` does no I/O → can't fail); the
+buffered event died on `UNKNOWN_TOPIC_OR_PART` on reconnect. **Postgres and Kafka
+diverged, nothing rolled back.** → motivates the transactional outbox (Day 38
+health check + a "what's next" answer).
+
+### 🧪 Testing — every step, confirmed
+```bash
+# config resolves + container override wins
+python -c "from app.core.config import settings; print(settings.kafka_bootstrap)"        # localhost:9092
+docker compose exec api python -c "from app.core.config import settings; print(settings.kafka_bootstrap)"  # kafka:19092
+# container can actually reach the advertised in-network listener
+docker compose exec api python -c "import socket; socket.create_connection(('kafka',19092),3); print('reachable')"
+
+# produce one event, see the delivery callback + a real offset
+python -c "import logging; logging.basicConfig(level=logging.INFO); \
+from app.core.enums import Topic; from app.core.kafka_producer import publish_event, flush_producer; \
+publish_event(Topic.ORDER_DISPATCHED.value, {'order_id':999,'rider_id':1,'ts':0}, key='999'); flush_producer()"
+# expect: kafka delivered topic=order.dispatched partition=? offset=N
+
+# partitioner proof — 10 keys must match the Java/murmur2 table
+#   p0:1,5,7,8   p1:4,6,10   p2:2,3,9
+python -c "from app.core.kafka_producer import publish_event, flush_producer; \
+[publish_event('partition.probe2', {'n':i}, key=str(i)) for i in range(1,11)]; flush_producer()"
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:19092 \
+  --topic partition.probe2 --from-beginning --property print.partition=true --property print.key=true \
+  --timeout-ms 5000 2>/dev/null | sort
+
+# end-to-end: dispatch → event on disk (keyed, with ts) + container-side delivery log
+curl -s -X POST http://localhost:8000/orders/dispatch | python -m json.tool
+docker compose logs api | grep "kafka delivered"   # bootstrap=kafka:19092, offset=N
+```
+
+### ✅ End of Day
+Dispatch produces `order.dispatched` to Kafka (post-commit, keyed, idempotent,
+murmur2-partitioned); flush on shutdown; the Pub/Sub→Kafka swap is invisible to
+the API contract; dual-write hole felt live. Redis-publish kept in git history.
+**Next:** Day 32 — consumer + replay (the dead broker's junk becomes the payoff).
 ---
 
 ## Day 32 — Consumer

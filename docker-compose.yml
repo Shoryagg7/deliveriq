@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: deliveriq_db
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql
     healthcheck:
@@ -74,10 +74,13 @@ services:
     environment:
       DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
       REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP: kafka:19092
     depends_on:
       migrate:
         condition: service_completed_successfully
       redis:
+        condition: service_started
+      kafka:
         condition: service_started
 
 volumes:

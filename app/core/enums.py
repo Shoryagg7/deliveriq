@@ -7,3 +7,8 @@ class OrderStatus(str, Enum):
     PICKED_UP = "PICKED_UP"
     DELIVERED = "DELIVERED"
     CANCELLED = "CANCELLED"
+
+
+class Topic(str, Enum):
+    ORDER_DISPATCHED = "order.dispatched"
+    ORDER_DELIVERED = "order.delivered"  # Day 33

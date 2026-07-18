@@ -1,13 +1,13 @@
+# app/services/dispatch.py
 import heapq
-import json
 import time
 from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
-from app.core.enums import OrderStatus
+from app.core.enums import OrderStatus, Topic
 from app.core.exceptions import NoPendingOrders, RiderUnavailable
-from app.core.redis_client import redis_client
+from app.core.kafka_producer import publish_event
 from app.models.order import Order
 from app.models.rider import Rider
 from app.services.geohash_service import (
@@ -56,7 +56,9 @@ def pick_next_order(db: Session):
         rider = None
         while True:
             rider_id = select_rider(
-                winner.pickup_lat, winner.pickup_lon, exclude=tried  # type: ignore
+                winner.pickup_lat, #type: ignore
+                winner.pickup_lon, #type: ignore
+                exclude=tried,  # type: ignore
             )
             if rider_id is None:
                 break  # band exhausted — genuinely nobody for this order
@@ -86,12 +88,13 @@ def pick_next_order(db: Session):
 
         db.commit()
 
-        # Redis catch-up AFTER commit only
+        # Redis + Kafka catch-up AFTER commit only
         remove_rider_from_index(rider_id)
         record_rider_assignment(rider_id)
-        redis_client.publish(
-            "order.dispatched",
-            json.dumps({"order_id": order_id, "rider_id": rider_id, "ts": time.time()}),
+        publish_event(
+            Topic.ORDER_DISPATCHED.value,
+            {"order_id": order_id, "rider_id": rider_id, "ts": time.time()},
+            key=str(order_id),
         )
         return {"order_id": order_id, "rider_id": rider_id}
 

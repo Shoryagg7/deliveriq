@@ -1,7 +1,7 @@
 import os
 
 os.environ["DATABASE_URL"] = (
-    "postgresql://deliveriq_user:password@localhost:5432/deliveriq_test_db"
+    "postgresql://deliveriq_user:password@localhost:5433/deliveriq_test_db"
 )
 os.environ["REDIS_URL"] = "redis://localhost:6379/15"
 import pytest

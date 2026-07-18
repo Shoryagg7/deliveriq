@@ -2374,6 +2374,215 @@ wrong and the connection succeeds and then hangs, which is the confusing part."
 *Shaky on any? That's your next review target.*
 
 ---
+---
+
+## 59. Kafka Producer — Config, Idempotence, the Async Delivery Model ⭐
+
+### Bootstrap ≠ the address you actually talk to (recap, now client-side)
+Same lesson as §57, felt from the producer: `bootstrap.servers` is a *handshake*.
+The client dials it once, the broker replies with its `advertised.listeners`, and
+every subsequent request goes to *that* address. So `kafka:9092` can accept a TCP
+connection and still be wrong — its listener advertises `localhost:9092`, so the
+client turns around and dials itself. Proven live: `socket.create_connection
+(('kafka',9092))` returned "reachable" *and* was the wrong listener. Config value:
+`localhost:9092` from the host shell (default), `kafka:19092` in Compose (env
+override wins over `.env`).
+
+**Soundbite:** "Bootstrap is a handshake, not a destination — the broker hands
+back its advertised listener and the client dials that. Which is why a Kafka
+address can pass a raw TCP check and still be wrong: the failure only shows up
+after the metadata round-trip."
+
+### The singleton — a Producer is a resource, not a value
+One `Producer` per process, lazily created. It owns a background I/O thread, TCP
+connections to every broker, and a message buffer. Per-request construction means
+a thread + handshake per dispatch, zero batching, and — the real killer — the
+object gets garbage-collected while its buffer still holds unsent messages, which
+vanish silently. Lazy init keeps import side-effect-free so `pytest` collecting
+`dispatch.py` doesn't spawn a broker connection.
+
+**Soundbite:** "The producer is a long-lived resource with a background thread and
+a send buffer, so it's a process-lifetime singleton. Construct one per request and
+you lose batching and drop whatever's still buffered when it's GC'd — silently."
+
+### Idempotence is transport-level, not semantic (the trap)
+`enable.idempotence=True` gives the producer a PID + a per-partition sequence
+number, so the broker drops a **network retry** of a message it already wrote
+(lost-ack case). It does NOT dedupe two separate `produce()` calls with identical
+payloads — distinct sequence numbers, broker correctly appends both. Proven: four
+identical `produce()` calls, idempotence on → four rows on the partition.
+
+**Soundbite:** "Producer idempotence dedupes retries, not payloads. PID plus a
+monotonic per-partition sequence means a network-retried write lands once —
+exactly-once *within one producer session to one partition*. It says nothing about
+my code calling produce twice. Business-level dedupe is the consumer's job: an
+idempotency key plus a uniqueness constraint."
+
+**Gotcha:** it's a *broker handshake*, not a client flag — needs the transaction
+coordinator loaded. Against a fresh broker (state wiped) the first produce logs
+`GETPID ... Coordinator load in progress: retrying` until the coordinator is
+ready; librdkafka retries it away and `flush()` still returns clean.
+
+### The async delivery model — `produce` / `poll(0)` / `flush`
+`produce()` enqueues to an in-memory buffer and returns immediately — no network
+I/O, so it *cannot* fail on a dead broker. A background thread sends; on ack it
+parks a completed callback on a queue; `poll(0)` drains *already-completed*
+callbacks and returns without blocking. Consequence: a message's delivery callback
+almost never fires during the `poll(0)` right after its own `produce()` — it fires
+on a *later* poll or on `flush()`. Measured live: a callback sat parked ~10 minutes
+until the next dispatch pumped it.
+
+**Soundbite:** "produce is async — buffers and returns; poll(0) only serves
+callbacks that already completed; so a producer can never synchronously confirm
+delivery. Confirmation arrives later via the callback, which is the *only* error
+channel. Anyone returning a delivered=true boolean from a produce wrapper has a
+bug."
+
+**Gotcha:** two separate channels. `produce()` raises only on local queue-full
+(`BufferError`); broker/delivery failures arrive *exclusively* via the callback,
+later, on another thread. try/except around produce proves nothing about delivery.
+
+### `flush()` on shutdown — narrows the window, doesn't close it
+`flush(5.0)` blocks until the buffer drains; it runs in the FastAPI `lifespan`
+shutdown. This handles **SIGTERM** — rolling deploys, scale-downs, `compose down`
+(SIGTERM, then 10s grace, then SIGKILL — the 5s flush fits). It does NOT handle
+SIGKILL, OOM-kill, or a pulled plug: buffered events die. Proven earlier with the
+"888, no flush" experiment — process exited 0, message never existed, no error.
+
+**Soundbite:** "Flushing on shutdown covers graceful termination — SIGTERM — which
+is the common case. It can't cover SIGKILL or a hard crash; buffered events are
+just lost. Flush narrows the window, it doesn't close it. Closing it is the
+outbox's job."
+
+### Partitioning: `hash(key) % partitions` — both halves are footguns
+Key decides partition; ordering holds only *within* a partition, so same key →
+same partition → per-key ordering. Two traps: (1) the hash is **client-specific** —
+librdkafka defaults to CRC32, the Java client to murmur2, so the *same key* lands
+on *different partitions* across clients; pin `partitioner=murmur2_random` to match
+the ecosystem. (2) the modulus means **adding a partition re-maps every existing
+key** and strands its old events on the old partition — a silent, irreversible
+ordering break, no error, no migration path. Verified from first principles: keys
+1–10, murmur2 vs CRC32 tables computed and matched the broker 10/10; Day 30's
+Java-produced rows were murmur2, my librdkafka rows were CRC32 until pinned.
+
+**Soundbite:** "Partition is hash(key) mod count. Same key, same partition, per-key
+ordering — but the hash is client-specific, CRC32 in librdkafka vs murmur2 in Java,
+so I pin the partitioner to interoperate; and the modulus means adding partitions
+re-maps every key and breaks ordering irreversibly. If ordering must survive
+scaling, over-provision partitions up front — you don't repartition."
+
+**Gotcha:** everyone knows "ordered within a partition." The winning follow-up:
+`NUM_PARTITIONS 3→4` silently breaks per-key ordering with no error and no
+migration path — which is *why* you never repartition a keyed topic.
+
+---
+
+## 60. The Dual-Write Hole — and why post-commit isn't enough ⭐
+
+### The concept
+Dispatch commits to Postgres, THEN produces to Kafka — two systems, not one
+transaction. Post-commit ordering is *mandatory*: publishing a fact before it's
+durable means a rollback leaves a permanent, replayable phantom event (worse in
+Kafka than Pub/Sub — Pub/Sub's phantom evaporates, Kafka's is on disk forever and
+every future consumer group replays it). But post-commit still leaves a window:
+commit succeeds, then the process dies or the produce times out → order ASSIGNED in
+Postgres, event never delivered, nothing rolls back.
+
+**Proven live (the break-it):** dispatched with the broker *stopped* → API returned
+`200 OK`, order ASSIGNED, rider BUSY. Restarted the broker; the buffered event
+retried into the reboot gap and died on `UNKNOWN_TOPIC_OR_PART` (topic metadata
+not yet reloaded). Consumer read `order.dispatched --from-beginning`: **only the
+recovered order present, the outage order's event gone.** Postgres showed both
+ASSIGNED and could not tell which one never reached Kafka.
+
+**Soundbite:** "Dispatch is a dual write — Postgres commit then Kafka produce, no
+shared transaction. I publish post-commit so a rollback can't leave a phantom
+event, but any crash in the gap leaves an order assigned with no event published
+and nothing to undo it. I proved it: dispatched with the broker down, got a 200,
+and watched that event die on reconnect while Postgres still said ASSIGNED. The fix
+is transactional outbox — write the event to an outbox table inside the order's
+transaction, then a relay tails it and publishes. The event becomes as durable as
+the state change because it *is* the state change. I scoped it out for a portfolio
+project, but that's exactly where I'd take it if these were payments."
+
+**Gotcha:** "just publish inside the transaction" is *strictly worse*, not a fix —
+rollback then leaves Kafka with a permanent record of an assignment that never
+happened. Neither pre- nor post-commit is correct for two independent systems;
+that's the whole reason the outbox pattern exists. Anyone who thinks reordering the
+two lines solves it hasn't seen the problem.
+
+**Honest scope:** the `UNKNOWN_TOPIC_OR_PART` death was partly amplified by an
+earlier `down -v` that destroyed the topic. In a steady-state outage (topic already
+durable in the volume) the buffered event more likely self-heals on reconnect. The
+precise, defensible claim is narrower and stronger: *a dual write has no atomicity,
+so a failure window exists where Postgres commits and the event doesn't, and no
+client-side retry closes it.* That window is real and measured.
+
+---
+
+## 61. Self-Test — Day 31 (answer out loud)
+1. Why can a Kafka address pass a raw TCP connection test and still be the wrong
+   one to use?
+2. Why is the Producer a process-lifetime singleton and not a per-request object?
+   Name the silent failure of getting it wrong.
+3. Idempotence is ON. You call `produce()` four times with the same payload. How
+   many rows land, and why isn't that a bug in idempotence?
+4. Name the two distinct channels for `produce()` errors vs delivery errors. Which
+   one does a dead broker use?
+5. Why can a producer never synchronously return "delivered = true"?
+6. What does `poll(0)` actually do, and what two things break if you never call it?
+7. `flush()` on shutdown covers which failures and not which others? Name the
+   signal boundary.
+8. Same key produced by a Python and a Java client lands on different partitions.
+   Why, and what's the one-line fix?
+9. Why is `NUM_PARTITIONS 3→4` a silent, irreversible ordering break?
+10. Why must the dispatch publish be post-commit — and why is pre-commit *worse*,
+    not merely different?
+11. You dispatched with the broker down and got a 200. Where did the event go, and
+    what does Postgres believe happened?
+12. What is the transactional outbox, and precisely which failure does it close
+    that post-commit publishing cannot?
+
+*Shaky on any? #3, #5, #10, #12 are the ones that separate "used Kafka" from
+"understands Kafka."*
+
+---
+
+## 62. Environment Split-Brain (Two Postgres, One `.env`) ⭐
+
+**Concept (why).** Dev ran hybrid: host-native Postgres on 5432 AND a Compose
+Postgres remapped to 5433 (the remap dodged a port-bind conflict). `.env` still
+pointed at 5432, so pytest + host app wrote to the native DB while the `api`
+container wrote to Compose. Two fully-migrated schemas, diverging silently
+(3 orders vs 2). No error ever fired — which is what made it dangerous. A change
+verified on one side was invisibly stale on the other.
+
+**Soundbite (~30s).** "I had a split-brain across two Postgres instances — host
+and containerized — because my env config and my compose file disagreed on the
+port. Nothing errored; the databases just quietly forked. The fix wasn't cleaning
+data, it was eliminating the redundant instance: I decommissioned the native
+Postgres, made Compose canonical, and repointed every hardcoded connection
+string. `docker compose down -v` is now my reset button."
+
+**Gotcha.** The tell was a sequence reset that "didn't take" — `RESTART WITH 4`
+on one DB, then reading `3267` back. It took fine; I was reading a different
+database than I wrote to. A sequence/value that won't change after you set it is a
+classic signature of a read/write split across two backends. Also: env-driven
+config (`alembic/env.py` reads `DATABASE_URL`) can silently override a hardcoded
+`alembic.ini` — a stale ini value is a dormant landmine, not dead code.
+
+**Self-test.**
+- Q1: You `UPDATE` a row, commit, re-`SELECT`, and see the old value. Two
+  explanations — which is the environment one?  (A: uncommitted txn / wrong
+  isolation, *or* you're connected to a different DB than you wrote to.)
+- Q2: Why does `docker-compose.yml` correctly use `@db:5432` internally while
+  `.env` needs `@localhost:5433`?  (Container-network service name + internal
+  port vs host-published remap.)
+- Q3: The report guessed Redis was also forked. It wasn't. What one command
+  settles "how many Redis are actually running?" before you theorize?
+  (`ss -tlnp | grep 6379` — one docker-proxy = one Redis.)
+
+---
 
 ---
 ---

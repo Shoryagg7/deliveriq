@@ -1,3 +1,4 @@
+# app/core/config.py
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,4 +11,11 @@ class Settings(BaseSettings):
     rate_limit_capacity: int = 100
     rate_limit_refill_per_min: int = 100
 
-settings = Settings() # type: ignore
+    # Bootstrap = the handshake address only. The broker replies with its
+    # advertised listener, and THAT is what the client actually connects to.
+    #   host shell  -> localhost:9092  (PLAINTEXT_HOST listener)
+    #   in Compose  -> kafka:19092     (PLAINTEXT listener)
+    kafka_bootstrap: str = "localhost:9092"
+
+
+settings = Settings()  # type: ignore

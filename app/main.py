@@ -1,7 +1,12 @@
+# app/main.py
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.core.exceptions import DeliverIQError
+from app.core.kafka_producer import flush_producer
 from app.core.logging_config import setup_logging
 from app.middleware.rate_limiter import rate_limit_middleware
 from app.middleware.request_id import request_id_middleware
@@ -10,16 +15,25 @@ from app.models.rider import Rider  # noqa: F401
 from app.routers import admin, orders, riders
 
 setup_logging()
-app = FastAPI(title="DeliverIQ")
+logger = logging.getLogger("deliveriq")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- startup ---
+    yield
+    # --- shutdown --- drain buffered events before the process dies
+    logger.info("shutdown: flushing kafka producer")
+    flush_producer()
+
+
+app = FastAPI(title="DeliverIQ", lifespan=lifespan)
 app.include_router(orders.router)
 app.include_router(riders.router)
 app.include_router(admin.router)
 app.middleware("http")(rate_limit_middleware)
 app.middleware("http")(request_id_middleware)
 
-import logging  # noqa: E402
-
-logger = logging.getLogger("deliveriq")
 
 @app.get("/health")
 def health():
