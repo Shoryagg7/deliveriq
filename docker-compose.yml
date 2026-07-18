@@ -9,17 +9,16 @@ services:
       - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro   # ← added
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U deliveriq_user -d deliveriq_db"]
       interval: 5s
       timeout: 3s
       retries: 5
-
   redis:
     image: redis:7
     ports:
       - "6379:6379"
-
   kafka:
     image: apache/kafka:4.1.2
     ports:
@@ -30,22 +29,33 @@ services:
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:19092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,PLAINTEXT_HOST://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-
       KAFKA_NUM_PARTITIONS: 3
       KAFKA_LOG_DIRS: /var/lib/kafka/data
     volumes:
       - kafkadata:/var/lib/kafka/data
-
+    healthcheck:                                                # ← added
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+  kafka-init:                                                   # ← added (one-shot, mirrors `migrate`)
+    image: apache/kafka:4.1.2
+    command: >
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092
+      --create --if-not-exists --topic order.dispatched
+      --partitions 3 --replication-factor 1
+    depends_on:
+      kafka:
+        condition: service_healthy
   kafka-ui:
     image: kafbat/kafka-ui:latest
     ports:
@@ -56,7 +66,6 @@ services:
       DYNAMIC_CONFIG_ENABLED: "true"
     depends_on:
       - kafka
-
   migrate:
     build: .
     command: alembic upgrade head
@@ -65,7 +74,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-
   api:
     build: .
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -80,9 +88,8 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_started
-      kafka:
-        condition: service_started
-
+      kafka-init:                                               # ← changed: was `kafka: service_started`
+        condition: service_completed_successfully
 volumes:
   pgdata:
   kafkadata:

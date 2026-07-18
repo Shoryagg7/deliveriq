@@ -2584,6 +2584,58 @@ config (`alembic/env.py` reads `DATABASE_URL`) can silently override a hardcoded
 
 ---
 
+## §63 — Reproducible-From-Empty: One-Shot Init Jobs & Real Readiness Gates
+
+**Concept (why).** A `docker compose down -v` wipes all data volumes. "Clean and
+ready" is only true if EVERY required setup artifact is rebuilt by code on the
+next `up`, not by remembered manual commands. Three artifacts needed rebuilding:
+Postgres schema, the isolated pytest database, and the Kafka topic. Two were
+manual (tribal knowledge — the thing that rots). Fix: make each reproducible.
+  - Schema → one-shot `migrate` job (`alembic upgrade head`), gated on db healthy.
+  - Test DB → Postgres init-script in `/docker-entrypoint-initdb.d/`, which runs
+    ONCE on a fresh data dir — exactly the down -v → up case.
+  - Topic → one-shot `kafka-init` job (`kafka-topics --create --if-not-exists
+    --partitions 3`), gated on kafka HEALTHY.
+
+**Soundbite (~30s).** "The whole stack reproduces from an empty volume with one
+command. Schema via a one-shot Alembic job, the pytest database via a Postgres
+init-script, Kafka topics with pinned partition counts via a one-shot admin job —
+all ordered by health-gated depends_on. Clone and `docker compose up`; no setup
+steps, no README dance. Making the environment declarative is what lets me trust
+`down -v` as a real reset button."
+
+**Gotcha 1 — `service_started` ≠ ready.** `depends_on: condition: service_started`
+only means the container process launched. A dependent that does real I/O on boot
+(kafka-init creating a topic) will race a broker that isn't accepting connections
+yet and fail intermittently. Fix: give the dependency a healthcheck that does a
+real round-trip (`kafka-topics --list`) and gate on `service_healthy`. Lazy
+clients (the producer) hide this; eager ones expose it.
+
+**Gotcha 2 — init-scripts run ONCE.** Files in `/docker-entrypoint-initdb.d/` run
+only when the data directory is empty. A warm restart (`down` without `-v`) skips
+them — correct, because the DB already exists — but it means you can't use them to
+apply ongoing changes. They're for first-init bootstrap only; schema *changes*
+belong in migrations.
+
+**Gotcha 3 — idempotent one-shots.** `--if-not-exists` (topic) and `alembic
+upgrade head` (schema) are safe to re-run on every `up`. A one-shot that errors on
+"already exists" breaks warm starts. Make boot jobs idempotent or gate them on
+first-init only.
+
+**Self-test.**
+- Q1: After `down -v && up`, schema and topic come back but pytest fails "database
+  does not exist." Why does schema auto-restore and the test DB not?  (migrate job
+  targets deliveriq_db only; test DB had no code responsible for it until the
+  init-script.)
+- Q2: `kafka-init` fails ~1 in 5 runs with connection refused, passes on retry.
+  Root cause and fix?  (Gated on service_started not service_healthy → races
+  broker readiness; add broker healthcheck, gate on service_healthy.)
+- Q3: Why put test-DB creation in an init-script but schema in a migration —
+  why not both in init-scripts?  (Init-scripts run once on fresh volume only;
+  schema evolves, must replay on every environment → migrations. DB existence is
+  a one-time bootstrap → init-script.)
+---
+
 ---
 ---
 ---
