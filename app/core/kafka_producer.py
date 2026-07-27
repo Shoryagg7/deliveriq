@@ -56,10 +56,16 @@ def publish_event(topic: str, payload: dict, key: str | None = None) -> None:
     producer.poll(0)  # serve delivery callbacks; does NOT block
 
 
-def flush_producer(timeout: float = 5.0) -> None:
-    """Block until the local queue drains. Shutdown only."""
+def flush_producer(timeout: float = 5.0) -> int:
+    """Block until the local queue drains.
+
+    Returns the number of messages STILL undelivered (0 == everything acked).
+    Callers that must not lose an event — the DLQ path — check this before
+    treating the publish as durable.
+    """
     if _producer is None:
-        return
+        return 0
     remaining = _producer.flush(timeout)
     if remaining:
         logger.error("kafka flush timed out — %d messages UNDELIVERED", remaining)
+    return remaining
