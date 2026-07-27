@@ -12,13 +12,17 @@ import logging
 from confluent_kafka import Consumer, KafkaError
 
 from app.core.config import settings
+from app.core.enums import Topic
 from app.core.logging_config import setup_logging
 
 setup_logging()
 logger = logging.getLogger("deliveriq.worker")
 
 CONSUMER_GROUP = "notifications"
-TOPIC = "order.dispatched"
+# Enum, not a literal: a typo'd topic string auto-creates a silent phantom topic
+# and the consumer then waits forever on the wrong log. Same enum the producer
+# publishes with, so the two can never drift apart.
+TOPIC = Topic.ORDER_DISPATCHED.value
 
 
 def build_consumer() -> Consumer:
