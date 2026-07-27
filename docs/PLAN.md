@@ -2862,10 +2862,29 @@ curl -s -X POST http://localhost:8000/orders/dispatch   # → 200 OK, order ASSI
 docker compose start kafka                                # event retries into reboot gap
 # consumer --from-beginning: outage order's event is GONE; Postgres still says ASSIGNED
 ```
-Result: `200` with the broker dead (`produce()` does no I/O → can't fail); the
-buffered event died on `UNKNOWN_TOPIC_OR_PART` on reconnect. **Postgres and Kafka
-diverged, nothing rolled back.** → motivates the transactional outbox (Day 38
-health check + a "what's next" answer).
+Result: `200` with the broker dead (`produce()` does no I/O → can't fail).
+**Postgres and Kafka diverged, nothing rolled back.** → motivates the
+transactional outbox (Day 38 health check + a "what's next" answer).
+
+> **Correction (verified 2026-07-18).** An earlier version of this note said the
+> buffered event "died on `UNKNOWN_TOPIC_OR_PART` on reconnect." That is not the
+> mechanism. Reproduced directly against a dead broker:
+> ```
+> Producer({'message.timeout.ms': 3000})
+> → KafkaError{code=_MSG_TIMED_OUT, "Local: Message timed out"}
+> ```
+> The message sits in the **local queue and keeps retrying** for
+> `message.timeout.ms`, then is dropped as `_MSG_TIMED_OUT`. (That first
+> observation was also amplified by an earlier `down -v` that had destroyed the
+> topic — a steady-state outage behaves differently.)
+>
+> The honest version is the stronger interview answer: a *short* outage is
+> invisibly survived by the retry buffer. The event is lost when either the retry
+> window expires **or the process exits** — and that buffer is memory, so a
+> deploy or crash during the outage loses it with no trace. The defensible claim
+> is narrower and sharper: **a dual write has no atomicity, so a window exists
+> where Postgres commits and the event does not, and no client-side retry closes
+> it.**
 
 ### 🧪 Testing — every step, confirmed
 ```bash
@@ -2900,14 +2919,236 @@ murmur2-partitioned); flush on shutdown; the Pub/Sub→Kafka swap is invisible t
 the API contract; dual-write hole felt live. Redis-publish kept in git history.
 **Next:** Day 32 — consumer + replay (the dead broker's junk becomes the payoff).
 ---
+## Day 32 — Kafka Consumer: order.dispatched → notifications (at-least-once) — DONE ✅
 
-## Day 32 — Consumer
-**Goal:** a Kafka consumer replaces the Pub/Sub worker.
-- `app/workers/notification_consumer.py`: `group.id="notifications"`, `auto.offset.reset="earliest"`, poll loop.
+**Goal:** consume `order.dispatched` with a real consumer group, process each
+event, and commit AFTER processing → at-least-once delivery. Replaces the Day-20
+Redis Pub/Sub worker (kept in repo as the "before").
 
-**Prove durability (the Day-20 flaw, now fixed):** stop the consumer, dispatch, restart → it **replays the missed event from its offset**. This is the concrete payoff of the Kafka migration.
+Shipped in three commits, deliberately — the deliverable, then each fix, so the
+reasoning is visible in the history the way Day 31's Redis→Kafka swap is:
 
-**✅** Producer + consumer working; missed-while-down events replay.
+| commit | what |
+|---|---|
+| `2187c48` | the consumer: poll → process → commit-after |
+| `5cdb214` | topic from the enum, not a string literal |
+| `b779009` | dead-letter queue + graceful SIGTERM shutdown |
+
+### The file: `app/workers/notification_consumer.py`
+
+Config that carries the guarantee:
+
+```python
+{
+  "bootstrap.servers": settings.kafka_bootstrap,
+  "group.id": "notifications",
+  "auto.offset.reset": "earliest",   # cold-start FALLBACK only (no committed offset)
+  "enable.auto.commit": False,       # manual commit → the ordering is ours
+}
+```
+
+The loop, in the order that matters:
+
+```
+poll(1.0)                      # blocks ≤1s, returns ONE msg or None
+  ├─ None            → continue
+  ├─ .error()        → EOF? continue : log + continue
+  └─ real message
+       ├─ PROCESS  (handle_event)          ← may raise
+       │    └─ raised? → DLQ + flush → only then fall through to commit
+       └─ COMMIT   (commit(message=msg))   ← commits msg.offset()+1
+```
+
+**Key decisions (why):**
+- `enable.auto.commit=False` + commit **after** the handler is the at-least-once
+  contract. Autocommit fires on a timer regardless of whether processing
+  finished, silently degrading this to at-most-once.
+- `auto.offset.reset=earliest` is a cold-start fallback, not a per-poll setting;
+  ignored the moment an offset is committed. (Corollary felt on Day 32:
+  `docker compose down -v` destroys committed offsets, so the group cold-starts
+  and replays the whole topic — indistinguishable from a replay *bug* if you
+  weren't the one who ran it.)
+- `poll()` three-way guard: None / `.error()` / real message. A non-None return
+  can be an event rather than data.
+- **Topic from `Topic.ORDER_DISPATCHED`, never a literal.** Day 31 added that enum
+  precisely because a typo'd literal auto-creates a silent phantom topic and the
+  consumer then waits forever on the wrong log — and the consumer is the half of
+  the system that warning was written about. Producer and consumer now resolve the
+  same enum and cannot drift.
+- Kept `app/workers/notification_worker.py` (Redis Pub/Sub) as the "before",
+  mirroring Day 31's commit preservation.
+
+### Poison pill → dead-letter queue ⭐ (the missing half of at-least-once)
+
+The first cut ran the handler outside any `try`. That is not a small omission:
+at-least-once plus commit-after **necessarily** means a message that can never be
+processed can never be skipped. One malformed payload killed the process before
+the commit, the restart re-read the same message, and the loop never advanced.
+
+Proven, three consecutive runs on one partition:
+
+```
+RUN 1  [notify] order 1 …(offset 0)     ← good, committed
+       JSONDecodeError: Expecting value ← poison, crash
+RUN 2  JSONDecodeError: Expecting value ← same message
+RUN 3  JSONDecodeError: Expecting value ← forever
+```
+
+The blast radius is wider than the bad message: a **valid** event queued behind
+it at the next offset was never delivered and never would be. With 3 partitions
+keyed by `order_id`, one bad event kills ~⅓ of all notifications.
+
+**And lag monitoring does not show it.** `--describe` on the wedged group prints
+no row at all for the blocked partition, because a partition with no committed
+offset has no lag to report. The dashboard reads "LAG 0, healthy" while a third
+of the topic is stuck.
+
+The fix — park it, don't drop it:
+
+```python
+except Exception as exc:
+    logger.exception("unprocessable message → DLQ (partition %s, offset %s)", …)
+    if not _to_dead_letter(msg, exc):
+        logger.critical("DLQ publish UNCONFIRMED — stopping without committing")
+        break
+consumer.commit(message=msg)
+```
+
+**`_to_dead_letter` flushes before returning True, and that ordering is the whole
+point.** Committing on an *unacked* DLQ publish would advance past the message
+with no copy of it anywhere — the one way this design can actually lose data. If
+the flush is unconfirmed the worker stops without committing, so the message is
+redelivered rather than silently dropped. (`flush_producer()` now returns the
+undelivered count so the caller can tell durable from dropped.)
+
+The DLQ record carries enough to debug without the original log:
+
+```json
+{"original_topic": "order.dispatched", "partition": 0, "offset": 1, "key": "2",
+ "raw_value": "NOT-JSON-AT-ALL",
+ "error": "JSONDecodeError: Expecting value: line 1 column 1 (char 0)",
+ "failed_at": 1785123737.2}
+```
+
+`order.dispatched.dlq` is declared in `kafka-init` alongside the main topic —
+infrastructure, not an auto-create side effect.
+
+### Graceful shutdown — SIGTERM is not KeyboardInterrupt ⭐
+
+`except KeyboardInterrupt` catches **SIGINT** (Ctrl-C) only. `docker compose stop`,
+`docker stop` and Kubernetes all send **SIGTERM**, which Python does *not* convert
+into KeyboardInterrupt — the process dies mid-loop, `finally` never runs, and
+`consumer.close()` is never called. The group then holds the dead member's
+partitions until `session.timeout.ms` expires.
+
+**Measured cost, from the consumer's own log timestamps:**
+
+```
+joined   : 01:01:18.2
+delivered: 01:02:02.9
+GAP = 44.7s      ← vs librdkafka's 45s session.timeout.ms default
+```
+
+A replacement instance sat idle for three quarters of a minute doing nothing.
+Uncaught, that is *every deploy* once this is containerised — and it presents as
+"Kafka is broken", not as a signal-handling bug.
+
+Fix: a handler for both signals that flips a `running` flag, so the loop finishes
+its current message and exits through `finally`.
+
+```
+SIGINT  → "SIGINT received — finishing current message, then stopping" → "Consumer closed cleanly."
+SIGTERM → "SIGTERM received — …"                                        → "Consumer closed cleanly."
+```
+
+### Run (hybrid mode)
+
+```bash
+docker compose up -d db redis kafka migrate kafka-init
+docker compose ps -a | grep -E 'migrate|kafka-init'   # both Exited (0)
+
+# T1 — consumer (host)
+python -m app.workers.notification_consumer
+# T2 — producer (host uvicorn); stop the api container first
+docker compose stop api && uvicorn app.main:app --reload --port 8000
+```
+
+### 🧪 Testing — every claim, confirmed live
+
+```bash
+# 1. end-to-end: dispatch → topic → consumer
+curl -s -X POST localhost:8000/orders/dispatch
+#    → {"dispatched":{"order_id":4,"rider_id":4}}
+#    → [notify] order 4 → rider 4 (partition 1, offset 0)
+
+# 2. read ≠ committed — describe BEFORE the consumer runs
+docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:19092 --describe --group notifications
+#    before: the event's partition has NO ROW (no committed offset)
+#    after : CURRENT-OFFSET 1  LOG-END-OFFSET 1  LAG 0
+
+# 3. at-least-once — crash BETWEEN process and commit, then restart
+#    (patch commit() via a delegating proxy; cimpl.Consumer is immutable
+#     so assigning Consumer.commit silently fails and proves nothing)
+#    RUN A  [notify] order 99 (offset 0) → CRASH before commit
+#    RUN B  [notify] order 99 (offset 0) ← RE-DELIVERED
+#    RUN C  (silent)                     ← offset committed
+
+# 4. poison pill → DLQ, and the message BEHIND it gets through
+#    [notify] order 1 (offset 0)
+#    unprocessable message → DLQ (partition 0, offset 1)
+#    [notify] order 3 (offset 2)   ← previously unreachable
+#    group: CURRENT-OFFSET 3  LOG-END-OFFSET 3  LAG 0
+
+# 5. both signals drain cleanly
+timeout -s TERM 8 python -m app.workers.notification_consumer   # "Consumer closed cleanly."
+timeout -s INT  8 python -m app.workers.notification_consumer   # "Consumer closed cleanly."
+```
+
+**Plan-correction / notes:**
+- Startup warning seen once: producer `Failed to acquire idempotence PID —
+  Coordinator load in progress: retrying`. Transient (`retrying`, not `failed`) —
+  dispatched too soon after broker boot, before the transaction coordinator
+  finished loading. Self-healed; event delivered. Don't hammer a broker in its
+  first seconds after `up`.
+- The `_PARTITION_EOF` branch is **dead code as configured**:
+  `enable.partition.eof` defaults to `false` in librdkafka. Measured with a
+  control — default: 0 EOF events; `enable.partition.eof=True`: 3 (one per
+  partition). The *outer* `msg.error()` guard is live and necessary; only the EOF
+  sub-branch is unreachable. Say it that way in an interview ("I guard it even
+  though it's off by default, since enabling it is one line") rather than
+  implying you watched it fire.
+- Verifying a claim needs a **working control**. Three of the first-pass
+  measurements were wrong: a `Consumer.commit` monkeypatch that silently failed
+  (immutable extension type) turned a first delivery into a fake "redelivery"; a
+  backgrounded process inherits SIGINT ignored, which faked a broken Ctrl-C path;
+  and a piped `timeout` measured the timeout, not the event. If the control
+  doesn't fail when it should, the experiment proved nothing.
+
+### Honest scope (tracked, NOT done)
+1. Consumer runs as a standalone script (`python -m …`), not a compose-managed
+   service → home: **Day 33** (add a `notification-worker` service). SIGTERM is
+   already handled, so containerising it no longer ships the 45s stall.
+2. Producer test coverage still zero (Day 31 report §2) — deferred twice now →
+   home: **Day 34**, with the idempotency work. Concrete evidence it matters:
+   `pytest` dispatches real orders, and dispatch publishes for real, so **the
+   test suite writes phantom events into the live `order.dispatched` topic**
+   (traced 4 stray events to one pytest run). The fixture that mocks
+   `publish_event` fixes both the coverage gap and the pollution.
+3. Nothing consumes `order.dispatched.dlq` yet — messages park there and wait for
+   a human. A replay tool (read DLQ → fix → produce back) is the natural Day 33+
+   follow-up.
+4. Commit is synchronous (correctness-first). Async commit (`asynchronous=True`)
+   is the throughput optimisation with a durability trade-off — interview talking
+   point, not built.
+
+### ✅ End of Day
+`order.dispatched` is consumed by a real consumer group with at-least-once
+delivery proven by a crash injected in the PROCESS→COMMIT gap. Unprocessable
+messages are parked in a dead-letter topic instead of wedging a partition, and
+the DLQ publish is durable *before* the offset advances. Both shutdown signals
+drain the group cleanly. **Next:** Day 33 — multiple consumer groups (and the
+worker becomes a real compose service).
 
 ---
 

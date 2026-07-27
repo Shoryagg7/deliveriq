@@ -2489,17 +2489,30 @@ commit succeeds, then the process dies or the produce times out → order ASSIGN
 Postgres, event never delivered, nothing rolls back.
 
 **Proven live (the break-it):** dispatched with the broker *stopped* → API returned
-`200 OK`, order ASSIGNED, rider BUSY. Restarted the broker; the buffered event
-retried into the reboot gap and died on `UNKNOWN_TOPIC_OR_PART` (topic metadata
-not yet reloaded). Consumer read `order.dispatched --from-beginning`: **only the
-recovered order present, the outage order's event gone.** Postgres showed both
-ASSIGNED and could not tell which one never reached Kafka.
+`200 OK`, order ASSIGNED, rider BUSY — `produce()` does no I/O, so it cannot fail.
+Consumer read `order.dispatched --from-beginning`: **only the recovered order
+present, the outage order's event gone.** Postgres showed both ASSIGNED and could
+not tell which one never reached Kafka.
+
+**The mechanism, measured:** the event does not fail on reconnect — it sits in the
+producer's **in-memory queue and keeps retrying** for `message.timeout.ms`, then is
+dropped:
+
+```
+Producer({'message.timeout.ms': 3000}) → dead broker
+→ KafkaError{code=_MSG_TIMED_OUT, "Local: Message timed out"}
+```
+
+So a *short* outage is invisibly survived by the retry buffer. The event is lost
+when the retry window expires **or the process exits** — and that buffer is memory,
+so a deploy or crash during the outage loses it with no trace at all.
 
 **Soundbite:** "Dispatch is a dual write — Postgres commit then Kafka produce, no
 shared transaction. I publish post-commit so a rollback can't leave a phantom
 event, but any crash in the gap leaves an order assigned with no event published
 and nothing to undo it. I proved it: dispatched with the broker down, got a 200,
-and watched that event die on reconnect while Postgres still said ASSIGNED. The fix
+and the event sat retrying in a memory buffer until it timed out — Postgres still
+said ASSIGNED, and nothing anywhere knew the notification was never sent. The fix
 is transactional outbox — write the event to an outbox table inside the order's
 transaction, then a relay tails it and publishes. The event becomes as durable as
 the state change because it *is* the state change. I scoped it out for a portfolio
@@ -2511,12 +2524,14 @@ happened. Neither pre- nor post-commit is correct for two independent systems;
 that's the whole reason the outbox pattern exists. Anyone who thinks reordering the
 two lines solves it hasn't seen the problem.
 
-**Honest scope:** the `UNKNOWN_TOPIC_OR_PART` death was partly amplified by an
-earlier `down -v` that destroyed the topic. In a steady-state outage (topic already
-durable in the volume) the buffered event more likely self-heals on reconnect. The
-precise, defensible claim is narrower and stronger: *a dual write has no atomicity,
-so a failure window exists where Postgres commits and the event doesn't, and no
-client-side retry closes it.* That window is real and measured.
+**Honest scope:** an earlier telling of this said the event died on
+`UNKNOWN_TOPIC_OR_PART` — that was wrong, and amplified by a `down -v` that had
+destroyed the topic. Corrected above to the measured `_MSG_TIMED_OUT` behaviour.
+The precise, defensible claim is narrower and stronger: *a dual write has no
+atomicity, so a failure window exists where Postgres commits and the event doesn't,
+and no client-side retry closes it.* That window is real and measured — and the
+"durability" covering it is a process-local memory buffer, which is the actual
+argument for the outbox.
 
 ---
 
@@ -2584,6 +2599,118 @@ config (`alembic/env.py` reads `DATABASE_URL`) can silently override a hardcoded
 
 ---
 
+# DeliverIQ — Interview Prep, Part 17 (Day 32)
+
+## 63. At-Least-Once Is a Commit *Placement*, Not a Setting ⭐
+
+**Concept (why).** The consumer polls, processes, then commits. Nothing about that
+is configuration — the guarantee lives in the *order of two lines*. Commit after
+the handler: a crash in between re-delivers the message (at-least-once). Commit
+before it: a crash in between skips the message forever (at-most-once). Turning on
+`enable.auto.commit` hands that ordering to a timer that fires whether or not
+processing finished, which silently converts a correct at-least-once worker into a
+lossy at-most-once one.
+
+**Proven, not assumed.** I injected a crash *between* PROCESS and COMMIT:
+
+```
+RUN A  [notify] order 99 (offset 0)   → killed before commit landed
+RUN B  [notify] order 99 (offset 0)   ← RE-DELIVERED
+RUN C  (silent)                        ← offset now committed
+```
+
+**Soundbite (~30s).** "At-least-once isn't a flag I set, it's where I put the
+commit. I disable auto-commit and commit after the handler returns, so a crash in
+the gap re-delivers rather than skips. I proved it by killing the process between
+processing and committing — the message came back on restart, then went quiet once
+the offset landed. The cost is that duplicates are now *my* problem, which is why
+the handler has to be idempotent."
+
+**Gotcha.** `commit(message=msg)` commits `msg.offset() + 1` — the *next* offset to
+read, not the one just read. A consumer group's CURRENT-OFFSET is always "where I'd
+resume", which is why it reads one higher than the last message you saw.
+
+## 64. The Poison Pill — the Half of At-Least-Once Nobody Mentions ⭐
+
+**Concept (why).** At-least-once + commit-after has a corollary that follows
+inescapably: **a message that can never be processed can never be skipped.** One
+malformed payload throws, the process dies before the commit, the restart re-reads
+the same message, and the partition never advances again. Every valid event queued
+behind it on that partition is never delivered.
+
+**And your lag dashboard says everything is fine.** `kafka-consumer-groups
+--describe` prints *no row at all* for a partition with no committed offset — so
+the wedged partition doesn't appear, and the remaining partitions honestly report
+LAG 0. Health is green while a third of the topic is stuck.
+
+**Soundbite (~30s).** "Commit-after gives me at-least-once, but it also means a
+message I can't parse blocks its partition forever — and the lag metric won't show
+it, because a partition with no committed offset has no lag row. So the handler is
+wrapped: anything that throws goes to a dead-letter topic with its original
+partition, offset, key, raw bytes and the exception, and then the offset advances.
+The subtle part is ordering — I flush the DLQ publish before committing, because
+committing on an unacked publish would step past the message with no copy of it
+anywhere. If the flush isn't confirmed, the worker stops instead of committing."
+
+**Gotcha.** A DLQ that you commit *optimistically* is worse than no DLQ: it converts
+"stuck but recoverable" into "silently gone." The flush-then-commit ordering is the
+entire safety property. And a DLQ nobody reads is a landfill — the follow-up work
+is a replay tool, not just the topic.
+
+## 65. SIGTERM Is Not KeyboardInterrupt ⭐
+
+**Concept (why).** `except KeyboardInterrupt` catches **SIGINT** — Ctrl-C. Every
+orchestrator (`docker stop`, `docker compose stop`, Kubernetes) stops a container
+with **SIGTERM**, and Python's default SIGTERM disposition terminates the process
+outright: no exception, no `finally`, no `consumer.close()`. The member never
+leaves the group, so the coordinator keeps its partitions assigned until
+`session.timeout.ms` expires.
+
+**Measured, from the consumer's own log timestamps:**
+
+```
+joined   : 01:01:18.2
+delivered: 01:02:02.9
+GAP = 44.7s        ← librdkafka's session.timeout.ms default is 45s
+```
+
+**Soundbite (~30s).** "My worker caught KeyboardInterrupt, which only covers Ctrl-C.
+Docker sends SIGTERM, so in a container the process was being killed mid-loop and
+never leaving the consumer group — the replacement instance then sat idle for 45
+seconds waiting for the session timeout on every deploy. It looks like Kafka is
+broken; it's actually an unhandled signal. I added a handler for both signals that
+flips a flag, so the loop finishes its current message and exits through `finally`
+where `close()` runs."
+
+**Gotcha.** This is invisible in local dev, because Ctrl-C is SIGINT and works
+perfectly. It only appears the day you containerise the worker — which is exactly
+why the signal handler belongs in the *same* change as the compose service, not
+after it.
+
+## 66. Self-Test — Day 32 (answer out loud)
+1. Which single line placement decides at-most-once vs at-least-once, and why does
+   `enable.auto.commit=true` silently pick the wrong one?
+2. `commit(message=msg)` on a message at offset 7 — what number is stored, and why?
+3. A message throws every time it's processed. Trace what happens to (a) that
+   message, (b) the partition, (c) the valid messages behind it, (d) the lag metric.
+4. Why must the DLQ publish be *flushed* before the commit? What exactly is lost if
+   you commit first?
+5. Your worker restarts cleanly with Ctrl-C but stalls ~45s per restart in Docker.
+   What's the bug, and what's the number 45 actually measuring?
+6. `auto.offset.reset=earliest` — when does it apply, and when is it ignored?
+7. Why does `docker compose down -v` make a consumer group look like it has a
+   replay bug?
+8. Cross-partition, is event order preserved? What *is* guaranteed, and what does
+   that mean for keying by `order_id`?
+9. You need to prove redelivery happens. Why is monkeypatching
+   `Consumer.commit` not a valid way to do it?
+
+*Shaky on any? #3 and #4 are the ones that show you've actually run a consumer in
+anger rather than read about one.*
+
+---
+
+
 ## §63 — Reproducible-From-Empty: One-Shot Init Jobs & Real Readiness Gates
 
 **Concept (why).** A `docker compose down -v` wipes all data volumes. "Clean and
@@ -2635,8 +2762,81 @@ first-init only.
   schema evolves, must replay on every environment → migrations. DB existence is
   a one-time bootstrap → init-script.)
 ---
+## §52 — Kafka Consumer: Groups, Offsets & At-Least-Once Delivery
 
+**Concept (why).** A consumer group is a durable, resumable reader position.
+Kafka stores each group's committed offset per partition in the internal
+`__consumer_offsets` topic — so a consumer that crashes resumes where it last
+COMMITTED, not where it last read. Messages wait in the append-only log (until
+retention expires), so a consumer being down delays delivery instead of
+destroying it — the fix for Redis Pub/Sub's broadcast-and-forget flaw. The same
+group abstraction load-balances partitions across members: N partitions split
+across group members, one partition per member max.
+
+**Delivery semantics = commit ordering (the core decision).**
+- Commit AFTER processing → at-least-once. Crash in the gap replays the message.
+  Loss impossible, duplicate possible. (DeliverIQ's choice — a duplicate delivery
+  notification beats a missing one.)
+- Commit BEFORE processing → at-most-once. Crash in the gap skips it forever.
+  Duplicate impossible, loss possible.
+- Exactly-once is NOT a checkbox: you get it via an idempotent consumer or
+  transactional writes. (Day 34 makes the handler idempotent → duplicates become
+  harmless → effectively-once.)
+
+**Soundbite (~30s).** "A consumer group is a durable reader position — Kafka
+stores committed offsets per partition, so a crashed consumer resumes exactly
+where it committed and messages wait in the log rather than being lost. Delivery
+semantics come down to commit ordering: commit after processing is at-least-once,
+safe against loss but replays on crash; commit before is at-most-once. I chose
+at-least-once with manual commits and disabled autocommit, because autocommit
+fires on a timer regardless of whether processing finished — which silently breaks
+the guarantee. Exactly-once I'd get by making the handler idempotent downstream."
+
+**Gotcha 1 — read ≠ committed.** The offset advances only on COMMIT, not on read.
+A message can be fully processed but uncommitted; on restart it replays. Proven
+live: consumer read order 1, `kafka-consumer-groups --describe` still showed
+CURRENT-OFFSET `-` / LAG undefined. After commit: CURRENT-OFFSET 1, LAG 0, and a
+restart went silent.
+
+**Gotcha 2 — autocommit breaks at-least-once silently.** `enable.auto.commit=true`
+commits on a ~5s timer independent of your handler. It can commit an offset before
+processing finishes → at-most-once by accident. Manual commit
+(`enable.auto.commit=false` + `consumer.commit(message=msg)` after processing) is
+what makes the semantics real.
+
+**Gotcha 3 — `auto.offset.reset` is a fallback, not a default.** It only applies
+when the group has NO committed offset (first run ever). Once an offset is
+committed, it's ignored. People think it controls "where do I start" every time;
+it's the cold-start rule only.
+
+**Gotcha 4 — poll() non-None ≠ message.** `poll()` can return an error/event
+object (e.g. `_PARTITION_EOF` = "read to end of partition"). Calling `.value()`
+on it crashes. Always check `msg.error()` before treating it as data.
+
+**Gotcha 5 — LAG is undefined, not "1", when no offset is committed.** LAG =
+LOG-END-OFFSET − CURRENT-OFFSET. With no committed offset, there's nothing to
+subtract from → LAG shows `-`. LAG becomes a real number only after the first
+commit. In production, rising LAG = consumers can't keep up with producers; it's
+THE consumer health metric (Day 36 Prometheus target).
+
+**Self-test.**
+- Q1: Consumer processes msg 5, crashes before commit, restarts. Which message
+  next, and why?  (5 again — offset reflects last commit, not last read →
+  at-least-once replay.)
+- Q2: You want no duplicate notifications ever. Which commit ordering, and what
+  do you give up?  (Commit before processing = at-most-once; you risk losing a
+  notification on a crash in the gap.)
+- Q3: Two consumers, group `notifications`, 3-partition topic. A third joins the
+  same group. What does the third do?  (Nothing — only 3 partitions, so one
+  member sits idle; max parallelism = partition count.)
+- Q4: Same topic, but the third consumer uses group `analytics`. Now what?
+  (It gets a full independent copy of every message with its own offsets —
+  cross-group is fan-out, not sharing.)
+- Q5: `describe` shows CURRENT-OFFSET 5, LOG-END-OFFSET 5, but your handler never
+  ran for msg 4. What ordering bug does this smell like?  (Commit-before-process:
+  offset advanced past a message whose processing was skipped/crashed.)
 ---
+
 ---
 ---
 ---
