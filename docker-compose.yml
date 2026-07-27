@@ -50,9 +50,14 @@ services:
   kafka-init:                                                   # ← added (one-shot, mirrors `migrate`)
     image: apache/kafka:4.1.2
     command: >
+      sh -c "
       /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092
       --create --if-not-exists --topic order.dispatched
+      --partitions 3 --replication-factor 1 &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092
+      --create --if-not-exists --topic order.dispatched.dlq
       --partitions 3 --replication-factor 1
+      "
     depends_on:
       kafka:
         condition: service_healthy
