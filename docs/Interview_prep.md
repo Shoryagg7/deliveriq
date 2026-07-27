@@ -2711,7 +2711,7 @@ anger rather than read about one.*
 ---
 
 
-## §63 — Reproducible-From-Empty: One-Shot Init Jobs & Real Readiness Gates
+## 67. Reproducible-From-Empty: One-Shot Init Jobs & Real Readiness Gates ⭐ (Day 31)
 
 **Concept (why).** A `docker compose down -v` wipes all data volumes. "Clean and
 ready" is only true if EVERY required setup artifact is rebuilt by code on the
@@ -2761,82 +2761,88 @@ first-init only.
   why not both in init-scripts?  (Init-scripts run once on fresh volume only;
   schema evolves, must replay on every environment → migrations. DB existence is
   a one-time bootstrap → init-script.)
----
-## §52 — Kafka Consumer: Groups, Offsets & At-Least-Once Delivery
-
-**Concept (why).** A consumer group is a durable, resumable reader position.
-Kafka stores each group's committed offset per partition in the internal
-`__consumer_offsets` topic — so a consumer that crashes resumes where it last
-COMMITTED, not where it last read. Messages wait in the append-only log (until
-retention expires), so a consumer being down delays delivery instead of
-destroying it — the fix for Redis Pub/Sub's broadcast-and-forget flaw. The same
-group abstraction load-balances partitions across members: N partitions split
-across group members, one partition per member max.
-
-**Delivery semantics = commit ordering (the core decision).**
-- Commit AFTER processing → at-least-once. Crash in the gap replays the message.
-  Loss impossible, duplicate possible. (DeliverIQ's choice — a duplicate delivery
-  notification beats a missing one.)
-- Commit BEFORE processing → at-most-once. Crash in the gap skips it forever.
-  Duplicate impossible, loss possible.
-- Exactly-once is NOT a checkbox: you get it via an idempotent consumer or
-  transactional writes. (Day 34 makes the handler idempotent → duplicates become
-  harmless → effectively-once.)
-
-**Soundbite (~30s).** "A consumer group is a durable reader position — Kafka
-stores committed offsets per partition, so a crashed consumer resumes exactly
-where it committed and messages wait in the log rather than being lost. Delivery
-semantics come down to commit ordering: commit after processing is at-least-once,
-safe against loss but replays on crash; commit before is at-most-once. I chose
-at-least-once with manual commits and disabled autocommit, because autocommit
-fires on a timer regardless of whether processing finished — which silently breaks
-the guarantee. Exactly-once I'd get by making the handler idempotent downstream."
-
-**Gotcha 1 — read ≠ committed.** The offset advances only on COMMIT, not on read.
-A message can be fully processed but uncommitted; on restart it replays. Proven
-live: consumer read order 1, `kafka-consumer-groups --describe` still showed
-CURRENT-OFFSET `-` / LAG undefined. After commit: CURRENT-OFFSET 1, LAG 0, and a
-restart went silent.
-
-**Gotcha 2 — autocommit breaks at-least-once silently.** `enable.auto.commit=true`
-commits on a ~5s timer independent of your handler. It can commit an offset before
-processing finishes → at-most-once by accident. Manual commit
-(`enable.auto.commit=false` + `consumer.commit(message=msg)` after processing) is
-what makes the semantics real.
-
-**Gotcha 3 — `auto.offset.reset` is a fallback, not a default.** It only applies
-when the group has NO committed offset (first run ever). Once an offset is
-committed, it's ignored. People think it controls "where do I start" every time;
-it's the cold-start rule only.
-
-**Gotcha 4 — poll() non-None ≠ message.** `poll()` can return an error/event
-object (e.g. `_PARTITION_EOF` = "read to end of partition"). Calling `.value()`
-on it crashes. Always check `msg.error()` before treating it as data.
-
-**Gotcha 5 — LAG is undefined, not "1", when no offset is committed.** LAG =
-LOG-END-OFFSET − CURRENT-OFFSET. With no committed offset, there's nothing to
-subtract from → LAG shows `-`. LAG becomes a real number only after the first
-commit. In production, rising LAG = consumers can't keep up with producers; it's
-THE consumer health metric (Day 36 Prometheus target).
-
-**Self-test.**
-- Q1: Consumer processes msg 5, crashes before commit, restarts. Which message
-  next, and why?  (5 again — offset reflects last commit, not last read →
-  at-least-once replay.)
-- Q2: You want no duplicate notifications ever. Which commit ordering, and what
-  do you give up?  (Commit before processing = at-most-once; you risk losing a
-  notification on a crash in the gap.)
-- Q3: Two consumers, group `notifications`, 3-partition topic. A third joins the
-  same group. What does the third do?  (Nothing — only 3 partitions, so one
-  member sits idle; max parallelism = partition count.)
-- Q4: Same topic, but the third consumer uses group `analytics`. Now what?
-  (It gets a full independent copy of every message with its own offsets —
-  cross-group is fan-out, not sharing.)
-- Q5: `describe` shows CURRENT-OFFSET 5, LOG-END-OFFSET 5, but your handler never
-  ran for msg 4. What ordering bug does this smell like?  (Commit-before-process:
-  offset advanced past a message whose processing was skipped/crashed.)
----
 
 ---
----
----
+
+## 68. `poll()` Returns Three Things, Not One ⭐
+
+**Concept (why).** `consumer.poll(timeout)` has a three-way return, and only one of
+them is data:
+
+```python
+msg = consumer.poll(1.0)
+if msg is None:        continue      # timeout expired, nothing available
+if msg.error():        ...           # an EVENT or an error, not a payload
+                                     # ↓ only now is msg.value() safe
+```
+
+Treating "not None" as "I have a message" is the mistake: `.value()` on an event
+object is a crash, and the code path that hits it is the rare one, so it survives
+testing and fails later.
+
+**Soundbite (~20s).** "`poll()` returns None, an error/event, or a message — three
+cases, and I branch on all three before touching `.value()`. The middle case is the
+one people miss because it's rare in dev: a non-None return isn't necessarily
+data."
+
+**Gotcha — the EOF branch is dead code as configured, and saying otherwise is a
+trap.** The usual example of a non-data event is `_PARTITION_EOF` ("you've read to
+the end of this partition"). But `enable.partition.eof` defaults to **false** in
+librdkafka, so that event never arrives unless you opt in. Measured, with a
+control:
+
+```
+DEFAULT (our config)         msgs=3  EOF_events=0
+enable.partition.eof=True    msgs=3  EOF_events=3   ← one per partition
+```
+
+So the honest framing is: *the outer `msg.error()` check is live and necessary
+— real errors do come through it. The `_PARTITION_EOF` sub-branch is defensive
+code for a signal we haven't enabled, and enabling it is one line.* Claiming you
+watched EOF fire, when the default says otherwise, is exactly the kind of detail an
+interviewer who runs Kafka will catch.
+
+## 69. A Test Without a Working Control Proves Nothing ⭐
+
+**Concept (why).** *(This answers §66 Q9.)* Verifying Day 32's at-least-once claim
+meant proving a message is re-delivered after a crash between processing and
+commit. The obvious approach — monkeypatch `Consumer.commit` to kill the process —
+**silently does nothing**:
+
+```python
+Consumer.commit = _die
+# TypeError: cannot set 'commit' attribute of immutable type 'cimpl.Consumer'
+```
+
+`confluent_kafka.Consumer` is a C extension type and its attributes can't be
+reassigned. The patch failed, the consumer committed normally, and the "redelivery"
+observed on the next run was simply a **first** delivery. The experiment produced a
+green result and proved nothing. The fix is a delegating proxy, which works because
+it's an ordinary Python object:
+
+```python
+class DiesOnCommit:
+    def __init__(self, inner): self._inner = inner
+    def __getattr__(self, name): return getattr(self._inner, name)
+    def commit(self, *a, **k): os._exit(1)
+```
+
+**Soundbite (~30s).** "I proved at-least-once by crashing the consumer between
+processing and committing, and the message came back on restart. But my first
+attempt was wrong in a way that looked right — I monkeypatched the commit method on
+a C extension type, which silently isn't allowed, so nothing crashed and I was
+watching a first delivery, not a redelivery. Now I always ask what my control is:
+if the negative case doesn't fail when it should, a passing test isn't evidence."
+
+**Gotcha — three ways a green result lied on this one day.**
+1. `Consumer.commit = …` on an immutable extension type → the injected fault never
+   fired.
+2. A **backgrounded** process inherits `SIGINT` ignored, so "Ctrl-C is broken too"
+   was an artifact of `&`, not of the code. (Use `timeout -s INT` in the
+   foreground.)
+3. Piping a timed run into `grep` measured the *timeout window*, not the event —
+   "91s" was just the `timeout 90`. Read the timestamps the process itself logged.
+
+Each of these produced a confident, wrong conclusion. The habit that catches all
+three: **run the control** — make the thing you think you're detecting *not*
+happen, and confirm your test notices.
