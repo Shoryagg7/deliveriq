@@ -65,7 +65,7 @@ def main():
     print(f"\nsuccessful dispatches: {len(ok)}")
     print(f"failed (expected for the {N_DISPATCH - N_ORDERS}+ extra calls): "
           f"{[(p, c, b.get('error') if isinstance(b, dict) else b) for p, c, b in failed]}")
-    print(f"assigned pairs: {sorted(zip(oids, rids))}")
+    print(f"assigned pairs: {sorted(zip(oids, rids, strict=True))}")
 
     dup_orders = len(oids) != len(set(oids))
     dup_riders = len(rids) != len(set(rids))

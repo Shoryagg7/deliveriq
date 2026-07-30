@@ -58,7 +58,7 @@ jobs:
         run: alembic upgrade head
 
       - name: Lint
-        run: ruff check app tests
+        run: ruff check app tests scripts
 
       # Host-side pytest against containerised infra — the same hybrid setup
       # used locally, so a green CI run means the local workflow genuinely works.
