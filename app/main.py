@@ -11,6 +11,7 @@ from app.core.exceptions import DeliverIQError
 from app.core.kafka_producer import flush_producer, get_producer
 from app.core.redis_client import redis_client
 from app.core.logging_config import setup_logging
+from app.middleware.idempotency import idempotency_middleware
 from app.middleware.rate_limiter import rate_limit_middleware
 from app.middleware.request_id import request_id_middleware
 from app.models.order import Order  # noqa: F401
@@ -34,6 +35,12 @@ app = FastAPI(title="DeliverIQ", lifespan=lifespan)
 app.include_router(orders.router)
 app.include_router(riders.router)
 app.include_router(admin.router)
+# Middleware runs in REVERSE registration order, so this list reads
+# outermost-last. Effective order per request:
+#   request_id  -> rate_limit -> idempotency -> route
+# request_id outermost so every log line, including a 429, carries a trace id.
+# rate_limit before idempotency so a flood of replayed keys is still throttled.
+app.middleware("http")(idempotency_middleware)
 app.middleware("http")(rate_limit_middleware)
 app.middleware("http")(request_id_middleware)
 
