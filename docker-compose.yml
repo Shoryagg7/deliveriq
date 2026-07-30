@@ -95,6 +95,57 @@ services:
         condition: service_started
       kafka-init:                                               # ← changed: was `kafka: service_started`
         condition: service_completed_successfully
+
+  # --- Day 33: three groups, one topic, independent offsets -----------------
+  # Identical wiring; only the module (and so the group.id) differs. Each is a
+  # managed worker now, not a `python -m` in a spare terminal — which is why the
+  # SIGTERM handler matters: `docker compose stop` sends SIGTERM, and without it
+  # every restart stalls ~45s waiting out session.timeout.ms.
+  notification-worker:
+    build: .
+    command: python -m app.workers.notification_consumer
+    environment:
+      DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP: kafka:19092
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  analytics-worker:
+    build: .
+    command: python -m app.workers.analytics_consumer
+    environment:
+      DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP: kafka:19092
+    depends_on:
+      migrate:                       # writes to dispatch_events → needs schema
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  audit-worker:
+    build: .
+    command: python -m app.workers.audit_consumer
+    environment:
+      # This worker never touches Postgres, but Settings is one global object
+      # with database_url required — so every process must supply it or fail at
+      # import. Per-process config classes would fix that; noted, not done.
+      DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP: kafka:19092
+      AUDIT_LOG_PATH: /var/log/deliveriq/audit.log
+    volumes:
+      - auditdata:/var/log/deliveriq
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
 volumes:
   pgdata:
   kafkadata:
+  auditdata:
