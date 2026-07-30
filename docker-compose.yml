@@ -145,7 +145,39 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  # --- Days 36-37: observability -------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Local demo only. Anonymous viewing means a screenshot or a screen-share
+      # doesn't start with a login prompt.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      # Provisioned from the repo, so `down -v` cannot lose the dashboard.
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    depends_on:
+      - prometheus
+
 volumes:
   pgdata:
   kafkadata:
   auditdata:
+  promdata:
+  grafanadata:

@@ -1,0 +1,10 @@
+# Provisioned, not clicked. A datasource configured by hand lives only in the
+# container's volume and vanishes on `down -v`.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

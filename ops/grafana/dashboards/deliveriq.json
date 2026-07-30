@@ -1,0 +1,137 @@
+{
+  "uid": "deliveriq-main",
+  "title": "DeliverIQ — Service Overview",
+  "tags": ["deliveriq"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Dependencies up",
+      "description": "From /ready. 0 means that dependency failed its last probe.",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "deliveriq_dependency_up",
+          "legendFormat": "{{dependency}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red", "index": 0 } } },
+            { "type": "value", "options": { "1": { "text": "UP", "color": "green", "index": 1 } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null }, { "color": "green", "value": 1 }
+          ] }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" }
+    },
+    {
+      "type": "stat",
+      "title": "Request rate (req/s)",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        { "expr": "sum(rate(deliveriq_http_requests_total[1m]))", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 2 } },
+      "options": { "colorMode": "value", "graphMode": "area" }
+    },
+    {
+      "type": "stat",
+      "title": "Error rate (5xx %)",
+      "description": "The SLI you would actually alert on. `or vector(0)` matters: with no 5xx at all the numerator selector matches NO series, and an empty numerator makes the whole division empty — a healthy service would render as 'No data', indistinguishable from a broken dashboard.",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "100 * (sum(rate(deliveriq_http_requests_total{status=~\"5..\"}[5m])) or vector(0)) / clamp_min(sum(rate(deliveriq_http_requests_total[5m])), 0.001)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 2,
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "orange", "value": 1 },
+            { "color": "red", "value": 5 }
+          ] }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "none" }
+    },
+    {
+      "type": "stat",
+      "title": "p99 latency",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(deliveriq_http_request_duration_seconds_bucket[5m])) by (le))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 3 } },
+      "options": { "colorMode": "value", "graphMode": "area" }
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency percentiles (all routes)",
+      "description": "Quantiles are estimated from histogram buckets, so they can only be as precise as the bucket edges.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(deliveriq_http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum(rate(deliveriq_http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum(rate(deliveriq_http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Dispatch outcomes / s",
+      "description": "no_rider_available is a SUPPLY problem; no_pending_orders is a DEMAND problem. Opposite responses.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        { "expr": "sum by (outcome) (rate(deliveriq_dispatch_total[1m]))", "legendFormat": "{{outcome}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "lineWidth": 2, "fillOpacity": 10, "stacking": { "mode": "normal" } } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests by route",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "sum by (route) (rate(deliveriq_http_requests_total[1m]))", "legendFormat": "{{route}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "lineWidth": 2, "fillOpacity": 5 } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Kafka events: published vs delivered",
+      "description": "A persistent gap means the producer is enqueueing faster than the broker acks — the dual-write hole made visible.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        { "expr": "sum by (topic) (rate(deliveriq_kafka_events_published_total[1m]))", "legendFormat": "published {{topic}}", "refId": "A" },
+        { "expr": "sum by (topic, outcome) (rate(deliveriq_kafka_events_delivered_total[1m]))", "legendFormat": "{{outcome}} {{topic}}", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "fillOpacity": 5 } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Rate-limit rejections & idempotent replays / s",
+      "description": "Replays rising means clients are retrying — usually a symptom of latency or timeouts upstream.",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 20 },
+      "targets": [
+        { "expr": "rate(deliveriq_rate_limit_rejections_total[1m])", "legendFormat": "429 rejections", "refId": "A" },
+        { "expr": "rate(deliveriq_idempotent_replays_total[1m])", "legendFormat": "idempotent replays", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "lineWidth": 2, "fillOpacity": 5 } } }
+    }
+  ]
+}
