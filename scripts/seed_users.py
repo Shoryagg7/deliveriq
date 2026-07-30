@@ -18,6 +18,7 @@ from app.core.enums import UserRole
 from app.core.security import hash_password
 from app.models.rider import Rider
 from app.models.user import User
+from app.services.geohash_service import add_rider
 
 DEMO_USERS = [
     ("ops@deliveriq.io", "opspassword123", UserRole.OPS, False),
@@ -49,6 +50,12 @@ def main() -> None:
                     db.add(rider)
                     db.flush()  # need the id before linking
                 user.rider_id = rider.id
+                # Writing the row is only HALF of onboarding a rider. Matching
+                # reads the Redis geohash index, not the table, so a rider
+                # created straight through SQLAlchemy is AVAILABLE in Postgres
+                # and invisible to dispatch. POST /riders calls this; a script
+                # that bypasses the endpoint has to call it too.
+                add_rider(rider.id, rider.current_lat, rider.current_lon)
 
             db.commit()
             link = f" -> rider {user.rider_id}" if user.rider_id else ""
