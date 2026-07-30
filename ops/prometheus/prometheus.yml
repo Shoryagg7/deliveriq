@@ -1,0 +1,17 @@
+# Scrape config. 5s is aggressive for production (15-30s is normal) but makes a
+# live demo readable — a dashboard that updates twice a minute looks broken.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: deliveriq-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+        labels:
+          service: api
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

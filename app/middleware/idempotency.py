@@ -16,6 +16,7 @@ import redis
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
+from app.core.metrics import idempotent_replays_total
 from app.core.redis_client import redis_client
 
 logger = logging.getLogger("deliveriq")
@@ -52,6 +53,7 @@ async def idempotency_middleware(request: Request, call_next):
                     "message": "A request with this Idempotency-Key is still being processed.",
                 },
             )
+        idempotent_replays_total.inc()
         logger.info("idempotent replay for key=%s", key)
         return Response(
             content=record["body"].encode(),

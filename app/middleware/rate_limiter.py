@@ -6,6 +6,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
+from app.core.metrics import rate_limit_rejections_total
 from app.core.redis_client import redis_client
 
 logger = logging.getLogger("deliveriq")
@@ -80,6 +81,7 @@ async def rate_limit_middleware(request: Request, call_next):
         return await call_next(request)
 
     if result == "-1" or result == -1:
+        rate_limit_rejections_total.inc()
         return JSONResponse(
             status_code=429, content={"error": "Rate limit exceeded. Try again later."}
         )

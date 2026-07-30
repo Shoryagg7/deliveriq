@@ -5,6 +5,10 @@ import logging
 from confluent_kafka import Producer
 
 from app.core.config import settings
+from app.core.metrics import (
+    kafka_events_delivered_total,
+    kafka_events_published_total,
+)
 
 logger = logging.getLogger("deliveriq")
 
@@ -34,8 +38,10 @@ def get_producer() -> Producer:
 def _delivery_report(err, msg) -> None:
     """Called by librdkafka's background thread once the broker acks (or gives up)."""
     if err is not None:
+        kafka_events_delivered_total.labels(topic=msg.topic(), outcome="failed").inc()
         logger.error("kafka delivery FAILED topic=%s err=%s", msg.topic(), err)
     else:
+        kafka_events_delivered_total.labels(topic=msg.topic(), outcome="delivered").inc()
         logger.info(
             "kafka delivered topic=%s partition=%s offset=%s",
             msg.topic(),
@@ -53,6 +59,7 @@ def publish_event(topic: str, payload: dict, key: str | None = None) -> None:
         value=json.dumps(payload).encode(),
         callback=_delivery_report,
     )
+    kafka_events_published_total.labels(topic=topic).inc()
     producer.poll(0)  # serve delivery callbacks; does NOT block
 
 
