@@ -87,30 +87,30 @@ def _make_order(client, lat=28.6139, lon=77.2090):
     return r.json()["id"]
 
 
-def test_dispatch_assigns_rider(client):
-    rider_id = _make_rider(client)
-    order_id = _make_order(client)
+def test_dispatch_assigns_rider(ops_client):
+    rider_id = _make_rider(ops_client)
+    order_id = _make_order(ops_client)
 
-    r = client.post("/orders/dispatch")
+    r = ops_client.post("/orders/dispatch")
     assert r.status_code == 200
     assert r.json()["dispatched"] == {"order_id": order_id, "rider_id": rider_id}
 
     # order is now ASSIGNED
-    assert client.get(f"/orders/{order_id}").json()["status"] == "ASSIGNED"
+    assert ops_client.get(f"/orders/{order_id}").json()["status"] == "ASSIGNED"
 
 
-def test_dispatch_publishes_event(client, published_events):
+def test_dispatch_publishes_event(ops_client, published_events):
     """The publish is part of the dispatch contract, so assert on it.
 
     Without this, the autouse mock would only be silencing the producer — the
     same green-for-the-wrong-reason shape as a patch that never applied.
     """
-    rider_id = _make_rider(client)
-    order_id = _make_order(client)
+    rider_id = _make_rider(ops_client)
+    order_id = _make_order(ops_client)
 
     assert published_events == []  # nothing published before the dispatch
 
-    client.post("/orders/dispatch")
+    ops_client.post("/orders/dispatch")
 
     assert len(published_events) == 1
     event = published_events[0]
@@ -121,37 +121,37 @@ def test_dispatch_publishes_event(client, published_events):
     assert event["payload"]["rider_id"] == rider_id
 
 
-def test_failed_dispatch_publishes_nothing(client, published_events):
+def test_failed_dispatch_publishes_nothing(ops_client, published_events):
     """No rider → no state change → no event. Announce only durable facts."""
-    _make_order(client)
+    _make_order(ops_client)
 
-    assert client.post("/orders/dispatch").status_code == 409
+    assert ops_client.post("/orders/dispatch").status_code == 409
     assert published_events == []
 
 
-def test_busy_rider_not_dispatched_again(client):
-    _make_rider(client)
-    _make_order(client)
-    _make_order(client)  # two orders, one rider
+def test_busy_rider_not_dispatched_again(ops_client):
+    _make_rider(ops_client)
+    _make_order(ops_client)
+    _make_order(ops_client)  # two orders, one rider
 
-    first = client.post("/orders/dispatch")
+    first = ops_client.post("/orders/dispatch")
     assert first.status_code == 200  # rider takes order 1, goes BUSY
 
-    second = client.post("/orders/dispatch")
+    second = ops_client.post("/orders/dispatch")
     assert second.status_code == 409  # orders pending but no AVAILABLE rider
 
 
-def test_delivery_frees_rider(client, ops_headers):
-    rider_id = _make_rider(client)
-    order_id = _make_order(client)
-    client.post("/orders/dispatch")  # rider BUSY
+def test_delivery_frees_rider(ops_client, ops_headers):
+    rider_id = _make_rider(ops_client)
+    order_id = _make_order(ops_client)
+    ops_client.post("/orders/dispatch")  # rider BUSY
 
     # advance through the legal lifecycle
-    client.patch(f"/orders/{order_id}/status", json={"status": "PICKED_UP"}, headers=ops_headers)
-    client.patch(f"/orders/{order_id}/status", json={"status": "DELIVERED"}, headers=ops_headers)
+    ops_client.patch(f"/orders/{order_id}/status", json={"status": "PICKED_UP"}, headers=ops_headers)
+    ops_client.patch(f"/orders/{order_id}/status", json={"status": "DELIVERED"}, headers=ops_headers)
 
     # rider is freed → a new order near the DROP can be dispatched to them
-    new_order = client.post(
+    new_order = ops_client.post(
         "/orders",
         json={
             "customer_id": 2,
@@ -164,7 +164,7 @@ def test_delivery_frees_rider(client, ops_headers):
         },
     ).json()["id"]
 
-    r = client.post("/orders/dispatch")
+    r = ops_client.post("/orders/dispatch")
     assert r.status_code == 200
     assert r.json()["dispatched"] == {"order_id": new_order, "rider_id": rider_id}
 

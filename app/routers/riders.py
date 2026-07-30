@@ -4,8 +4,10 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.dependencies import require_ops
 from app.core.exceptions import RiderNotFound
 from app.models.rider import Rider
+from app.models.user import User
 from app.schemas.rider import RiderCreate, RiderResponse
 from app.services.geohash_service import add_rider, update_rider_location
 
@@ -13,7 +15,13 @@ router = APIRouter(prefix="/riders", tags=["riders"])
 
 
 @router.post("", response_model=RiderResponse, status_code=201)
-def create_rider(rider: RiderCreate, db: Session = Depends(get_db)):
+def create_rider(
+    rider: RiderCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_ops),
+):
+    """OPS ONLY — onboarding a courier is an operator action. Left open,
+    anyone could inject riders into the dispatch pool."""
     new_rider = Rider(**rider.model_dump())
     db.add(new_rider)
     db.commit()

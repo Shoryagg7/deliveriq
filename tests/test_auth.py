@@ -96,31 +96,60 @@ def test_customer_may_not_change_status(client):
     assert r.status_code == 403
 
 
-def test_rider_may_not_touch_someone_elses_order(client, ops_headers):
+def test_rider_may_not_touch_someone_elses_order(ops_client):
     """A legal transition by the wrong actor is still forbidden."""
     from tests.conftest import TestingSessionLocal
     from tests.test_orders import _make_order, _make_rider
-    _make_rider(client)
+    _make_rider(ops_client)
     # a second, far-away rider so dispatch can't pick them for this order
-    other_rider = _make_rider(client, lat=19.0760, lon=72.8777)
-    oid = _make_order(client)
-    client.post("/orders/dispatch")  # rider 1 takes it
+    other_rider = _make_rider(ops_client, lat=19.0760, lon=72.8777)
+    oid = _make_order(ops_client)
+    ops_client.post("/orders/dispatch")  # rider 1 takes it
 
-    headers = _rider_login(client, TestingSessionLocal, "other@x.io", rider_id=other_rider)
-    r = client.patch(f"/orders/{oid}/status", json={"status": "PICKED_UP"}, headers=headers)
+    headers = _rider_login(ops_client, TestingSessionLocal, "other@x.io", rider_id=other_rider)
+    r = ops_client.patch(f"/orders/{oid}/status", json={"status": "PICKED_UP"}, headers=headers)
     assert r.status_code == 403
 
 
-def test_assigned_rider_may_advance_own_order_but_not_cancel(client):
+def test_assigned_rider_may_advance_own_order_but_not_cancel(ops_client):
     from tests.conftest import TestingSessionLocal
     from tests.test_orders import _make_order, _make_rider
-    rider_id = _make_rider(client)
-    oid = _make_order(client)
-    client.post("/orders/dispatch")
+    rider_id = _make_rider(ops_client)
+    oid = _make_order(ops_client)
+    ops_client.post("/orders/dispatch")
 
-    headers = _rider_login(client, TestingSessionLocal, "mine@x.io", rider_id=rider_id)
-    ok = client.patch(f"/orders/{oid}/status", json={"status": "PICKED_UP"}, headers=headers)
+    headers = _rider_login(ops_client, TestingSessionLocal, "mine@x.io", rider_id=rider_id)
+    ok = ops_client.patch(f"/orders/{oid}/status", json={"status": "PICKED_UP"}, headers=headers)
     assert ok.status_code == 200
 
-    cancel = client.patch(f"/orders/{oid}/status", json={"status": "CANCELLED"}, headers=headers)
+    cancel = ops_client.patch(f"/orders/{oid}/status", json={"status": "CANCELLED"}, headers=headers)
     assert cancel.status_code == 403
+
+
+def test_dispatch_is_ops_only(client, ops_headers):
+    """Dispatch assigns work to a courier — a fleet operation.
+
+    A rider able to call it could farm assignments to themselves; a customer
+    could jump the queue. Neither should reach the handler at all.
+    """
+    assert client.post("/orders/dispatch").status_code == 401
+
+    _register(client)
+    customer = _token(client)
+    assert client.post(
+        "/orders/dispatch", headers={"Authorization": f"Bearer {customer}"}
+    ).status_code == 403
+
+    # ops reaches the handler: 409 is "no pending orders", not a refusal
+    assert client.post("/orders/dispatch", headers=ops_headers).status_code in (200, 404, 409)
+
+
+def test_rider_onboarding_is_ops_only(client):
+    """Left open, anyone could inject riders into the dispatch pool."""
+    body = {"name": "Ghost", "current_lat": 28.61, "current_lon": 77.20}
+    assert client.post("/riders", json=body).status_code == 401
+
+    _register(client)
+    assert client.post(
+        "/riders", json=body, headers={"Authorization": f"Bearer {_token(client)}"}
+    ).status_code == 403

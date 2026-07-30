@@ -3,7 +3,11 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.dependencies import assert_may_change_status, get_current_user
+from app.core.dependencies import (
+    assert_may_change_status,
+    get_current_user,
+    require_ops,
+)
 from app.core.enums import OrderStatus
 from app.core.exceptions import NoPendingOrders, OrderNotFound, RiderUnavailable
 from app.core.metrics import dispatch_duration_seconds, dispatch_total
@@ -44,7 +48,14 @@ def list_orders(status: OrderStatus | None = None, db: Session = Depends(get_db)
 
 
 @router.post("/dispatch")
-def dispatch_order(db: Session = Depends(get_db)):
+def dispatch_order(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_ops),
+):
+    """OPS ONLY. Dispatch assigns work to a courier — it is a fleet
+    operation, not something the customer who placed the order or the rider
+    who wants it may trigger for themselves. A rider able to call this could
+    farm assignments; a customer could jump the queue."""
     # Outcome is labelled, not just counted: "dispatch rate dropped" is useless
     # on its own — no_rider_available (supply problem) and no_pending_orders
     # (demand problem) need opposite responses at 3am.
