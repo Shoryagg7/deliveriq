@@ -42,6 +42,50 @@ function Health() {
   );
 }
 
+// Seeded by scripts/seed_users.py. Kept here so the demo is one click, and so
+// the 403 differences between roles are easy to show side by side.
+const DEMO_LOGINS = [
+  { label: "ops", email: "ops@deliveriq.io", password: "opspassword123" },
+  { label: "rider", email: "rider@deliveriq.io", password: "riderpassword123" },
+  { label: "customer", email: "customer@deliveriq.io", password: "custpassword123" },
+];
+
+function Stats({ say }) {
+  const [stats, setStats] = useState(null);
+
+  useEffect(() => {
+    const poll = () =>
+      api
+        .stats()
+        .then((r) => setStats(r.data))
+        .catch((e) => {
+          setStats(null);
+          if (e.status !== 403) say(e.message, "err");
+        });
+    poll();
+    const id = setInterval(poll, 6000);
+    return () => clearInterval(id);
+  }, [say]);
+
+  if (!stats) return null;
+  return (
+    <div className="admin">
+      <span className="admin-tag">/admin/stats</span>
+      <span>
+        <b>{stats.total_orders}</b> orders
+      </span>
+      <span>
+        avg <b>₹{Math.round(stats.avg_order_value || 0)}</b>
+      </span>
+      {Object.entries(stats.riders_by_status || {}).map(([k, v]) => (
+        <span key={k}>
+          {k.toLowerCase()} <b>{v}</b>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function Auth({ user, onUser, say }) {
   const [email, setEmail] = useState("ops@deliveriq.io");
   const [password, setPassword] = useState("opspassword123");
@@ -63,42 +107,79 @@ function Auth({ user, onUser, say }) {
     }
   }
 
-  if (user) {
-    return (
-      <div className="auth-bar">
-        <span className="who">
-          {user.email}
-          <span className={`role role-${user.role}`}>{user.role}</span>
-        </span>
-        <button
-          className="ghost"
-          onClick={() => {
-            setToken(null);
-            onUser(null);
-            say("signed out");
-          }}
-        >
-          Sign out
-        </button>
-      </div>
-    );
+  async function switchTo(demo) {
+    setEmail(demo.email);
+    setPassword(demo.password);
+    setBusy(true);
+    try {
+      const { data } = await api.login(demo.email, demo.password);
+      setToken(data.access_token);
+      const me = await api.me();
+      onUser(me.data);
+      say(`now acting as ${me.data.role}`, "ok");
+    } catch (e) {
+      say(`${e.message} — run: python -m scripts.seed_users`, "err");
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
     <div className="auth-bar">
-      <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="email" />
-      <input
-        type="password"
-        value={password}
-        onChange={(e) => setPassword(e.target.value)}
-        placeholder="password"
-      />
-      <button disabled={busy} onClick={() => go("login")}>
-        Sign in
-      </button>
-      <button className="ghost" disabled={busy} onClick={() => go("register")}>
-        Register
-      </button>
+      {user ? (
+        <>
+          <span className="who">
+            {user.email}
+            <span className={`role role-${user.role}`}>{user.role}</span>
+            {user.rider_id && <span className="rid">rider #{user.rider_id}</span>}
+          </span>
+          <span className="grow" />
+          <span className="switch-label">act as</span>
+          {DEMO_LOGINS.map((d) => (
+            <button
+              key={d.label}
+              className={`chip ${user.role === d.label ? "on" : ""}`}
+              disabled={busy}
+              onClick={() => switchTo(d)}
+            >
+              {d.label}
+            </button>
+          ))}
+          <button
+            className="ghost"
+            onClick={() => {
+              setToken(null);
+              onUser(null);
+              say("signed out");
+            }}
+          >
+            Sign out
+          </button>
+        </>
+      ) : (
+        <>
+          <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="email" />
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="password"
+          />
+          <button disabled={busy} onClick={() => go("login")}>
+            Sign in
+          </button>
+          <button className="ghost" disabled={busy} onClick={() => go("register")}>
+            Register
+          </button>
+          <span className="grow" />
+          <span className="switch-label">or</span>
+          {DEMO_LOGINS.map((d) => (
+            <button key={d.label} className="chip" disabled={busy} onClick={() => switchTo(d)}>
+              {d.label}
+            </button>
+          ))}
+        </>
+      )}
     </div>
   );
 }
@@ -144,10 +225,15 @@ export default function App() {
   async function addRider() {
     setBusy(true);
     try {
+      // Jitter must stay INSIDE the geohash search ring. Matching looks at the
+      // order's cell plus its 8 neighbours (precision 6 ~ 1.2km x 0.61km), so a
+      // rider more than one cell away is invisible even while AVAILABLE.
+      // +/-0.0015 deg is ~165m — comfortably inside the ring, and still spread
+      // enough for the 500m fairness band to have something to choose between.
       await api.createRider({
         name: `Rider-${Math.floor(Math.random() * 900 + 100)}`,
-        current_lat: 28.61 + (Math.random() - 0.5) * 0.02,
-        current_lon: 77.2 + (Math.random() - 0.5) * 0.02,
+        current_lat: 28.61 + (Math.random() - 0.5) * 0.003,
+        current_lon: 77.2 + (Math.random() - 0.5) * 0.003,
       });
       say("rider added", "ok");
       refresh();
@@ -233,6 +319,7 @@ export default function App() {
       </header>
 
       <Auth user={user} onUser={setUser} say={say} />
+      {user?.role === "ops" && <Stats say={say} />}
 
       <section className="stats">
         {["PENDING", "ASSIGNED", "PICKED_UP", "DELIVERED"].map((s) => (
@@ -305,8 +392,9 @@ export default function App() {
             ))}
           </div>
           <p className="hint">
-            Status changes require a signed-in <b>ops</b> user or the{" "}
-            <b>assigned rider</b> — anyone else gets 403.
+            Status changes need <b>ops</b>, or the <b>rider the order is
+            assigned to</b>. Switch role above and try one — a customer gets 403,
+            and a rider gets 403 on someone else’s order.
           </p>
         </section>
       </div>
