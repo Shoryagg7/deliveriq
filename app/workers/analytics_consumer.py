@@ -12,6 +12,7 @@ import logging
 from datetime import UTC, datetime
 
 from confluent_kafka import Message
+from sqlalchemy.dialects.postgresql import insert
 
 from app.core.database import SessionLocal
 from app.core.logging_config import setup_logging
@@ -25,26 +26,41 @@ CONSUMER_GROUP = "analytics"
 
 
 def handle_event(payload: dict, msg: Message) -> None:
-    """Persist one dispatch fact. Raising here routes the message to the DLQ."""
+    """Persist one dispatch fact, idempotently.
+
+    ON CONFLICT DO NOTHING against the (partition, offset) unique constraint:
+    a redelivered message inserts zero rows instead of double-counting. Doing
+    the dedupe in ONE statement matters — a SELECT-then-INSERT would race a
+    second worker on the same group and both would decide the row was absent.
+
+    Raising here routes the message to the DLQ.
+    """
+    stmt = (
+        insert(DispatchEvent)
+        .values(
+            order_id=payload["order_id"],
+            rider_id=payload["rider_id"],
+            dispatched_at=datetime.fromtimestamp(payload["ts"], UTC).replace(
+                tzinfo=None
+            ),
+            recorded_at=datetime.now(UTC).replace(tzinfo=None),
+            kafka_partition=msg.partition(),
+            kafka_offset=msg.offset(),
+        )
+        .on_conflict_do_nothing(constraint="uq_dispatch_event_msg")
+    )
+
     db = SessionLocal()
     try:
-        db.add(
-            DispatchEvent(
-                order_id=payload["order_id"],
-                rider_id=payload["rider_id"],
-                dispatched_at=datetime.fromtimestamp(payload["ts"], UTC).replace(
-                    tzinfo=None
-                ),
-                kafka_partition=msg.partition(),
-                kafka_offset=msg.offset(),
-            )
-        )
+        result = db.execute(stmt)
         db.commit()
+        inserted = result.rowcount == 1
     finally:
         db.close()
 
     logger.info(
-        f"[analytics] recorded order {payload['order_id']} "
+        f"[analytics] {'recorded' if inserted else 'DUPLICATE ignored'} "
+        f"order {payload['order_id']} "
         f"(partition {msg.partition()}, offset {msg.offset()})"
     )
 
