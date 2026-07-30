@@ -4,9 +4,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
+from app.core.database import SessionLocal
 from app.core.exceptions import DeliverIQError
-from app.core.kafka_producer import flush_producer
+from app.core.kafka_producer import flush_producer, get_producer
+from app.core.redis_client import redis_client
 from app.core.logging_config import setup_logging
 from app.middleware.rate_limiter import rate_limit_middleware
 from app.middleware.request_id import request_id_middleware
@@ -37,8 +40,57 @@ app.middleware("http")(request_id_middleware)
 
 @app.get("/health")
 def health():
-    logger.info("health check hit")
+    """Liveness only — is this process up? Cheap, no dependencies.
+
+    Kept separate from /ready on purpose: a load balancer that restarts a
+    container because Redis blipped turns one dependency outage into an outage
+    of everything. Liveness answers "restart me?", readiness answers "route to
+    me?" — different questions, different consequences.
+    """
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    """Readiness — can this process actually serve traffic?
+
+    Round-trips every hard dependency rather than checking a cached flag: a
+    connection pool can look healthy while the server behind it is gone. Returns
+    503 with a per-dependency breakdown so the failing one is named, not guessed.
+    """
+    checks: dict[str, str] = {}
+
+    try:
+        db = SessionLocal()
+        try:
+            db.execute(text("SELECT 1"))
+            checks["postgres"] = "ok"
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001 — report, never raise from a probe
+        checks["postgres"] = f"error: {type(exc).__name__}"
+
+    try:
+        redis_client.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:  # noqa: BLE001
+        checks["redis"] = f"error: {type(exc).__name__}"
+
+    try:
+        # metadata round-trip = the broker answered. list_topics with a short
+        # timeout, because a readiness probe that blocks is itself an outage.
+        get_producer().list_topics(timeout=2.0)
+        checks["kafka"] = "ok"
+    except Exception as exc:  # noqa: BLE001
+        checks["kafka"] = f"error: {type(exc).__name__}"
+
+    healthy = all(v == "ok" for v in checks.values())
+    if not healthy:
+        logger.error("readiness FAILED: %s", checks)
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={"status": "ready" if healthy else "degraded", "checks": checks},
+    )
 
 
 @app.exception_handler(DeliverIQError)

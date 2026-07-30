@@ -1,10 +1,20 @@
+import logging
 import time
 
+import redis
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.core.redis_client import redis_client
+
+logger = logging.getLogger("deliveriq")
+
+# Probes must never touch a dependency. Otherwise Redis going down fails the
+# LIVENESS probe, the orchestrator restarts every container, and one dependency
+# outage becomes a total outage — the exact cascade the /health vs /ready split
+# exists to prevent.
+PROBE_PATHS = frozenset({"/health", "/ready"})
 
 BUCKET_SIZE = settings.rate_limit_capacity  # max tokens the bucket can hold
 REFILL_RATE = settings.rate_limit_refill_per_min / 60  # tokens added per second
@@ -46,6 +56,9 @@ async def rate_limit_middleware(request: Request, call_next):
     if not settings.rate_limit_enabled:  # toggle off for load tests
         return await call_next(request)
 
+    if request.url.path in PROBE_PATHS:
+        return await call_next(request)
+
     # request.client can be None in raw ASGI / some test setups — guard it.
     client = request.client
     client_ip = client.host if client is not None else "unknown"
@@ -53,10 +66,18 @@ async def rate_limit_middleware(request: Request, call_next):
     bucket_key = f"rate_limit:{client_key}"
     now = time.time()
 
-    result = _rate_limit(
-        keys=[bucket_key],
-        args=[BUCKET_SIZE, REFILL_RATE, now, TTL],
-    )
+    try:
+        result = _rate_limit(
+            keys=[bucket_key],
+            args=[BUCKET_SIZE, REFILL_RATE, now, TTL],
+        )
+    except redis.RedisError as exc:
+        # FAIL OPEN, deliberately. Fail-closed would mean Redis being down takes
+        # the entire API down with it — a protective control causing the outage
+        # it exists to prevent. Serving unthrottled traffic is the lesser harm
+        # here; for a payment or auth control the trade-off inverts.
+        logger.error("rate limiter degraded, failing OPEN: %s", exc)
+        return await call_next(request)
 
     if result == "-1" or result == -1:
         return JSONResponse(
