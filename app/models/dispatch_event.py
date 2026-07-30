@@ -1,7 +1,7 @@
 # app/models/dispatch_event.py
 from datetime import UTC, datetime
 
-from sqlalchemy import Column, DateTime, Integer
+from sqlalchemy import Column, DateTime, Integer, UniqueConstraint
 
 from app.core.database import Base
 
@@ -9,14 +9,23 @@ from app.core.database import Base
 class DispatchEvent(Base):
     """What the `analytics` consumer group writes — one row per event CONSUMED.
 
-    Deliberately NOT deduplicated yet. Delivery is at-least-once, so a crash
-    before commit (or a group whose offsets are reset) replays events and this
-    table double-counts. Storing kafka_partition/kafka_offset makes those
-    duplicates visible rather than mysterious, and gives Day 34 a natural
-    dedupe key to build on.
+    At-least-once means the SAME message is redelivered after a crash between
+    processing and commit. (partition, offset) uniquely identifies a message in
+    Kafka, so a unique constraint on that pair turns redelivery into a no-op:
+    the consumer stays at-least-once, the effect becomes exactly-once. That is
+    what "effectively-once" means — you don't get it from a broker setting, you
+    get it by making the write idempotent.
+
+    Note the limit: this dedupes redelivery of one message. It does NOT dedupe
+    the same real-world fact PUBLISHED twice (a producer retry creating a second
+    message at a different offset) — that needs an event_id inside the payload.
+    Different problem, different key.
     """
 
     __tablename__ = "dispatch_events"
+    __table_args__ = (
+        UniqueConstraint("kafka_partition", "kafka_offset", name="uq_dispatch_event_msg"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     order_id = Column(Integer, nullable=False, index=True)
