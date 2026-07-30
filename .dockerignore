@@ -1,8 +1,18 @@
+# Secrets must never enter the image — the container gets config from compose
+# environment, not from a copied .env.
+.env
+
+# Host virtualenv / node_modules are platform-specific and would silently
+# shadow what pip and npm installed inside the image.
 venv/
+frontend/node_modules/
+frontend/dist/
+
 __pycache__/
 *.pyc
-.env
+*.egg-info/
 .git/
 .pytest_cache/
-*.egg-info/
+.ruff_cache/
 .mypy_cache/
+audit.log
