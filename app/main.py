@@ -16,7 +16,8 @@ from app.middleware.rate_limiter import rate_limit_middleware
 from app.middleware.request_id import request_id_middleware
 from app.models.order import Order  # noqa: F401
 from app.models.rider import Rider  # noqa: F401
-from app.routers import admin, orders, riders
+from app.models.user import User  # noqa: F401
+from app.routers import admin, auth, orders, riders
 
 setup_logging()
 logger = logging.getLogger("deliveriq")
@@ -35,6 +36,7 @@ app = FastAPI(title="DeliverIQ", lifespan=lifespan)
 app.include_router(orders.router)
 app.include_router(riders.router)
 app.include_router(admin.router)
+app.include_router(auth.router)
 # Middleware runs in REVERSE registration order, so this list reads
 # outermost-last. Effective order per request:
 #   request_id  -> rate_limit -> idempotency -> route
