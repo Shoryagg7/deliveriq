@@ -3,10 +3,18 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.dependencies import require_admin
 from app.models.order import Order
 from app.models.rider import Rider
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+# Guard on the ROUTER, not each handler: a future endpoint added here is
+# protected by default. Per-handler guards are one forgotten decorator away
+# from an open admin route.
+router = APIRouter(
+    prefix="/admin",
+    tags=["admin"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 @router.get("/stats")

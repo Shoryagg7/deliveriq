@@ -21,5 +21,10 @@ class Settings(BaseSettings):
     # this to a mounted volume path so the file survives a rebuild.
     audit_log_path: str = "audit.log"
 
+    # Dev default only — deployment MUST override JWT_SECRET. A shipped default
+    # secret means anyone with the source can mint an admin token.
+    jwt_secret: str = "dev-only-change-me"
+    jwt_expire_minutes: int = 60
+
 
 settings = Settings()  # type: ignore
