@@ -9,6 +9,12 @@ class OrderStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class UserRole(str, Enum):
+    CUSTOMER = "customer"
+    RIDER = "rider"
+    OPS = "ops"
+
+
 class Topic(str, Enum):
     ORDER_DISPATCHED = "order.dispatched"
     ORDER_DELIVERED = "order.delivered"  # Day 33

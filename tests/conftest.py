@@ -15,6 +15,8 @@ from app.core.redis_client import redis_client
 from app.main import app
 from app.models.order import Order  # noqa: F401 — register tables on Base
 from app.models.rider import Rider  # noqa: F401
+from app.models.user import User  # noqa: F401
+from app.core.enums import UserRole
 
 engine = create_engine(os.environ["DATABASE_URL"])
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -94,3 +96,25 @@ def client():
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def ops_headers(client):
+    """Bearer headers for an ops user — the role allowed to drive status."""
+    client.post(
+        "/auth/register",
+        json={"email": "ops@deliveriq.io", "password": "opspassword123"},
+    )
+    db = TestingSessionLocal()
+    try:
+        db.query(User).filter(User.email == "ops@deliveriq.io").update(
+            {"role": UserRole.OPS.value}
+        )
+        db.commit()
+    finally:
+        db.close()
+    token = client.post(
+        "/auth/login",
+        json={"email": "ops@deliveriq.io", "password": "opspassword123"},
+    ).json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
