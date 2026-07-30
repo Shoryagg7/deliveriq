@@ -23,9 +23,14 @@ TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engin
 # its OWN name binding, created at import time. Patching the definition site
 # (app.core.kafka_producer.publish_event) leaves these untouched — the test goes
 # green and the event still lands on the real broker. Patch where it is USED.
+#
+# monkeypatch.setattr raises AttributeError if the name isn't there, so this
+# list cannot silently rot: move a publish call site and the suite errors
+# instead of quietly publishing for real. (It already caught one — the Day 33
+# refactor moved the DLQ publish out of notification_consumer into runner.)
 _PUBLISH_CALL_SITES = (
     "app.services.dispatch",
-    "app.workers.notification_consumer",  # DLQ path
+    "app.workers.runner",  # DLQ path, shared by all three worker groups
 )
 
 

@@ -12,6 +12,7 @@ sys.path.insert(
 )  # let env.py find your "app" package
 
 from app.core.database import Base
+from app.models.dispatch_event import DispatchEvent
 from app.models.order import Order
 from app.models.rider import Rider
 

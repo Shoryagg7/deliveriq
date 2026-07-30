@@ -17,5 +17,9 @@ class Settings(BaseSettings):
     #   in Compose  -> kafka:19092     (PLAINTEXT listener)
     kafka_bootstrap: str = "localhost:9092"
 
+    # Where the `audit` consumer group appends its trail. Container overrides
+    # this to a mounted volume path so the file survives a rebuild.
+    audit_log_path: str = "audit.log"
+
 
 settings = Settings()  # type: ignore
