@@ -118,3 +118,15 @@ def ops_headers(client):
         json={"email": "ops@deliveriq.io", "password": "opspassword123"},
     ).json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def ops_client(client, ops_headers):
+    """A client already carrying an ops bearer token.
+
+    Dispatch and rider onboarding are ops-only, so most flow tests need this.
+    Mutating the shared client's default headers keeps call sites clean —
+    otherwise every request in a flow test grows a headers= argument.
+    """
+    client.headers.update(ops_headers)
+    return client

@@ -300,6 +300,11 @@ export default function App() {
     }
   }
 
+  // Ops-only actions are disabled rather than hidden: a greyed control with a
+  // reason teaches the permission model, whereas a missing button just looks
+  // like a feature that isn't there.
+  const isOps = user?.role === "ops";
+
   const counts = orders.reduce(
     (a, o) => ({ ...a, [o.status]: (a[o.status] || 0) + 1 }),
     {},
@@ -338,7 +343,11 @@ export default function App() {
       </section>
 
       <section className="actions">
-        <button onClick={addRider} disabled={busy}>
+        <button
+          onClick={addRider}
+          disabled={busy || !isOps}
+          title={isOps ? "" : "ops only — onboarding a courier is an operator action"}
+        >
           + Rider
         </button>
         <button onClick={() => addOrder(false)} disabled={busy}>
@@ -347,9 +356,20 @@ export default function App() {
         <button className="alt" onClick={() => addOrder(true)} disabled={busy}>
           + Order <span className="tag">fixed Idempotency-Key</span>
         </button>
-        <button className="primary" onClick={dispatch} disabled={busy}>
+        <button
+          className="primary"
+          onClick={dispatch}
+          disabled={busy || !isOps}
+          title={isOps ? "" : "ops only — dispatch assigns work to a courier"}
+        >
           Dispatch next →
         </button>
+        {!isOps && (
+          <span className="perm-note">
+            {user ? `signed in as ${user.role} —` : "not signed in —"} rider
+            onboarding and dispatch are <b>ops only</b>
+          </span>
+        )}
       </section>
 
       <div className="cols">
@@ -392,9 +412,10 @@ export default function App() {
             ))}
           </div>
           <p className="hint">
-            Status changes need <b>ops</b>, or the <b>rider the order is
-            assigned to</b>. Switch role above and try one — a customer gets 403,
-            and a rider gets 403 on someone else’s order.
+            <b>ops</b> — dispatch, rider onboarding, any status change.<br />
+            <b>rider</b> — advance only the order assigned to them, never cancel.<br />
+            <b>customer</b> — place orders; 403 on everything above.<br />
+            Switch role above and try it; the server enforces this, not the UI.
           </p>
         </section>
       </div>
