@@ -179,3 +179,36 @@ def test_error_envelope(client):
     r = client.get("/orders/999")
     assert r.status_code == 404
     assert r.json() == {"error": "ORDER_NOT_FOUND", "message": "Order 999 not found"}
+
+
+def _order_payload(value=250):
+    return {
+        "customer_id": 1, "restaurant_id": 1, "value": value,
+        "pickup_lat": 28.6139, "pickup_lon": 77.2090,
+        "drop_lat": 28.7041, "drop_lon": 77.1025,
+    }
+
+
+def test_idempotent_retry_replays_first_response(client):
+    """A retried POST must return the FIRST response, not create a second order."""
+    headers = {"Idempotency-Key": "retry-me"}
+    first = client.post("/orders", json=_order_payload(), headers=headers)
+    second = client.post("/orders", json=_order_payload(), headers=headers)
+
+    assert first.status_code == 201
+    assert second.json() == first.json()          # same id, same body
+    assert second.headers.get("Idempotent-Replay") == "true"
+    assert len(client.get("/orders").json()) == 1  # only ONE order exists
+
+
+def test_different_idempotency_keys_create_separate_orders(client):
+    a = client.post("/orders", json=_order_payload(), headers={"Idempotency-Key": "a"})
+    b = client.post("/orders", json=_order_payload(), headers={"Idempotency-Key": "b"})
+    assert a.json()["id"] != b.json()["id"]
+
+
+def test_no_key_means_no_deduplication(client):
+    """Opt-in contract: without the header, behaviour is unchanged."""
+    a = client.post("/orders", json=_order_payload())
+    b = client.post("/orders", json=_order_payload())
+    assert a.json()["id"] != b.json()["id"]
