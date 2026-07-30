@@ -114,6 +114,7 @@ The one mind-shift from normal programming: **SQL is declarative.** You state
 planner picks the algorithm. That's why the same query can be fast or slow
 depending on indexes: I control the what, the planner controls the how."
 
+
 ## 0.2 Your first queries (on your own data)
 
 Connect to your project DB and look around:

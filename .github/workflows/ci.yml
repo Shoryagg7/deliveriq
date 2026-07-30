@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: # lets you re-run from the Actions tab without a push
+
+# A new push to the same branch cancels the previous run — no point burning
+# minutes on a commit that is already superseded.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (Postgres + Redis + Kafka)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff==0.16.0   # pinned: an unpinned linter fails builds that changed nothing
+
+      # Infra comes from the REAL docker-compose.yml, not a parallel CI-only
+      # description of it. GitHub's `services:` block would mean maintaining two
+      # definitions of the same stack, and they drift — CI eventually goes green
+      # against a Kafka configured differently from the one that actually runs.
+      # This way a broken compose file fails CI instead of surfacing at deploy.
+      - name: Start infrastructure
+        run: |
+          docker compose up -d db redis kafka
+          docker compose ps
+
+      # kafka-init is gated on the broker healthcheck and exits 0 only once the
+      # topics exist, so "did the broker come up?" needs no sleep-and-hope.
+      - name: Wait for Postgres and create topics
+        run: |
+          for i in $(seq 1 30); do
+            docker compose exec -T db pg_isready -U deliveriq_user -d deliveriq_db && break
+            sleep 2
+          done
+          docker compose up kafka-init --exit-code-from kafka-init
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgresql://deliveriq_user:password@localhost:5433/deliveriq_db
+        run: alembic upgrade head
+
+      - name: Lint
+        run: ruff check app tests
+
+      # Host-side pytest against containerised infra — the same hybrid setup
+      # used locally, so a green CI run means the local workflow genuinely works.
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql://deliveriq_user:password@localhost:5433/deliveriq_test_db
+          REDIS_URL: redis://localhost:6379/15
+          KAFKA_BOOTSTRAP: localhost:9092
+        run: pytest tests/ -q
+
+      # Runs even when tests fail — the logs are the whole point when they do.
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose logs --tail 100
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

@@ -10,9 +10,9 @@ from sqlalchemy import text
 from app.core.database import SessionLocal
 from app.core.exceptions import DeliverIQError
 from app.core.kafka_producer import flush_producer, get_producer
-from app.core.redis_client import redis_client
 from app.core.logging_config import setup_logging
 from app.core.metrics import dependency_up
+from app.core.redis_client import redis_client
 from app.middleware.idempotency import idempotency_middleware
 from app.middleware.metrics import metrics_middleware
 from app.middleware.rate_limiter import rate_limit_middleware
