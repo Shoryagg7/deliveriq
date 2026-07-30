@@ -1,3 +1,6 @@
+from app.core.enums import Topic
+
+
 def test_create_order(client):
     r = client.post(
         "/orders",
@@ -94,6 +97,36 @@ def test_dispatch_assigns_rider(client):
 
     # order is now ASSIGNED
     assert client.get(f"/orders/{order_id}").json()["status"] == "ASSIGNED"
+
+
+def test_dispatch_publishes_event(client, published_events):
+    """The publish is part of the dispatch contract, so assert on it.
+
+    Without this, the autouse mock would only be silencing the producer — the
+    same green-for-the-wrong-reason shape as a patch that never applied.
+    """
+    rider_id = _make_rider(client)
+    order_id = _make_order(client)
+
+    assert published_events == []  # nothing published before the dispatch
+
+    client.post("/orders/dispatch")
+
+    assert len(published_events) == 1
+    event = published_events[0]
+    assert event["topic"] == Topic.ORDER_DISPATCHED.value
+    # keyed by order_id → same partition → per-order ordering downstream
+    assert event["key"] == str(order_id)
+    assert event["payload"]["order_id"] == order_id
+    assert event["payload"]["rider_id"] == rider_id
+
+
+def test_failed_dispatch_publishes_nothing(client, published_events):
+    """No rider → no state change → no event. Announce only durable facts."""
+    _make_order(client)
+
+    assert client.post("/orders/dispatch").status_code == 409
+    assert published_events == []
 
 
 def test_busy_rider_not_dispatched_again(client):
