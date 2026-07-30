@@ -1,11 +1,31 @@
-target-version = "py311"
-line-length = 88
-indent-width = 4
+# Explicit lint config so CI is reproducible. Without this, `pip install ruff`
+# grabs whatever is newest, a future release adds a rule, and a build that
+# touched nothing suddenly fails.
+line-length = 100
+target-version = "py314"
 
 [lint]
-select = ["E", "F", "W", "I"]
-ignore = ["E501"]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes — undefined names, unused imports
+    "I",   # import sorting
+    "UP",  # pyupgrade — modern syntax for the target version
+    "B",   # bugbear — likely bugs, not style
+]
+ignore = [
+    "E501",  # line length is handled by the formatter, not the linter
+    "B008",  # Depends() in defaults is the FastAPI idiom, not a mutable-default bug
+    # UP042 suggests StrEnum over `(str, Enum)`. Declined deliberately: StrEnum
+    # changes what str(member) returns (the value, not "Class.MEMBER"), which
+    # would silently alter Pydantic serialization and anything that formats a
+    # member into a string. The current form is explicit — every call site uses
+    # .value — and is covered by tests. Not a refactor to make casually.
+    "UP042",
+]
 
-[format]
-quote-style = "double"
-indent-style = "space"
+[lint.per-file-ignores]
+# Tests import fixtures for their side effects and shadow names freely.
+"tests/*" = ["F811", "E402"]
+# conftest sets env vars BEFORE importing app modules — the import order is
+# load-bearing, not sloppy.
+"tests/conftest.py" = ["E402"]

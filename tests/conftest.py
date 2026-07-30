@@ -11,12 +11,12 @@ from sqlalchemy.orm import sessionmaker
 
 import app.core.kafka_producer as kafka_producer
 from app.core.database import Base, get_db
+from app.core.enums import UserRole
 from app.core.redis_client import redis_client
 from app.main import app
 from app.models.order import Order  # noqa: F401 — register tables on Base
 from app.models.rider import Rider  # noqa: F401
 from app.models.user import User  # noqa: F401
-from app.core.enums import UserRole
 
 engine = create_engine(os.environ["DATABASE_URL"])
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
