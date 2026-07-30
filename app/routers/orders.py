@@ -3,10 +3,12 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.dependencies import assert_may_change_status, get_current_user
 from app.core.enums import OrderStatus
 from app.core.exceptions import OrderNotFound
 from app.models.order import Order
 from app.models.rider import Rider
+from app.models.user import User
 from app.schemas.order import OrderCreate, OrderResponse
 from app.services.dispatch import pick_next_order
 from app.services.geohash_service import update_rider_location
@@ -51,11 +53,21 @@ class StatusUpdate(BaseModel):
 
 
 @router.patch("/{order_id}/status")
-def update_status(order_id: int, body: StatusUpdate, db: Session = Depends(get_db)):
+def update_status(
+    order_id: int,
+    body: StatusUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise OrderNotFound(f"Order {order_id} not found")
     current = OrderStatus(order.status)  # str from DB → enum
+    # TWO orthogonal guards, both required:
+    #   is this move legal?        PENDING → DELIVERED is not
+    #   may THIS caller make it?   a customer marking their own order delivered
+    #                              is a legal move by the wrong actor
+    assert_may_change_status(user, order, body.status)
     transition(current, body.status)  # validate; raises InvalidTransition if illegal
     order.status = body.status.value  # type: ignore # enum → str for the DB
     # terminal states free the assigned rider + put them back in the index

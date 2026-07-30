@@ -35,7 +35,8 @@ class TokenResponse(BaseModel):
 class UserResponse(BaseModel):
     id: int
     email: str
-    is_admin: bool
+    role: str
+    rider_id: int | None = None
 
     model_config = {"from_attributes": True}
 

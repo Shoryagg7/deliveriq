@@ -5,6 +5,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.enums import OrderStatus, UserRole
 from app.core.security import decode_access_token
 from app.models.user import User
 
@@ -39,11 +40,57 @@ def get_current_user(
     return user
 
 
-def require_admin(user: User = Depends(get_current_user)) -> User:
+def require_ops(user: User = Depends(get_current_user)) -> User:
     """403, not 401: the caller IS authenticated, they're just not allowed."""
-    if not user.is_admin:
+    if user.role != UserRole.OPS.value:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin privileges required",
+            detail="Ops privileges required",
         )
     return user
+
+
+# Old name kept so existing routers keep working.
+require_admin = require_ops
+
+
+def assert_may_change_status(user: User, order, new_status: OrderStatus) -> None:
+    """The PERMITTED-ACTOR guard — orthogonal to the legal-transition guard.
+
+    `transition()` answers "is PENDING → DELIVERED a legal move?". This answers
+    "may THIS caller make it?". Both must pass. A state machine alone will
+    happily let a customer mark their own order delivered, because the move is
+    legal — it is the actor that is wrong.
+
+        ops       — anything, including cancelling
+        rider     — may advance ONLY the order assigned to them
+        customer  — may not touch status at all
+
+    Raises 403; never reveals whether the order exists to a caller who has no
+    business knowing.
+    """
+    if user.role == UserRole.OPS.value:
+        return
+
+    if user.role == UserRole.RIDER.value:
+        if user.rider_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Rider account is not linked to a rider record",
+            )
+        if order.rider_id != user.rider_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You may only update orders assigned to you",
+            )
+        if new_status == OrderStatus.CANCELLED:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Riders may not cancel orders; contact ops",
+            )
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Customers may not change order status",
+    )

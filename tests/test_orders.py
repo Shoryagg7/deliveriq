@@ -141,14 +141,14 @@ def test_busy_rider_not_dispatched_again(client):
     assert second.status_code == 409  # orders pending but no AVAILABLE rider
 
 
-def test_delivery_frees_rider(client):
+def test_delivery_frees_rider(client, ops_headers):
     rider_id = _make_rider(client)
     order_id = _make_order(client)
     client.post("/orders/dispatch")  # rider BUSY
 
     # advance through the legal lifecycle
-    client.patch(f"/orders/{order_id}/status", json={"status": "PICKED_UP"})
-    client.patch(f"/orders/{order_id}/status", json={"status": "DELIVERED"})
+    client.patch(f"/orders/{order_id}/status", json={"status": "PICKED_UP"}, headers=ops_headers)
+    client.patch(f"/orders/{order_id}/status", json={"status": "DELIVERED"}, headers=ops_headers)
 
     # rider is freed → a new order near the DROP can be dispatched to them
     new_order = client.post(
@@ -169,10 +169,10 @@ def test_delivery_frees_rider(client):
     assert r.json()["dispatched"] == {"order_id": new_order, "rider_id": rider_id}
 
 
-def test_illegal_transition_rejected(client):
+def test_illegal_transition_rejected(client, ops_headers):
     order_id = _make_order(client)
     # PENDING → DELIVERED skips ASSIGNED/PICKED_UP → illegal
-    r = client.patch(f"/orders/{order_id}/status", json={"status": "DELIVERED"})
+    r = client.patch(f"/orders/{order_id}/status", json={"status": "DELIVERED"}, headers=ops_headers)
     assert r.status_code == 400
 
 def test_error_envelope(client):
