@@ -1,9 +1,11 @@
 # app/main.py
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import text
 
@@ -115,6 +117,26 @@ def metrics():
     reachable only inside the compose network, and putting auth on it means
     the scraper needs credentials it will inevitably have hardcoded."""
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# --- static frontend -------------------------------------------------------
+# Mounted LAST so it can claim "/" without shadowing any API route: FastAPI
+# matches in registration order, and a catch-all mount registered earlier would
+# swallow /orders, /auth and friends.
+#
+# Served by the API rather than hosted separately, which removes an entire
+# category of problems: no CORS config, no second deploy target, no environment
+# variable pointing the frontend at the right backend URL per environment.
+_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if _FRONTEND_DIST.is_dir():
+    # html=True serves index.html at the mount root. It does NOT rewrite
+    # arbitrary unknown paths to index.html — /nope still 404s, verified. That
+    # is correct here because the console is a single view with no client-side
+    # router; adding one would mean adding an explicit catch-all fallback.
+    app.mount("/", StaticFiles(directory=_FRONTEND_DIST, html=True), name="frontend")
+    logger.info("frontend mounted from %s", _FRONTEND_DIST)
+else:
+    logger.warning("no frontend build at %s — run `npm run build`", _FRONTEND_DIST)
 
 
 @app.exception_handler(DeliverIQError)

@@ -1,0 +1,145 @@
+:root {
+  --bg: #0b0e14;
+  --panel: #141922;
+  --panel-2: #1b212c;
+  --line: #262e3a;
+  --txt: #e6eaf0;
+  --dim: #8b95a6;
+  --accent: #4f8cff;
+  --ok: #3ecf8e;
+  --warn: #f5a623;
+  --err: #ff5c5c;
+  --violet: #a071ff;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--txt);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app { max-width: 1180px; margin: 0 auto; padding: 28px 20px 60px; }
+
+header {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 16px; flex-wrap: wrap; margin-bottom: 18px;
+}
+h1 {
+  margin: 0; font-size: 26px; letter-spacing: -0.4px;
+  background: linear-gradient(92deg, #fff, #7fb0ff);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.sub { margin: 4px 0 0; color: var(--dim); font-size: 13px; }
+
+/* health pills */
+.health { display: flex; gap: 8px; flex-wrap: wrap; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--panel); border: 1px solid var(--line);
+  padding: 5px 11px; border-radius: 999px; font-size: 12px; color: var(--dim);
+}
+.pill i { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); }
+.pill.up i { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.pill.down i { background: var(--err); box-shadow: 0 0 8px var(--err); }
+.pill.down { color: var(--err); border-color: #4a2020; }
+
+/* auth */
+.auth-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: var(--panel); border: 1px solid var(--line);
+  padding: 10px 12px; border-radius: 12px; margin-bottom: 16px;
+}
+.auth-bar input {
+  background: var(--bg); border: 1px solid var(--line); color: var(--txt);
+  padding: 8px 10px; border-radius: 8px; font-size: 13px; min-width: 190px;
+}
+.auth-bar input:focus { outline: none; border-color: var(--accent); }
+.who { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.role {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px; text-transform: uppercase;
+  letter-spacing: .5px; background: #23303f; color: var(--dim);
+}
+.role-ops { background: rgba(160,113,255,.18); color: var(--violet); }
+.role-rider { background: rgba(79,140,255,.18); color: var(--accent); }
+.role-customer { background: rgba(139,149,166,.18); color: var(--dim); }
+
+/* buttons */
+button {
+  background: var(--panel-2); color: var(--txt); border: 1px solid var(--line);
+  padding: 8px 14px; border-radius: 9px; font-size: 13px; font-weight: 500;
+  cursor: pointer; transition: .15s;
+}
+button:hover:not(:disabled) { border-color: #3a4658; transform: translateY(-1px); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover:not(:disabled) { background: #6ba0ff; }
+button.alt { border-color: #3d3357; background: rgba(160,113,255,.12); }
+button.ghost { background: transparent; color: var(--dim); }
+button.tiny { padding: 4px 9px; font-size: 11px; border-radius: 6px; }
+.tag {
+  font-size: 10px; opacity: .75; background: rgba(255,255,255,.07);
+  padding: 1px 6px; border-radius: 5px; margin-left: 6px;
+}
+
+/* stat tiles */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.stat {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 12px; padding: 14px 16px; display: flex; flex-direction: column; gap: 2px;
+}
+.stat .n { font-size: 26px; font-weight: 650; letter-spacing: -1px; }
+.stat .n small { font-size: 14px; color: var(--dim); font-weight: 400; }
+.stat .l { font-size: 11px; color: var(--dim); letter-spacing: .6px; }
+
+.actions { display: flex; gap: 9px; flex-wrap: wrap; margin-bottom: 18px; }
+
+/* panels */
+.cols { display: grid; grid-template-columns: 1.35fr 1fr; gap: 14px; }
+@media (max-width: 860px) { .cols { grid-template-columns: 1fr; } }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; }
+.panel h2 {
+  margin: 0 0 12px; font-size: 13px; text-transform: uppercase;
+  letter-spacing: .8px; color: var(--dim); display: flex; align-items: center; gap: 8px;
+}
+.count { background: var(--panel-2); padding: 1px 8px; border-radius: 999px; font-size: 11px; }
+.rows { display: flex; flex-direction: column; gap: 6px; max-height: 380px; overflow-y: auto; }
+.empty { color: var(--dim); font-size: 13px; margin: 6px 2px; }
+
+.row {
+  display: flex; align-items: center; gap: 9px;
+  background: var(--panel-2); border: 1px solid transparent;
+  padding: 9px 11px; border-radius: 9px; font-size: 13px;
+}
+.row:hover { border-color: var(--line); }
+.grow { flex: 1; }
+.id { color: var(--dim); font-variant-numeric: tabular-nums; min-width: 34px; }
+.val { color: var(--dim); font-variant-numeric: tabular-nums; }
+.rid { font-size: 11px; color: var(--accent); }
+
+.badge {
+  font-size: 10px; letter-spacing: .5px; padding: 3px 8px;
+  border-radius: 999px; font-weight: 600;
+}
+.s-PENDING { background: rgba(139,149,166,.18); color: var(--dim); }
+.s-ASSIGNED { background: rgba(79,140,255,.18); color: var(--accent); }
+.s-PICKED_UP { background: rgba(245,166,35,.18); color: var(--warn); }
+.s-DELIVERED { background: rgba(62,207,142,.18); color: var(--ok); }
+.s-CANCELLED { background: rgba(255,92,92,.16); color: var(--err); }
+
+.row.log { font-size: 12.5px; }
+.row.log .ts { color: var(--dim); font-variant-numeric: tabular-nums; font-size: 11px; }
+.row.log.ok { border-left: 2px solid var(--ok); }
+.row.log.err { border-left: 2px solid var(--err); color: #ffb4b4; }
+.row.log.warn { border-left: 2px solid var(--warn); color: #ffd79a; }
+
+.hint { color: var(--dim); font-size: 11.5px; margin: 12px 2px 0; line-height: 1.5; }
+.hint b { color: var(--txt); font-weight: 600; }
+
+footer { display: flex; gap: 16px; margin-top: 22px; flex-wrap: wrap; }
+footer a { color: var(--dim); font-size: 12px; text-decoration: none; }
+footer a:hover { color: var(--accent); }
