@@ -82,8 +82,11 @@ services:
   api:
     build: .
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    # A RANGE, not a fixed port. `--scale api=3` needs three free host ports; a
+    # plain "8000:8000" makes the 2nd replica die on "port is already allocated".
+    # With one replica this still binds 8000, so nothing changes day to day.
     ports:
-      - "${API_PORTS:-8000:8000}"
+      - "${API_PORTS:-8000-8002:8000}"
     environment:
       DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
       REDIS_URL: redis://redis:6379/0
