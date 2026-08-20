@@ -31,7 +31,7 @@ the soundbite *and* the gotcha for a section, you own that rung.
  6  Events           Kafka, delivery semantics, DLQ, outbox   (senior)
  7  Production       auth, idempotency, observability, CI     (senior)
  8  Scaling up       system design, sharding, CAP, saga       (staff signal)
- 9  Honest gaps      what's wrong with it, and the fix        (credibility)
+ 9  The audit        what I found in my own code, and fixed  (credibility)
 ```
 
 **Governing rule:** the gaps in §9 are **volunteered, never hidden**. A
@@ -548,10 +548,14 @@ every call). And Lua numbers are floats while Redis integer-truncates a bare
 numeric return — so the script returns `tostring(tokens)` and Python parses it
 back, or the remaining-tokens header loses its fraction.
 
-**Gotcha (a real gap — see §9):** the limiter keys on `X-API-Key or client.host`.
-A client can rotate the header and mint a fresh bucket per request. Behind a
-proxy the real IP is in `X-Forwarded-For`, which is itself spoofable unless you
-verify the request came from your trusted proxy.
+**Gotcha — this was a real gap, now fixed (§9.4):** the limiter used to key on
+`X-API-Key or client.host`, so a client could rotate a header it controls and
+mint a fresh bucket per request — a rate limiter anyone could opt out of. It now
+keys on the **verified** token subject first, falling back to `X-Forwarded-For`
+only when `trust_proxy_headers` is set (that header is spoofable unless a proxy
+you control overwrites it), and finally the peer address. Worth stating as the
+general rule: **throttle on the most trustworthy identifier available, never on
+one the caller can choose.**
 
 ## 3.4 Dual-write consistency: Postgres ↔ Redis
 
@@ -657,7 +661,7 @@ wait-time aging term: without aging, a cheap order starves behind a stream of
 expensive ones, which is the classic scheduling-starvation problem, and aging is
 the OS technique for exactly it."
 
-**Gotcha — volunteer this, it's a strength (see §9.1):** the current
+**Gotcha — volunteer this, it's a strength (see §9.5):** the current
 implementation reloads *all* pending orders and rebuilds the heap on every call,
 so it is **O(n log n) per dispatch**, not O(log n). For a single pop, a plain
 `max()` would do equal work. The heap earns its keep when you pop many in
@@ -1039,8 +1043,10 @@ rider, always — that's not incidental.
 **Connection pooling.** Opening a connection is expensive (TCP + auth + a
 Postgres backend process). The engine keeps N warm connections that requests
 borrow and return. Sizing is `instances × pool_size` against `max_connections`
-(~100 default): 3 replicas × 20 = 60. Do that arithmetic before the DB does it
-for you; PgBouncer is the next tier.
+(~100 default): 3 replicas × 20 = 60. That 20 is configured explicitly in
+`app/core/database.py` — SQLAlchemy's default is 5 + 10 overflow, so quoting the
+arithmetic without setting the value describes a system you do not have. Do the
+arithmetic before the DB does it for you; PgBouncer is the next tier.
 
 ## 5.7 The statelessness checklist — "can I run 3 of these?"
 
@@ -1874,20 +1880,31 @@ infrastructure from **the same `docker-compose.yml` used locally**, so the two
 can't drift. It works without code changes because config is env-driven (§7.3) —
 CI just points `DATABASE_URL`/`REDIS_URL` at its service containers.
 
-**Load: Locust, 50 concurrent users, limiter disabled → ~123 RPS, p99 220 ms, 0%
-errors.** I ran it twice on purpose: with the limiter **on**, 97% of requests
-returned 429 — correct behaviour, one IP capped at 100 tokens, but it measures
-the *limiter*, not the app. With it **off**, those are the honest capacity
-numbers.
+**I have no load number I'm willing to quote, and that is deliberate.** The old
+figure — "~123 RPS, p99 220 ms" — came from a Locust run that only hit
+unauthenticated `POST /orders`. It measured a plain INSERT: no auth, no matching,
+no row locks, no Kafka. The number was real; the claim attached to it was not, so
+I retired it (§9.5).
+
+The load profile now drives `POST /orders/dispatch` — the **claim** — under
+contention with a seeded fleet, which is the number anyone actually cares about.
+It has not been re-run, so there is nothing to report yet. Say exactly that: *"I
+retired that figure because it measured the wrong endpoint, and I haven't
+re-measured."* **An honest absence beats a confident irrelevance**, and an
+interviewer who probes a quoted number is testing whether you know what it
+covered.
 
 **Percentiles, plainly:** p99 = 220 ms means 99% of requests finished within
 220 ms. Percentiles beat averages because the average hides the slow tail, and
 the tail is what users feel.
 
-**Gotcha, and it's the whole point:** always name *which configuration* a load
-number came from. A big RPS with the limiter silently off, or a low one with it
-on, is a misleading number. (See §9.2 — this benchmark still doesn't measure what
-it appears to.)
+**Gotcha, and it's the whole point:** always name *which configuration and which
+endpoint* a load number came from. A big RPS with the limiter silently off, or a
+low one with it on, is a misleading number — and so is a fast one measuring an
+endpoint that does none of the work the system is interesting for. Running it
+twice, limiter on and off, is what makes either number mean something: with the
+limiter **on**, 97% of requests returned 429, which measures the *limiter*, not
+the app.
 
 ## 7.9 Level check — §7
 
@@ -2053,66 +2070,210 @@ demands it.
 ---
 ---
 
-# 9 — The honest gaps
+# 9 — The audit: what was wrong, and what I did about it
 
-Each gap below is only "owned" when you can state **both the flaw and the fix**.
-Admitting a flaw without knowing its remedy is half an answer. Volunteer the
-first two unprompted — they buy the most credibility.
+This section used to list seven known flaws. Then I audited every source file
+line by line and found **nine more** — including four endpoints that had no
+authentication at all. Thirteen are now fixed; six are not.
 
-## 9.1 Scheduler complexity is misstated
+That story is worth more in an interview than the original list was, because it
+demonstrates the thing the list only claimed: that I look for my own defects and
+then close them. Lead with it.
 
-The resume/README line says **O(log n)**; it is actually **O(n log n) per
-dispatch**, because every call reloads all pending orders and rebuilds the heap.
-The `heappop` is O(log n); the build dominates.
-**Fix:** a persistent indexed priority queue updated incrementally, or push the
-ordering into the database (`ORDER BY priority LIMIT 1 FOR UPDATE SKIP LOCKED`)
-and drop the in-process heap entirely.
+**Governing rule, unchanged:** a gap is only "owned" when you can state **both
+the flaw and the fix**. For the fixed ones, state the flaw, the fix, and *why the
+fix is shaped the way it is* — that last part is where the signal is.
 
-## 9.2 The benchmark doesn't measure what it claims
+**One command re-checks all of it:** `./scripts/verify.sh` — config guard, lint,
+71 tests, and a live smoke test of every auth boundary against a real server,
+including an attempt to authenticate with a token forged using the old shipped
+secret.
 
-~123 RPS / p99 220 ms comes from a Locust run that only hits **unauthenticated
-`POST /orders`** — so it measures a plain INSERT. Not matching, not locking, not
-Kafka. **Fix:** benchmark `POST /orders/dispatch` under `--scale api=3` with a
-seeded rider fleet; report dispatch throughput and the p99 of the *claim*, which
-is the number anyone actually cares about.
+## 9.1 The four auth holes ⭐ (lead with this one)
 
-## 9.3 Forgeable admin auth in the deployed instance
+The project's role table was enforced on *write* paths that looked dangerous and
+skipped on ones that didn't. Four endpoints shipped open:
 
-The JWT secret is the hardcoded dev default in the deployed configuration, so an
-`ops` token can be forged. **Fix:** inject the secret from the platform's secret
-store, fail startup if it equals the default, and rotate.
+| Endpoint | Was | Now |
+|---|---|---|
+| `PATCH /riders/{id}/location` | anonymous | ops, or the rider themselves |
+| `POST /orders` | anonymous, `customer_id` from the body | authenticated, id from the token |
+| `GET /orders`, `GET /orders/{id}` | anonymous, every order | scoped by role |
+| `GET /riders`, `GET /riders/{id}` | anonymous, full roster + positions | ops, or the rider themselves |
 
-## 9.4 No transactional outbox
+**The worst one, and why it's the worst.** `PATCH /riders/{id}/location` writes
+through to the Redis geohash index, and **that index is the matching engine**.
+Anyone who could call it could teleport the whole fleet onto one coordinate and
+defeat the distance filter, the fairness band and the two-phase claim in a single
+unauthenticated request. It shipped open because it reads like a profile update.
+The lesson to say out loud: *"who may write this field" and "who may decide
+dispatch outcomes" turned out to be the same question, and I had not noticed they
+were.*
 
-A crash between `db.commit()` and the Kafka publish loses the event permanently
-(§6.9). **This is the dual-write problem, by name.** **Fix:** an `outbox` table
-written inside the order's transaction plus a relay (polling, or WAL-tailing via
-Debezium), accepting at-least-once publishing that the existing idempotent
+**The ownership hole.** `POST /orders` took `customer_id` from the request body,
+so anyone could place an order as anyone — and the system therefore had no
+trustworthy notion of ownership at all, which is what every read-scoping rule
+depends on. The fix removes the field from the schema entirely rather than
+validating it: **a field the server must check against the token is a field the
+client should not be sending.**
+
+**The 403-vs-404 pair ⭐** — my favourite detail here, because the two endpoints
+point opposite ways *on purpose*:
+
+- `GET /orders/{id}` returns **404** for an order you may not see. A 403 would
+  confirm the id exists and let you enumerate orders one request at a time.
+- `PATCH /riders/{id}/location` returns **403 before checking existence**. Here
+  the rider id is not the secret, and authorising first stops the 404-vs-403
+  difference from mapping the fleet.
+
+Same mechanism, opposite answers. The deciding question is *which fact is worth
+hiding* — and being able to argue both directions is the point.
+
+**Soundbite:** "My audit found four endpoints with no auth at all. The worst let
+anyone move any rider, and since rider positions are the matching index, that was
+full control of dispatch from an unauthenticated request. I fixed the authz, but
+the more useful takeaway was why it happened: it looked like a profile update, so
+I'd classified it by shape instead of by blast radius."
+
+## 9.2 The signing key had a working default ⭐
+
+`JWT_SECRET` defaulted to `dev-only-change-me` — a value published in the
+repository — so anyone with the source could mint an ops token, and every
+`require_ops` guard in the project was decorative. Not just in production: in
+*every* environment, because nothing anywhere overrode it or objected.
+
+**The fix is the interesting part.** I removed the default rather than improving
+it. A better default would still have been a default, and **a control that can be
+skipped by forgetting a variable is not a control.** The app now refuses to
+import without a secret, rejects known placeholders by name, and enforces a
+32-**byte** floor — bytes, not characters, for the same reason bcrypt's 72-byte
+limit is counted in bytes.
+
+Two operational details worth having ready:
+
+- Every process needs it, `migrate` included, because `alembic/env.py` imports
+  `app.core.database` → `app.core.config`. One `x-app-env` YAML anchor delivers
+  it to all five services; a secret pasted five times is a secret that ends up
+  wrong in one of them.
+- Compose interpolates `${JWT_SECRET:?}` when the **file** is parsed, so even
+  `docker compose up db` fails without it. That is why CI sets it at job level
+  rather than on the pytest step.
+
+**Soundbite:** "The signing key had a working default, which meant every
+authorization guard in the project was decorative. I removed the default instead
+of improving it — the app now refuses to boot without a real secret, because a
+control you can skip by forgetting an environment variable isn't a control."
+
+## 9.3 Correctness and availability
+
+**Idempotency keys were global.** The cache key was `idempotency:{key}` with no
+caller in it, so two users who both sent `Idempotency-Key: retry-1` collided and
+the second received *the first user's response body*. A cross-tenant leak, not a
+correctness nit. Now namespaced by the **verified** token subject, and bound to a
+hash of method+path+body — so the same key with a different payload is a 422
+instead of a confidently wrong replay.
+
+**The middleware was blocking the event loop ⭐.** Both middlewares used the
+*synchronous* Redis client while being `async def`. The routes were fine — they
+are sync `def`, so FastAPI runs them in a threadpool — but the middleware chain
+runs on the loop, so every request stalled every other in-flight request on the
+process. The irony worth admitting: §7.4 sells the `ContextVar` on the grounds
+that "async interleaves many requests on one thread," and the middleware was
+preventing exactly that. Now two clients: async for middleware, sync for services.
+
+**"Fail open" was only half-built ⭐.** Both middlewares catch `redis.RedisError`
+and deliberately fail open, and that reasoning is sound. But there were no socket
+timeouts — so it only caught a *refused* connection. A Redis that accepts and
+then **hangs**, which is the more common production failure, raised nothing and
+blocked forever. The protective control failed in exactly the mode it was written
+to survive. A timeout is what turns a hang into an error the fallback can act on.
+
+**The pool sizing was fiction.** §5.6 quotes "3 replicas × 20 = 60" — the code
+called bare `create_engine()`, whose default is 5 + 10. Now configured
+explicitly, with `pool_pre_ping` so a Postgres restart doesn't hand out dead
+connections until each one fails a real query.
+
+**Soundbite:** "The one I'd flag hardest is that my fail-open only caught refused
+connections. Redis hanging is the likelier failure and it had no timeout, so the
+degradation path I'd written a comment about could never actually run. Adding
+socket timeouts is what made the design I'd described real."
+
+## 9.4 Keying, pipelining, and measuring
+
+- **The rate limiter was opt-out.** It keyed on `X-API-Key or client.host`, so
+  rotating a header you control minted a fresh bucket per request. Now: verified
+  `sub` first, then `X-Forwarded-For` **only** behind an explicit
+  `trust_proxy_headers` flag (trusting it unconditionally is the same bypass in a
+  different header), then the peer address. The key is hashed so a bucket can
+  never leak an email into Redis or a log.
+- **Matching did 2 un-pipelined Redis round trips per candidate**, inside the
+  dispatch hot path, *while holding a Postgres row lock on the order* — so
+  per-candidate latency was lock-hold time. One pipeline now.
+- **Idempotent replays bypassed the metrics middleware**, which sat inside
+  idempotency: `idempotent_replays_total` counted them while
+  `http_requests_total` did not, and the two metrics disagreed about how much
+  traffic the service had served. Moving metrics outermost fixed the count — and
+  **broke the label**, because `scope["route"]` is only populated once the router
+  matches. Counting replays under `__unmatched__` is a worse lie than a missing
+  count, so the route template is now resolved directly. Good thing to tell:
+  *the fix needed a second fix, and a test caught it.*
+- **Request ids were minted unconditionally**, discarding any upstream
+  `X-Request-ID`, so a trail could not be followed across a hop — which is the
+  entire point of having one. Now adopted when well-formed, and validated first,
+  because that value goes straight into every log line for the request.
+- **The idempotency in-flight lock was 30s**, shorter than a slow request, so the
+  claim could expire mid-flight and let a retry double-execute — precisely what
+  the middleware exists to prevent.
+
+## 9.5 Still open — the genuine remaining gaps
+
+Volunteer these. They are the honest half of the story and each one has a fix I
+can describe.
+
+**No transactional outbox.** A crash between `db.commit()` and the Kafka publish
+loses the event permanently (§6.9). **This is the dual-write problem, by name** —
+the most important thing still outstanding. *Fix:* an `outbox` table written
+inside the order's transaction plus a relay (polling, or WAL-tailing via
+Debezium), accepting the at-least-once publishing that the existing idempotent
 consumers already absorb.
 
-## 9.5 Durability theatre
+**Durability theatre.** One Kafka broker with RF=1 means `acks=all` provides no
+real durability — "all" is one replica. *Fix:* three brokers, RF=3,
+`min.insync.replicas=2`. **The producer config is already correct; the topology
+isn't**, which is the whole point.
 
-A single Kafka broker with RF=1 means `acks=all` provides **no real durability** —
-"all" is one replica. **Fix:** three brokers, RF=3, `min.insync.replicas=2`; the
-config is already correct, the topology isn't.
+**The dispatcher is still O(n log n) per call.** Every dispatch reloads all
+pending orders and rebuilds the heap; the `heappop` is O(log n) but the build
+dominates. The README wording is corrected. *Fix:* push the ordering into the
+database (`ORDER BY priority LIMIT 1 FOR UPDATE SKIP LOCKED`) and drop the
+in-process heap entirely.
 
-## 9.6 The rate limiter is bypassable
+**No benchmark numbers I'm willing to quote.** The old "~123 RPS, p99 220 ms"
+came from a Locust run hitting unauthenticated `POST /orders` — it measured a
+plain INSERT, not matching, locking or Kafka. The load profile now drives the
+dispatch **claim** under contention, but **I have not re-run it**, so I have no
+number. Say that rather than quoting the old one: *"I retired that figure because
+it measured the wrong endpoint, and I haven't re-measured yet."* An honest
+absence beats a confident irrelevance.
 
-It keys on `X-API-Key or client.host`, so rotating a client-supplied header mints
-a fresh bucket per request. **Fix:** key on authenticated identity where one
-exists, and on a proxy-verified `X-Forwarded-For` otherwise — trusting that header
-blindly lets anyone forge a new IP per request.
+**The concurrency proof isn't in CI.** `scripts/race_test.py` is a manual script,
+so the project's headline correctness property is not regression-protected. No
+test asserts an event round-trips a real broker either — publishing is patched at
+the call sites. *Fix:* the race test as a CI job with `--scale api=3`, and one
+end-to-end produce-and-consume test.
 
-## 9.7 Test gaps
+**No token revocation.** §7.1 names revocation as JWT's weakness and offers the
+per-request user lookup as mitigation — that covers *deleted* and *demoted* users
+only. A stolen token, a password change, or "log me out everywhere" all stay
+valid until `exp`. *Fix:* a `jti` claim plus a Redis denylist with a TTL matching
+the token's remaining life. Redis is already a hard dependency, so it costs no
+new infrastructure.
 
-Kafka *infrastructure* is real in the suite, but publishing is patched at the call
-sites, so no test asserts an event actually round-trips a broker. The concurrency
-proof (`scripts/race_test.py`) is a manual script, not in CI — which means the
-project's headline correctness property is not regression-protected. **Fix:** one
-end-to-end test that produces and consumes for real, and the race test as a CI
-job.
+**No FK on `orders.customer_id`.** Ownership is enforced in the handler but not
+by the database. *Fix:* a migration adding the constraint — deferred because
+applying it to existing rows needs a decision about orphaned demo data.
 
-## 9.8 Known-and-deliberate, not gaps
+## 9.6 Known-and-deliberate, not gaps
 
 State these as choices, not omissions: the fairness band Δ is a fixed constant
 rather than per-city-tuned; `orders_today` resets on **UTC** midnight rather than
@@ -2129,10 +2290,10 @@ cases this system actually has.
 ## 10.1 Cold-open drill (do these unprompted)
 
 - [ ] Deliver the §0.1 opener cold, in under twenty seconds
-- [ ] Volunteer the O(n log n) correction (§9.1) before being asked
-- [ ] Volunteer the missing outbox (§9.4) before being asked
+- [ ] Volunteer the O(n log n) correction (§9.5) before being asked
+- [ ] Volunteer the missing outbox (§9.5) before being asked
 - [ ] Defend `SKIP LOCKED` — **including what it costs** (§5.3)
-- [ ] Answer "how would you make this production-ready?" using §9 as the answer
+- [ ] Answer "how would you make this production-ready?" using §9.5 as the answer
 - [ ] Sketch the architecture from memory, naming a trade-off at every arrow
 - [ ] Tell the §5.5 story with the numbers: 5/15 → 10/15, zero doubles
 
@@ -2179,7 +2340,7 @@ result → what I'd change.
 - [ ] derive the token bucket's advantages *and* what `expire` really does (§3.2)
 - [ ] explain why Lua is atomic and what race it removes (§3.3)
 - [ ] explain the dual write, the phantom-cell bug, and reconciliation (§3.4)
-- [ ] justify aging, and state the real complexity of your dispatcher (§4.1, §9.1)
+- [ ] justify aging, and state the real complexity of your dispatcher (§4.1, §9.5)
 - [ ] argue the fairness band against a blended score (§4.3)
 - [ ] give the two failure semantics of the same `transition()` call (§4.4)
 - [ ] draw the lost update and fix it both ways (§5.3)
@@ -2195,7 +2356,7 @@ result → what I'd change.
 - [ ] explain metric cardinality and liveness vs readiness (§7.5)
 - [ ] run the 6-step design framework with envelope math on a fresh prompt (§8.1–8.2)
 - [ ] whiteboard the dispatch system with a trade-off at every arrow (§8.7)
-- [ ] state all seven gaps in §9 *with their fixes*
+- [ ] state the six remaining gaps in §9.5 *with their fixes*
 
 *Every unchecked box is your next review target.*
 
