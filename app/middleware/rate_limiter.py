@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import time
 
@@ -7,7 +8,8 @@ from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.core.metrics import rate_limit_rejections_total
-from app.core.redis_client import redis_client
+from app.core.redis_client import async_redis_client
+from app.core.security import subject_from_bearer
 
 logger = logging.getLogger("deliveriq")
 
@@ -49,8 +51,39 @@ redis.call('EXPIRE', KEYS[1], ttl)
 return tostring(tokens)
 """
 
-# register the script once at import (returns a callable)
-_rate_limit = redis_client.register_script(RATE_LIMIT_LUA)
+# register the script once at import (returns an awaitable callable)
+_rate_limit = async_redis_client.register_script(RATE_LIMIT_LUA)
+
+
+def bucket_identity(request: Request) -> str:
+    """Who this request is throttled AS (G13).
+
+    The old key was `X-API-Key or client.host`, which meant a caller could mint
+    a brand-new bucket per request just by changing a header they control — a
+    rate limiter anyone could opt out of. The order below is strictly
+    most-trustworthy first:
+
+      1. the VERIFIED `sub` of a bearer token. Unforgeable without the signing
+         key, and it follows the user across IPs, which is what you actually
+         want to limit.
+      2. `X-Forwarded-For`, but ONLY when trust_proxy_headers is set — i.e. we
+         are behind a proxy that OVERWRITES it. Trusting it unconditionally is
+         the same bypass in a different header.
+      3. the peer address, which the client cannot choose.
+    """
+    sub = subject_from_bearer(request.headers.get("Authorization"))
+    if sub:
+        # Hashed so a bucket key can never leak an email into Redis or a log.
+        return "user:" + hashlib.sha256(sub.encode()).hexdigest()[:32]
+
+    if settings.trust_proxy_headers:
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            # Left-most entry is the original client; the rest is proxy chain.
+            return "ip:" + forwarded.split(",")[0].strip()
+
+    client = request.client
+    return "ip:" + (client.host if client is not None else "unknown")
 
 
 async def rate_limit_middleware(request: Request, call_next):
@@ -60,15 +93,13 @@ async def rate_limit_middleware(request: Request, call_next):
     if request.url.path in PROBE_PATHS:
         return await call_next(request)
 
-    # request.client can be None in raw ASGI / some test setups — guard it.
-    client = request.client
-    client_ip = client.host if client is not None else "unknown"
-    client_key = request.headers.get("X-API-Key") or client_ip
-    bucket_key = f"rate_limit:{client_key}"
+    bucket_key = f"rate_limit:{bucket_identity(request)}"
     now = time.time()
 
     try:
-        result = _rate_limit(
+        # AWAITED, not blocking (G06). This runs on the event loop; a sync
+        # Redis call here stalls every other in-flight request on the process.
+        result = await _rate_limit(
             keys=[bucket_key],
             args=[BUCKET_SIZE, REFILL_RATE, now, TTL],
         )

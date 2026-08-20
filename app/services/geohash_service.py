@@ -55,14 +55,24 @@ def select_rider(
     if not candidates:
         return None
 
-    scored = []
+    # ONE pipeline instead of two round trips per candidate (G15). This runs
+    # inside the dispatch hot path WHILE a Postgres row lock is held on the
+    # order, so per-candidate latency is lock-hold time: with 20 riders in a
+    # cell the old loop cost 40 sequential round trips, all of them blocking
+    # every other dispatcher contending for that row.
+    pipe = redis_client.pipeline(transaction=False)
     for rid in candidates:
-        loc = redis_client.hgetall(f"rider:{rid}:loc")
+        pipe.hgetall(f"rider:{rid}:loc")
+        pipe.get(_orders_key(rid))
+    replies = pipe.execute()
+
+    scored = []
+    for i, rid in enumerate(candidates):
+        loc, orders_raw = replies[2 * i], replies[2 * i + 1]
         if not loc:
             continue
         dist = _haversine(order_lat, order_lon, float(loc["lat"]), float(loc["lon"]))
-        orders_today = int(redis_client.get(_orders_key(rid)) or 0)
-        scored.append((rid, dist, orders_today))
+        scored.append((rid, dist, int(orders_raw or 0)))
     if not scored:
         return None
 

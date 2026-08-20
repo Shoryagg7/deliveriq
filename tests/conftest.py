@@ -4,6 +4,13 @@ os.environ["DATABASE_URL"] = (
     "postgresql://deliveriq_user:password@localhost:5433/deliveriq_test_db"
 )
 os.environ["REDIS_URL"] = "redis://localhost:6379/15"
+# JWT_SECRET has no default (G04) — app.core.config refuses to import without
+# one. Set here, before any app import, so the suite doesn't depend on a
+# developer's .env being present. Deterministic on purpose: a random per-run
+# secret would make a token captured in one test meaningless in the next.
+os.environ.setdefault(
+    "JWT_SECRET", "test-only-secret-not-used-outside-the-suite-0123456789"
+)
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -129,4 +136,29 @@ def ops_client(client, ops_headers):
     otherwise every request in a flow test grows a headers= argument.
     """
     client.headers.update(ops_headers)
+    return client
+
+
+@pytest.fixture
+def customer_headers(client):
+    """Bearer headers for a plain customer — the default actor for order flows.
+
+    Placing an order now requires a token (G02): `customer_id` comes from the
+    subject, not the body, so there is no such thing as an anonymous order.
+    """
+    client.post(
+        "/auth/register",
+        json={"email": "customer@deliveriq.io", "password": "custpassword123"},
+    )
+    token = client.post(
+        "/auth/login",
+        json={"email": "customer@deliveriq.io", "password": "custpassword123"},
+    ).json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def customer_client(client, customer_headers):
+    """A client already carrying a customer bearer token."""
+    client.headers.update(customer_headers)
     return client
