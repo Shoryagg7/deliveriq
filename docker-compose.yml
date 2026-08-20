@@ -1,3 +1,18 @@
+# Shared app environment. Every service built from this repo imports
+# app.core.config at import time, and JWT_SECRET has no default (G04) — so all
+# of them need it, `migrate` included, because alembic/env.py imports
+# app.core.database. One anchor instead of five copies: a secret that has to be
+# pasted five times is a secret that ends up wrong in one of them.
+#
+# `:?` makes Compose itself refuse to start when JWT_SECRET is unset, rather
+# than passing an empty string down to a container that then fails to boot with
+# a stack trace nobody reads.
+x-app-env: &app-env
+  DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
+  REDIS_URL: redis://redis:6379/0
+  KAFKA_BOOTSTRAP: kafka:19092
+  JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env — see .env.example}
+
 services:
   db:
     image: postgres:18
@@ -75,7 +90,7 @@ services:
     build: .
     command: alembic upgrade head
     environment:
-      DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
+      <<: *app-env
     depends_on:
       db:
         condition: service_healthy
@@ -88,9 +103,7 @@ services:
     ports:
       - "${API_PORTS:-8000-8002:8000}"
     environment:
-      DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
-      REDIS_URL: redis://redis:6379/0
-      KAFKA_BOOTSTRAP: kafka:19092
+      <<: *app-env
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -108,9 +121,7 @@ services:
     build: .
     command: python -m app.workers.notification_consumer
     environment:
-      DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
-      REDIS_URL: redis://redis:6379/0
-      KAFKA_BOOTSTRAP: kafka:19092
+      <<: *app-env
     depends_on:
       kafka-init:
         condition: service_completed_successfully
@@ -120,9 +131,7 @@ services:
     build: .
     command: python -m app.workers.analytics_consumer
     environment:
-      DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
-      REDIS_URL: redis://redis:6379/0
-      KAFKA_BOOTSTRAP: kafka:19092
+      <<: *app-env
     depends_on:
       migrate:                       # writes to dispatch_events → needs schema
         condition: service_completed_successfully
@@ -134,12 +143,11 @@ services:
     build: .
     command: python -m app.workers.audit_consumer
     environment:
-      # This worker never touches Postgres, but Settings is one global object
-      # with database_url required — so every process must supply it or fail at
-      # import. Per-process config classes would fix that; noted, not done.
-      DATABASE_URL: postgresql://deliveriq_user:password@db:5432/deliveriq_db
-      REDIS_URL: redis://redis:6379/0
-      KAFKA_BOOTSTRAP: kafka:19092
+      # Inherits the shared block even though this worker never touches Postgres
+      # or Redis: Settings is one global object, so every process must satisfy
+      # every required field or fail at import. Per-process config classes would
+      # fix that; noted, not done.
+      <<: *app-env
       AUDIT_LOG_PATH: /var/log/deliveriq/audit.log
     volumes:
       - auditdata:/var/log/deliveriq

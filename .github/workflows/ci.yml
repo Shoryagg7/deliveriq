@@ -18,6 +18,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    # Job-level, not step-level. JWT_SECRET has no default (G04), so every
+    # process that imports app.core.config needs it — and docker-compose.yml
+    # interpolates `${JWT_SECRET:?}` when the FILE is parsed, so even
+    # `docker compose up db` fails without it. A CI-only throwaway value: it
+    # signs nothing that outlives the run, but it must still clear the length
+    # and placeholder checks the app enforces.
+    env:
+      JWT_SECRET: ci-only-not-a-real-secret-do-not-reuse-anywhere-0123456789
+
     steps:
       - uses: actions/checkout@v4
 

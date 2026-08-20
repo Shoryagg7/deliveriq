@@ -248,7 +248,6 @@ export default function App() {
     setBusy(true);
     try {
       const body = {
-        customer_id: Math.floor(Math.random() * 100) + 1,
         restaurant_id: Math.floor(Math.random() * 20) + 1,
         value: Math.floor(Math.random() * 900) + 100,
         pickup_lat: 28.61,

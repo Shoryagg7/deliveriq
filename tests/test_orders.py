@@ -1,19 +1,55 @@
+"""Order lifecycle: creation, dispatch, state transitions, idempotency.
+
+Every /orders call carries a token now (G02). `customer_id` is derived from the
+subject rather than the body, so an anonymous order is not a thing that exists.
+"""
+
 from app.core.enums import Topic
 
 
-def test_create_order(client):
+def _make_rider(client, lat=28.6139, lon=77.2090, headers=None):
+    r = client.post(
+        "/riders",
+        json={
+            "name": "Suresh",
+            "current_lat": lat,
+            "current_lon": lon,
+        },
+        headers=headers,
+    )
+    assert r.status_code == 201
+    return r.json()["id"]
+
+
+def _make_order(client, lat=28.6139, lon=77.2090, headers=None):
     r = client.post(
         "/orders",
         json={
-            "customer_id": 1,
             "restaurant_id": 1,
             "value": 500,
-            "pickup_lat": 28.6139,
-            "pickup_lon": 77.2090,
-            "drop_lat": 28.7041,
-            "drop_lon": 77.1025,
+            "pickup_lat": lat,
+            "pickup_lon": lon,
+            "drop_lat": 19.0760,
+            "drop_lon": 72.8777,  # Mumbai drop
         },
+        headers=headers,
     )
+    assert r.status_code == 201
+    return r.json()["id"]
+
+
+def _order_payload(value=250):
+    return {
+        "restaurant_id": 1, "value": value,
+        "pickup_lat": 28.6139, "pickup_lon": 77.2090,
+        "drop_lat": 28.7041, "drop_lon": 77.1025,
+    }
+
+
+# --- creation and validation ------------------------------------------------
+
+def test_create_order(customer_client):
+    r = customer_client.post("/orders", json=_order_payload(value=500))
     assert r.status_code == 201
     body = r.json()
     assert body["value"] == 500
@@ -21,28 +57,28 @@ def test_create_order(client):
     assert body["id"] == 1
 
 
-def test_invalid_value_rejected(client):
-    r = client.post(
-        "/orders",
-        json={
-            "customer_id": 1,
-            "restaurant_id": 1,
-            "value": -10,
-            "pickup_lat": 28.6,
-            "pickup_lon": 77.2,
-            "drop_lat": 28.7,
-            "drop_lon": 77.3,
-        },
-    )
+def test_order_is_owned_by_the_caller_not_the_body(customer_client):
+    """G02: a client-supplied customer_id must not be able to reassign ownership."""
+    me = customer_client.get("/auth/me").json()["id"]
+    body = _order_payload() | {"customer_id": me + 999}
+    created = customer_client.post("/orders", json=body).json()
+    assert created["customer_id"] == me
+
+
+def test_anonymous_may_not_create_an_order(client):
+    assert client.post("/orders", json=_order_payload()).status_code == 401
+
+
+def test_invalid_value_rejected(customer_client):
+    r = customer_client.post("/orders", json=_order_payload(value=-10))
     assert r.status_code == 422
 
 
-def test_boundary_coordinates_accepted(client):
+def test_boundary_coordinates_accepted(customer_client):
     # south pole (-90) and antimeridian (-180/180) are valid coordinates
-    r = client.post(
+    r = customer_client.post(
         "/orders",
         json={
-            "customer_id": 1,
             "restaurant_id": 1,
             "value": 100,
             "pickup_lat": -90,
@@ -54,38 +90,17 @@ def test_boundary_coordinates_accepted(client):
     assert r.status_code == 201
 
 
-def test_get_missing_order_404(client):
-    r = client.get("/orders/999")
+def test_get_missing_order_404(customer_client):
+    assert customer_client.get("/orders/999").status_code == 404
+
+
+def test_error_envelope(customer_client):
+    r = customer_client.get("/orders/999")
     assert r.status_code == 404
-def _make_rider(client, lat=28.6139, lon=77.2090):
-    r = client.post(
-        "/riders",
-        json={
-            "name": "Suresh",
-            "current_lat": lat,
-            "current_lon": lon,
-        },
-    )
-    assert r.status_code == 201
-    return r.json()["id"]
+    assert r.json() == {"error": "ORDER_NOT_FOUND", "message": "Order 999 not found"}
 
 
-def _make_order(client, lat=28.6139, lon=77.2090):
-    r = client.post(
-        "/orders",
-        json={
-            "customer_id": 1,
-            "restaurant_id": 1,
-            "value": 500,
-            "pickup_lat": lat,
-            "pickup_lon": lon,
-            "drop_lat": 19.0760,
-            "drop_lon": 72.8777,  # Mumbai drop
-        },
-    )
-    assert r.status_code == 201
-    return r.json()["id"]
-
+# --- dispatch ---------------------------------------------------------------
 
 def test_dispatch_assigns_rider(ops_client):
     rider_id = _make_rider(ops_client)
@@ -154,7 +169,6 @@ def test_delivery_frees_rider(ops_client, ops_headers):
     new_order = ops_client.post(
         "/orders",
         json={
-            "customer_id": 2,
             "restaurant_id": 1,
             "value": 300,
             "pickup_lat": 19.0760,
@@ -169,46 +183,35 @@ def test_delivery_frees_rider(ops_client, ops_headers):
     assert r.json()["dispatched"] == {"order_id": new_order, "rider_id": rider_id}
 
 
-def test_illegal_transition_rejected(client, ops_headers):
-    order_id = _make_order(client)
+def test_illegal_transition_rejected(ops_client, ops_headers):
+    order_id = _make_order(ops_client)
     # PENDING → DELIVERED skips ASSIGNED/PICKED_UP → illegal
-    r = client.patch(f"/orders/{order_id}/status", json={"status": "DELIVERED"}, headers=ops_headers)
+    r = ops_client.patch(f"/orders/{order_id}/status", json={"status": "DELIVERED"}, headers=ops_headers)
     assert r.status_code == 400
 
-def test_error_envelope(client):
-    r = client.get("/orders/999")
-    assert r.status_code == 404
-    assert r.json() == {"error": "ORDER_NOT_FOUND", "message": "Order 999 not found"}
 
+# --- idempotency ------------------------------------------------------------
 
-def _order_payload(value=250):
-    return {
-        "customer_id": 1, "restaurant_id": 1, "value": value,
-        "pickup_lat": 28.6139, "pickup_lon": 77.2090,
-        "drop_lat": 28.7041, "drop_lon": 77.1025,
-    }
-
-
-def test_idempotent_retry_replays_first_response(client):
+def test_idempotent_retry_replays_first_response(customer_client):
     """A retried POST must return the FIRST response, not create a second order."""
     headers = {"Idempotency-Key": "retry-me"}
-    first = client.post("/orders", json=_order_payload(), headers=headers)
-    second = client.post("/orders", json=_order_payload(), headers=headers)
+    first = customer_client.post("/orders", json=_order_payload(), headers=headers)
+    second = customer_client.post("/orders", json=_order_payload(), headers=headers)
 
     assert first.status_code == 201
     assert second.json() == first.json()          # same id, same body
     assert second.headers.get("Idempotent-Replay") == "true"
-    assert len(client.get("/orders").json()) == 1  # only ONE order exists
+    assert len(customer_client.get("/orders").json()) == 1  # only ONE order exists
 
 
-def test_different_idempotency_keys_create_separate_orders(client):
-    a = client.post("/orders", json=_order_payload(), headers={"Idempotency-Key": "a"})
-    b = client.post("/orders", json=_order_payload(), headers={"Idempotency-Key": "b"})
+def test_different_idempotency_keys_create_separate_orders(customer_client):
+    a = customer_client.post("/orders", json=_order_payload(), headers={"Idempotency-Key": "a"})
+    b = customer_client.post("/orders", json=_order_payload(), headers={"Idempotency-Key": "b"})
     assert a.json()["id"] != b.json()["id"]
 
 
-def test_no_key_means_no_deduplication(client):
+def test_no_key_means_no_deduplication(customer_client):
     """Opt-in contract: without the header, behaviour is unchanged."""
-    a = client.post("/orders", json=_order_payload())
-    b = client.post("/orders", json=_order_payload())
+    a = customer_client.post("/orders", json=_order_payload())
+    b = customer_client.post("/orders", json=_order_payload())
     assert a.json()["id"] != b.json()["id"]

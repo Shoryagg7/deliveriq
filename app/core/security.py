@@ -65,3 +65,23 @@ def decode_access_token(token: str) -> dict | None:
         return jwt.decode(token, settings.jwt_secret, algorithms=[ALGORITHM])
     except JWTError:
         return None
+
+
+def subject_from_bearer(authorization: str | None) -> str | None:
+    """The verified `sub` from an Authorization header, or None.
+
+    Used by middleware, which runs BEFORE the dependency graph and so has no
+    `get_current_user` to lean on. Verification still happens — an unverified
+    decode would let a caller pick their own rate-limit bucket or idempotency
+    namespace by editing base64, which is the whole hole this closes (G13/G05).
+
+    Returns None rather than raising: middleware must not turn a malformed
+    token into an error, only into "unauthenticated". The routes decide that.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    claims = decode_access_token(authorization[7:])
+    if claims is None:
+        return None
+    sub = claims.get("sub")
+    return sub if isinstance(sub, str) and sub else None

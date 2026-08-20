@@ -21,12 +21,15 @@ from app.core.database import SessionLocal
 from app.core.kafka_producer import flush_producer
 from app.models.order import Order
 from app.models.rider import Rider
+from app.models.user import User
 from app.services.dispatch import pick_next_order
 from app.services.geohash_service import add_rider
 
 PICKUP = (28.6100, 77.2000)
 DROP = (28.6500, 77.2500)
 JITTER = 0.0015  # ~165m — comfortably inside the geohash search ring
+
+DEMO_CUSTOMER = "customer@deliveriq.io"  # created by scripts.seed_users
 
 N_RIDERS = 6
 N_ORDERS = 9
@@ -50,10 +53,19 @@ def main() -> None:
             add_rider(rider.id, rider.current_lat, rider.current_lon)
             riders.append(rider)
 
+        # Orders belong to a REAL user now (G02): customer_id is derived from
+        # the token at the API, and order listings are scoped by owner — a
+        # random id would seed orders no demo login can see.
+        customer = db.query(User).filter(User.email == DEMO_CUSTOMER).first()
+        if customer is None:
+            raise SystemExit(
+                f"no {DEMO_CUSTOMER} user — run `python -m scripts.seed_users` first"
+            )
+
         for _ in range(N_ORDERS):
             db.add(
                 Order(
-                    customer_id=random.randint(1, 200),
+                    customer_id=customer.id,
                     restaurant_id=random.randint(1, 30),
                     value=random.randint(120, 950),
                     pickup_lat=PICKUP[0],

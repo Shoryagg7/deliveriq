@@ -14,7 +14,7 @@ from app.core.exceptions import DeliverIQError
 from app.core.kafka_producer import flush_producer, get_producer
 from app.core.logging_config import setup_logging
 from app.core.metrics import dependency_up
-from app.core.redis_client import redis_client
+from app.core.redis_client import async_redis_client, redis_client
 from app.middleware.idempotency import idempotency_middleware
 from app.middleware.metrics import metrics_middleware
 from app.middleware.rate_limiter import rate_limit_middleware
@@ -35,6 +35,9 @@ async def lifespan(app: FastAPI):
     # --- shutdown --- drain buffered events before the process dies
     logger.info("shutdown: flushing kafka producer")
     flush_producer()
+    # The async pool holds real sockets; closing it stops "Unclosed connection"
+    # noise on shutdown and returns the connections promptly.
+    await async_redis_client.aclose()
 
 
 app = FastAPI(title="DeliverIQ", lifespan=lifespan)
@@ -44,12 +47,18 @@ app.include_router(admin.router)
 app.include_router(auth.router)
 # Middleware runs in REVERSE registration order, so this list reads
 # outermost-last. Effective order per request:
-#   request_id  -> rate_limit -> idempotency -> route
+#   request_id -> metrics -> rate_limit -> idempotency -> route
 # request_id outermost so every log line, including a 429, carries a trace id.
+# metrics NEXT (G16): it used to sit inside idempotency, so a replayed response
+#   returned without ever passing through it — replays were missing from
+#   http_requests_total while idempotent_replays_total counted them, and the two
+#   metrics disagreed about how much traffic the service had served. A metrics
+#   layer has to wrap everything that can produce a response, or it is measuring
+#   a subset it cannot name.
 # rate_limit before idempotency so a flood of replayed keys is still throttled.
-app.middleware("http")(metrics_middleware)
 app.middleware("http")(idempotency_middleware)
 app.middleware("http")(rate_limit_middleware)
+app.middleware("http")(metrics_middleware)
 app.middleware("http")(request_id_middleware)
 
 

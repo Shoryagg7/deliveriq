@@ -72,8 +72,10 @@ def seed(headers):
             r.raise_for_status()
             riders.append(r.json()["id"])
         for i in range(N_ORDERS):
-            r = c.post(url(8001, "/orders"),
-                       json={"customer_id": 1, "restaurant_id": 1,
+            # Authenticated like everything else now (G02): customer_id comes
+            # from the token, so it is no longer a field to send.
+            r = c.post(url(8001, "/orders"), headers=headers,
+                       json={"restaurant_id": 1,
                              "value": 100 + i,
                              "pickup_lat": LAT, "pickup_lon": LON,
                              "drop_lat": LAT + 0.01, "drop_lon": LON + 0.01})
