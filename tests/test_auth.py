@@ -77,15 +77,15 @@ def _rider_login(client, db_session_factory, email, rider_id):
     return {"Authorization": f"Bearer {token}"}
 
 
-def test_status_change_requires_authentication(client):
+def test_status_change_requires_authentication(client, customer_headers):
     from tests.test_orders import _make_order
-    oid = _make_order(client)
+    oid = _make_order(client, headers=customer_headers)
     assert client.patch(f"/orders/{oid}/status", json={"status": "ASSIGNED"}).status_code == 401
 
 
-def test_customer_may_not_change_status(client):
+def test_customer_may_not_change_status(client, customer_headers):
     from tests.test_orders import _make_order
-    oid = _make_order(client)
+    oid = _make_order(client, headers=customer_headers)
     _register(client)
     token = _token(client)
     r = client.patch(

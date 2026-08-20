@@ -54,6 +54,46 @@ def require_ops(user: User = Depends(get_current_user)) -> User:
 require_admin = require_ops
 
 
+def assert_may_move_rider(user: User, rider_id: int) -> None:
+    """The PERMITTED-ACTOR guard for location writes (G01).
+
+    Location is not a harmless field. `update_rider_location` writes through to
+    the Redis geohash index, and that index IS the matching engine — so an actor
+    who can move riders can decide who gets dispatched. Left unauthenticated,
+    anyone could teleport the whole fleet onto one coordinate and defeat the
+    distance filter, the fairness band and the two-phase claim in a single
+    request. That makes this the same class of guard as
+    `assert_may_change_status`, not a CRUD detail.
+
+        ops       — may move anyone (correcting a bad GPS fix is an ops action)
+        rider     — may move ONLY themselves
+        customer  — never
+
+    Raises 403; never reveals whether the rider exists to a caller who has no
+    business knowing.
+    """
+    if user.role == UserRole.OPS.value:
+        return
+
+    if user.role == UserRole.RIDER.value:
+        if user.rider_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Rider account is not linked to a rider record",
+            )
+        if user.rider_id != rider_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You may only update your own location",
+            )
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Customers may not update rider locations",
+    )
+
+
 def assert_may_change_status(user: User, order, new_status: OrderStatus) -> None:
     """The PERMITTED-ACTOR guard — orthogonal to the legal-transition guard.
 

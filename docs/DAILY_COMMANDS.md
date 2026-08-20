@@ -1,4 +1,4 @@
-# DeliverIQ — Daily Commands (v3: Days 1–30, Kafka included)
+# DeliverIQ — Daily Commands (v4: Kafka, auth-hardened API, verify.sh)
 
 > Two questions before any command: **which MODE am I in** (dev vs proof), and
 > **which curl mode do I need** (A happy-path vs B debugging).
@@ -30,14 +30,20 @@ Never both at once — they fight over port 8000. Ctrl-C uvicorn before a proof 
 **Morning start:**
 ```bash
 source venv/bin/activate
-docker compose up -d db redis            # Day 31+: db redis kafka  (kafka-ui optional)
+docker compose up -d db redis kafka      # kafka-ui optional
 uvicorn app.main:app --reload            # terminal 1 — leave running, this is your log stream
 ```
+> **Won't start? Check `.env` first.** `JWT_SECRET` has no default — the app
+> refuses to import without one and says so with the fix attached. Generate:
+> `sed -i "s|^JWT_SECRET=.*|JWT_SECRET=$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')|" .env`
+> Compose interpolates it when the **file** is parsed, so even
+> `docker compose up db` fails without it. That is the guard working.
 
 **Daily loop (terminal 2):**
 ```bash
 curl -siS http://localhost:8000/...      # Mode B on first request of the session
 python -m pytest                         # after every meaningful change
+./scripts/verify.sh                      # before any commit — adds lint + live auth checks
 ```
 
 **Installing a package:**
@@ -118,17 +124,33 @@ docker compose down && docker compose up -d db redis   # +kafka from Day 31
 Port rule: `${API_PORTS:-8000:8000}` in compose.yml. Unset = deterministic 8000.
 Scale runs set it inline. The yml file is never edited to switch modes.
 
-### Load test — Locust (Day 27)
+### Load test — Locust
 ```bash
 pip install locust                       # once
-locust -f locustfile.py --host http://localhost:8000
+API_PORTS=8000-8002:8000 docker compose up -d --scale api=3   # contention needs replicas
+docker compose exec api python -m scripts.seed_users
+RATE_LIMIT_ENABLED=false locust -f locustfile.py --host http://localhost:8000
 # browser → http://localhost:8089 → users 50, ramp 10, Start
 ```
-**Run it twice, report which run a number came from:**
-- Limiter ON → ~97% 429s. That's the limiter *working*, not capacity.
-- Limiter OFF (`RATE_LIMIT_ENABLED=false` in the api env) → honest numbers.
-  Day-27 baseline: **~123 RPS @ 50 users · p99 220ms · p95 180ms · median 93ms
-  · 0% errors.** Any regression hunt starts against these.
+**There is no baseline number any more, deliberately.** The old
+"~123 RPS · p99 220 ms" came from a profile that only hit *unauthenticated*
+`POST /orders` — it measured a plain INSERT: no auth, no matching, no row locks,
+no Kafka. The figure was real; the claim attached to it wasn't, so it was retired
+rather than restated.
+
+`locustfile.py` now logs in as ops and mixes two tasks:
+- `/orders [create]` — supply side, keeps the pending queue non-empty
+- `/orders/dispatch [claim]` — **the measurement**: matching under row-lock
+  contention across replicas
+
+**Report the two separately.** A blended RPS across both is meaningless — one is
+an INSERT, the other is the whole system. `409` on dispatch means no rider was
+free, which is a real outcome under load, not an error; the file marks it as a
+success so the run doesn't report a fake error rate.
+
+**Run it twice, and name which run a number came from:**
+- Limiter ON → mostly 429s. That's the limiter *working*, not capacity.
+- Limiter OFF → the honest number. Say the endpoint *and* the replica count.
 
 ### Standalone Docker (Day 27 — dormant, Compose supersedes; kept for the story)
 ```bash
@@ -165,35 +187,117 @@ header (Day 22) — paste that id into the logs to trace one request end-to-end.
 **Error ladder when Mode A prints `Expecting value: line 1 column 0`:**
 `curl -siS` → `docker compose ps -a` (proof mode) or read uvicorn terminal (dev mode) → logs.
 
+### Get a token first — nothing below works without one
+
+**Every endpoint except `/auth/*` and the probes now needs a bearer token.**
+If a curl that used to work returns `401`, that is the fix working, not a
+regression.
+
+```bash
+# ops token — dispatch, rider onboarding, admin, sees everything
+OPS=$(curl -s -X POST http://localhost:8000/auth/login -H "Content-Type: application/json" \
+  -d '{"email":"ops@deliveriq.io","password":"opspassword123"}' \
+  | python -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+
+# customer token — places orders, sees only their own
+CUST=$(curl -s -X POST http://localhost:8000/auth/login -H "Content-Type: application/json" \
+  -d '{"email":"customer@deliveriq.io","password":"custpassword123"}' \
+  | python -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+
+echo ${OPS:0:20}...        # sanity: non-empty means login worked
+```
+> No users yet? `python -m scripts.seed_users` (dev) or
+> `docker compose exec api python -m scripts.seed_users` (proof).
+> Tokens expire in 60 min — re-run the export, don't debug a phantom 401.
+
 ### Endpoint cookbook (real schemas — cross-check /docs after schema changes)
 
 ```bash
-# create rider
-curl -s -X POST http://localhost:8000/riders -H "Content-Type: application/json" \
+# create rider — OPS ONLY (401 without a token, 403 with a customer's)
+curl -s -X POST http://localhost:8000/riders -H "Authorization: Bearer $OPS" \
+  -H "Content-Type: application/json" \
   -d '{"name":"Suresh","current_lat":28.6139,"current_lon":77.2090}' | python -m json.tool
 
-# create order
-curl -s -X POST http://localhost:8000/orders -H "Content-Type: application/json" \
-  -d '{"customer_id":1,"restaurant_id":1,"value":250,
+# create order — NO customer_id in the body; it comes from the token
+curl -s -X POST http://localhost:8000/orders -H "Authorization: Bearer $CUST" \
+  -H "Content-Type: application/json" \
+  -d '{"restaurant_id":1,"value":250,
        "pickup_lat":28.6140,"pickup_lon":77.2090,
        "drop_lat":28.6200,"drop_lon":77.2150}' | python -m json.tool
 
-# dispatch next order
-curl -s -X POST http://localhost:8000/orders/dispatch | python -m json.tool
+# dispatch next order — OPS ONLY
+curl -s -X POST http://localhost:8000/orders/dispatch -H "Authorization: Bearer $OPS" | python -m json.tool
 
 # advance order status (ASSIGNED → PICKED_UP → DELIVERED; CANCELLED where legal)
-curl -s -X PATCH http://localhost:8000/orders/1/status -H "Content-Type: application/json" \
-  -d '{"status":"PICKED_UP"}' | python -m json.tool
+curl -s -X PATCH http://localhost:8000/orders/1/status -H "Authorization: Bearer $OPS" \
+  -H "Content-Type: application/json" -d '{"status":"PICKED_UP"}' | python -m json.tool
 
-# reads
-curl -s http://localhost:8000/orders/1 | python -m json.tool
-curl -s http://localhost:8000/admin/stats | python -m json.tool
+# move a rider — ops, or that rider. Writes through to the geohash index.
+curl -s -X PATCH http://localhost:8000/riders/1/location -H "Authorization: Bearer $OPS" \
+  -H "Content-Type: application/json" -d '{"lat":28.6150,"lon":77.2100}' | python -m json.tool
 
-# rate limiter — burst test (Day 16/25): 200s, then 429s once the bucket drains
-for i in {1..110}; do curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/orders/1; done | sort | uniq -c
+# reads — scoped by role: ops sees all, customer sees only their own
+curl -s http://localhost:8000/orders -H "Authorization: Bearer $OPS"  | python -m json.tool
+curl -s http://localhost:8000/orders -H "Authorization: Bearer $CUST" | python -m json.tool
+curl -s http://localhost:8000/admin/stats -H "Authorization: Bearer $OPS" | python -m json.tool
 
 # interactive alternative to all of the above: http://localhost:8000/docs
+#   click Authorize, paste the raw token (no "Bearer " prefix)
 ```
+
+### Security spot-checks — what each one proves
+
+```bash
+# every one of these must print 401 — the four endpoints that used to be open
+for ep in /orders /riders; do
+  curl -s -o /dev/null -w "GET  $ep -> %{http_code}\n" http://localhost:8000$ep; done
+curl -s -o /dev/null -w "PATCH /riders/1/location -> %{http_code}\n" \
+  -X PATCH http://localhost:8000/riders/1/location \
+  -H "Content-Type: application/json" -d '{"lat":1,"lon":1}'
+
+# 403, not 401 — authenticated but not permitted (authn vs authz)
+curl -s -o /dev/null -w "customer -> dispatch -> %{http_code}\n" \
+  -X POST http://localhost:8000/orders/dispatch -H "Authorization: Bearer $CUST"
+
+# a token signed with the OLD shipped secret must be rejected
+FORGED=$(python -c "
+from jose import jwt
+from datetime import datetime, timedelta, UTC
+print(jwt.encode({'sub':'ops@deliveriq.io','exp':datetime.now(UTC)+timedelta(hours=1)},
+                 'dev-only-change-me', algorithm='HS256'))")
+curl -s -o /dev/null -w "forged ops token -> %{http_code}\n" \
+  http://localhost:8000/admin/stats -H "Authorization: Bearer $FORGED"
+
+# idempotency: same key twice = one order, second carries the replay header
+curl -siS -X POST http://localhost:8000/orders -H "Authorization: Bearer $CUST" \
+  -H "Idempotency-Key: demo-1" -H "Content-Type: application/json" \
+  -d '{"restaurant_id":1,"value":250,"pickup_lat":28.61,"pickup_lon":77.20,"drop_lat":28.62,"drop_lon":77.21}' \
+  | grep -iE "HTTP/|Idempotent-Replay"      # run twice: 2nd shows Idempotent-Replay: true
+
+# same key, DIFFERENT body -> 422, not a wrong replay
+curl -s -o /dev/null -w "key reuse w/ new body -> %{http_code}\n" \
+  -X POST http://localhost:8000/orders -H "Authorization: Bearer $CUST" \
+  -H "Idempotency-Key: demo-1" -H "Content-Type: application/json" \
+  -d '{"restaurant_id":9,"value":999,"pickup_lat":28.61,"pickup_lon":77.20,"drop_lat":28.62,"drop_lon":77.21}'
+
+# rate limiter — burst until the bucket drains (capacity 100, refills 100/min)
+for i in $(seq 1 110); do
+  curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/orders \
+    -H "Authorization: Bearer $CUST"; done | sort | uniq -c
+#   observed:  101 200 / 9 429   <- 100 tokens + refill during the run
+
+# THE OLD BYPASS, now closed: rotating a caller-supplied header used to mint a
+# fresh bucket every request. Keyed on the verified token now, so it does not.
+for i in $(seq 1 20); do
+  curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/orders \
+    -H "Authorization: Bearer $CUST" -H "X-API-Key: rotate-$i"; done | sort | uniq -c
+#   observed:  20 429            <- still throttled. Before the fix: 20 x 200.
+
+# request-id correlation: supply one and it comes back; garbage is replaced
+curl -siS http://localhost:8000/health -H "X-Request-ID: my-trace-12345" | grep -i x-request-id
+```
+> The whole block above is automated: **`./scripts/verify.sh`** runs these plus
+> lint and the test suite, and prints a pass/fail line per check.
 > `POST /riders/match` was **removed** Day 29 ("dead code with a live side
 > effect"). It returns **405**, not 404 — the path still matches
 > `GET /riders/{rider_id}` with `rider_id="match"`. Don't chase that ghost.
@@ -290,17 +394,71 @@ fire-and-forget flaw, in one integer — and the whole reason §8 exists.
 
 ## 6. Tests
 
+### The one command
+
 ```bash
-python -m pytest                              # always python -m (PATH-shadowing lesson); 9 tests
-python -m pytest tests/test_orders.py -k dispatch -v
-python -m pytest -x                           # stop at first failure
-python -m pytest --lf                         # re-run only last failures
-python -m pytest --cov=app --cov-report=term-missing   # coverage + which lines are naked
-python scripts/race_test.py                   # PROOF MODE at scale=3 only
+./scripts/verify.sh          # config guard + infra + migrations + lint + 71 tests + live auth smoke
 ```
-Isolation seams (Day 21): Postgres via `dependency_overrides[get_db]` →
-`deliveriq_test_db`; Redis via `REDIS_DB=15` env set **before import** (module
-global, not a Depends). Two seams, two mechanisms — that asymmetry is the lesson.
+16 checks, ~50 s, pass/fail line each. Safe to run while the stack is up — the
+suite uses `deliveriq_test_db`, so dev data is untouched (verified). Run this
+before any commit and before any demo.
+
+### Everyday pytest
+
+```bash
+python -m pytest                    # always python -m (PATH-shadowing lesson); 71 tests
+python -m pytest -x                 # stop at first failure — use while fixing
+python -m pytest --lf               # re-run only last failures — the tight loop
+python -m pytest -q --no-header     # quiet, for a fast green/red
+python -m pytest --cov=app --cov-report=term-missing    # which lines are naked
+```
+Needs infra up: `docker compose up -d db redis kafka`.
+
+### Which command runs which proof
+
+Pick the file by the property you just touched.
+
+| Command | Tests | What it proves |
+|---|---|---|
+| `pytest tests/test_orders.py` | 16 | Order lifecycle end to end: creation, validation bounds, dispatch assigns the right rider, a busy rider isn't re-dispatched, delivery frees them, illegal transitions rejected, idempotent retries replay. |
+| `pytest tests/test_auth.py` | 13 | Registration, login, the **401-vs-403** split, no account-enumeration oracle, and the permitted-actor matrix — a rider may advance only their own order and may never cancel. |
+| `pytest tests/test_scoping_and_idempotency.py` | 10 | **Read scoping** (customer sees only their own, rider only assigned, ops all) and **cross-tenant idempotency isolation** — two users sending the same key must not collide. |
+| `pytest tests/test_rider_location_auth.py` | 8 | The **dispatch-integrity guard**. Ends with a live hijack attempt: an outsider tries to teleport a far rider onto the pickup point, and the genuinely-nearest rider must still win. |
+| `pytest tests/test_middleware_hardening.py` | 13 | Rate-limit keying can't be rotated by the caller, forged tokens fall back to peer IP, request-ids are adopted only when safe, and idempotent replays appear in HTTP metrics. |
+| `pytest tests/test_config.py` | 11 | The **`JWT_SECRET` startup guard**: missing, placeholder, too short, and bytes-vs-characters length. |
+
+Narrow further with `-k`:
+
+```bash
+python -m pytest tests/test_orders.py -k dispatch -v      # just the dispatch path
+python -m pytest -k "idempot" -v                          # idempotency across all files
+python -m pytest -k "hijack or forged" -v                 # the two attack-shaped tests
+```
+
+### The concurrency proof (not in pytest, not in CI)
+
+```bash
+API_PORTS=8000-8002:8000 docker compose up -d --scale api=3   # PROOF MODE only
+docker compose exec api python -m scripts.seed_users
+python -m scripts.race_test
+```
+Fires **15 simultaneous dispatches across 3 replicas** against 10 orders and 10
+riders, then asserts every assigned `order_id` **and** every `rider_id` is
+unique. This is the headline correctness claim — that `SELECT … FOR UPDATE SKIP
+LOCKED` prevents double-assignment — and it is the one property **not** protected
+by CI, so run it by hand after touching `services/dispatch.py`.
+
+Expected tail: `✅ zero double-assignment across replicas`. Anything else is a
+real regression, not flakiness.
+
+### Isolation seams (Day 21)
+
+Postgres via `dependency_overrides[get_db]` → `deliveriq_test_db`; Redis via
+`REDIS_URL` db 15 set **before import** (module global, not a `Depends`); Kafka
+via patching `publish_event` at the **call sites**, not the definition site.
+Three seams, three mechanisms — that asymmetry is the lesson. `conftest.py`
+asserts no real producer was ever constructed, so a missed call site fails the
+run instead of silently publishing to a live broker.
 
 ---
 

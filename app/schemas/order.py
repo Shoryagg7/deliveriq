@@ -6,7 +6,10 @@ from app.core.enums import OrderStatus
 
 
 class OrderCreate(BaseModel):
-    customer_id: int
+    # NO customer_id (G02). It used to be a request-body field, so any caller
+    # could place an order as anyone. Identity comes from the verified token in
+    # the router — a field the server must check against the token is a field
+    # the client should not be sending.
     restaurant_id: int
     value: float = Field(gt=0, description="Order value in INR, must be positive")
     pickup_lat: float = Field(ge=-90, le=90, description="Latitude must be between -90 and 90")

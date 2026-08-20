@@ -23,22 +23,22 @@ others idle — throughput inside an SLA, distributed fairly.
 flowchart TD
     Client["Client / React console"]
 
-    subgraph MW["Middleware chain (per request)"]
-        ReqID["request_id<br/>contextvar, on every log line"]
-        RL["Rate limit<br/>token bucket, atomic Lua"]
-        Idem["Idempotency-Key<br/>cached response, POST only"]
-        Met["Metrics<br/>route template, bounded labels"]
+    subgraph MW["Middleware chain — outermost first"]
+        ReqID["request_id<br/>adopts a valid upstream id, else mints one"]
+        Met["metrics<br/>route template, bounded label cardinality"]
+        RL["rate limit<br/>atomic Lua bucket, keyed on verified identity"]
+        Idem["idempotency<br/>per-principal, body-fingerprinted, POST only"]
     end
 
     subgraph REPLICAS["API replicas (--scale api=3)"]
-        API["FastAPI<br/>JWT auth · role-based authz"]
-        Dispatch["Dispatch<br/>priority heap + aging, O(log n)"]
-        Match["Matching<br/>geohash cell + fairness band"]
+        Auth["JWT auth + RBAC<br/>ops · rider · customer"]
+        Dispatch["dispatch<br/>priority heap + aging"]
+        Match["matching<br/>geohash cell + fairness band"]
     end
 
     Postgres[("PostgreSQL<br/>orders · riders · users · dispatch_events")]
     Redis[("Redis<br/>token bucket · geo index · idempotency")]
-    Kafka["Kafka<br/>order.dispatched"]
+    Kafka["Kafka — order.dispatched<br/>3 partitions, keyed by order_id"]
     DLQ["order.dispatched.dlq<br/>unprocessable messages"]
     Obs["Prometheus → Grafana"]
 
@@ -46,15 +46,15 @@ flowchart TD
     Analytics["analytics<br/>consumer group → Postgres"]
     Audit["audit<br/>consumer group → file"]
 
-    Client --> ReqID --> RL --> Idem --> Met --> API
-    API --> Dispatch
+    Client --> ReqID --> Met --> RL --> Idem --> Auth
+    Auth --> Dispatch
     Dispatch -->|"claim: SELECT … FOR UPDATE SKIP LOCKED"| Postgres
     Dispatch --> Match
-    Match -.->|"O(1) cell lookup"| Redis
-    Dispatch -->|"post-commit publish"| Kafka
+    Match -.->|"cell + 8 neighbours, one pipeline"| Redis
+    Dispatch -->|"publish AFTER commit"| Kafka
     RL -.-> Redis
     Idem -.-> Redis
-    API -.-> Postgres
+    Auth -.-> Postgres
     Met -.-> Obs
     Kafka --> Notif
     Kafka --> Analytics
@@ -66,10 +66,19 @@ flowchart TD
     classDef algo fill:#EEEDFE,stroke:#534AB7,color:#26215C;
     classDef store fill:#E1F5EE,stroke:#0F6E56,color:#04342C;
     classDef bus fill:#FFF1E6,stroke:#B25A1E,color:#5C2F0C;
+    classDef sec fill:#FDECEF,stroke:#A61E4D,color:#5C0F26;
     class Dispatch,Match algo;
     class Redis,Postgres store;
     class Kafka,DLQ bus;
+    class Auth sec;
 ```
+
+**Reading the middleware chain.** Order is deliberate and each position is load-
+bearing. `request_id` is outermost so every log line — including a 429 — carries
+a trace id. `metrics` sits next so it observes *every* response the service
+emits, including rate-limit rejections and idempotent replays that never reach a
+route. `rate_limit` precedes `idempotency` so a flood of replayed keys is still
+throttled.
 
 ---
 
@@ -81,11 +90,22 @@ inside the image.
 ```bash
 git clone https://github.com/Shoryagg7/deliveriq && cd deliveriq
 cp .env.example .env
-docker compose up -d --build
+
+# JWT_SECRET has no default — the app refuses to start without one, by design
+sed -i "s|^JWT_SECRET=.*|JWT_SECRET=$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')|" .env
+
+docker compose up -d --build          # first build ~4 min; subsequent ~15 s
 
 # demo logins + a populated board
 docker compose exec api python -m scripts.seed_users
 docker compose exec api python -m scripts.seed_demo
+```
+
+Confirm every dependency answered before using the console:
+
+```bash
+curl -s localhost:8000/ready | python3 -m json.tool
+# {"status": "ready", "checks": {"postgres": "ok", "redis": "ok", "kafka": "ok"}}
 ```
 
 | | |
@@ -118,13 +138,19 @@ mid-claim re-selects the next-best rider for the *same* order rather than
 dropping the order. Verified with concurrent dispatches across replicas — zero
 duplicate order or rider assignments.
 
-### Matching — O(1) lookup, bounded search
+### Matching — bounded search, then fairness
 Riders are indexed into geohash cells in Redis (precision 6, ~1.2 km × 0.61 km).
-Matching reads the order's cell plus its eight neighbours — constant time
-regardless of fleet size, versus scanning every rider. The trade-off is explicit:
-a rider more than one cell out is not considered. Within the candidate set a
-500 m fairness band admits everyone near the closest rider, then picks whoever
-has taken the fewest orders today.
+Matching reads the order's cell plus its eight neighbours: a constant number of
+set lookups regardless of fleet size, versus scanning every rider. Scoring the
+candidates is then linear in how many riders occupy those nine cells, so the win
+is *bounding the candidate set*, not constant-time end to end — the honest claim
+is the useful one. Candidate reads are issued as a single Redis pipeline, because
+this runs while a Postgres row lock is held and every round trip is lock-hold
+time.
+
+The trade-off is explicit: a rider more than one cell out is not considered.
+Within the candidate set a 500 m fairness band admits everyone near the closest
+rider, then picks whoever has taken the fewest orders today.
 
 ### Scheduling — priority with aging
 A max-heap orders by `value + minutes_waited × weight`, so high-value orders go
@@ -150,6 +176,35 @@ consequences are handled rather than assumed:
   Unprocessable messages go to a DLQ with full context, and the offset advances
   only once that publish is acknowledged.
 
+### Security — audited, not assumed
+The service was audited endpoint by endpoint after it was feature-complete, and
+the audit found more than the feature work had: four endpoints reachable with no
+token at all, a signing key with a working default, and an idempotency cache that
+could serve one user another user's response. All are closed.
+
+- **Identity is derived, never accepted.** `POST /orders` takes `customer_id`
+  from the verified token; the field was removed from the request schema
+  entirely. A field the server must validate against the token is a field the
+  client should not be sending.
+- **Reads are scoped in the query, not filtered after.** A customer's listing
+  never loads another customer's row. `GET /orders/{id}` answers **404** for an
+  order you may not see, because a 403 would confirm the id exists and allow
+  enumeration — while `PATCH /riders/{id}/location` authorises *before* the
+  existence check for the same reason in reverse. Which fact is worth hiding
+  decides the code.
+- **Rider location is a dispatch-integrity endpoint.** It writes through to the
+  geohash index, so whoever can move riders can steer assignment. It is guarded
+  like the dispatch path, not like a profile update.
+- **`JWT_SECRET` has no default.** The app refuses to import without one, rejects
+  known placeholders, and requires 32 bytes. A control that can be skipped by
+  forgetting an environment variable is not a control.
+- **Rate limiting keys on verified identity**, falling back to `X-Forwarded-For`
+  only when a trusted proxy is declared. Keying on a caller-supplied header let
+  anyone mint a fresh bucket per request.
+
+`./scripts/verify.sh` re-checks all of this in one command, including minting a
+token with the old shipped secret and asserting the API rejects it.
+
 ### Failure behaviour
 - `/health` is liveness — cheap, zero dependencies. `/ready` round-trips
   Postgres, Redis and Kafka and returns 503 naming the failure. They are separate
@@ -172,14 +227,17 @@ consequences are handled rather than assumed:
 |---|---|---|
 | `POST` | `/auth/register` · `/auth/login` | public |
 | `GET` | `/auth/me` | authenticated |
-| `POST` `GET` | `/orders` | public |
-| `GET` | `/orders/{id}` | public |
+| `POST` | `/orders` | authenticated — owner taken from the token |
+| `GET` | `/orders` · `/orders/{id}` | authenticated — scoped by role |
 | `POST` | `/orders/dispatch` | **ops** |
 | `PATCH` | `/orders/{id}/status` | **ops**, or the assigned rider |
-| `POST` | `/riders` | **ops** |
-| `GET` `PATCH` | `/riders/{id}` · `/riders/{id}/location` | public |
+| `POST` `GET` | `/riders` | **ops** |
+| `GET` `PATCH` | `/riders/{id}` · `/riders/{id}/location` | **ops**, or that rider |
 | `GET` | `/admin/stats` | **ops** |
 | `GET` | `/health` · `/ready` · `/metrics` | public |
+
+Read scoping is per role: ops sees everything, a rider sees only orders assigned
+to them, a customer sees only their own.
 
 Status transitions pass two orthogonal guards: the move must be **legal**
 (`PENDING → DELIVERED` is not) *and* the caller must be **permitted** — a
@@ -187,7 +245,10 @@ customer marking their own order delivered is a legal move by the wrong actor,
 which a state machine alone cannot catch.
 
 `POST /orders` accepts an `Idempotency-Key` header; a retry with the same key
-replays the original response instead of creating a second order.
+replays the original response instead of creating a second order. The key is
+namespaced per authenticated caller and bound to a hash of the request, so two
+users cannot collide on the same key and the same key sent with a *different*
+body returns 422 rather than a confidently wrong replay.
 
 ---
 
@@ -211,16 +272,40 @@ Logs are structured JSON carrying a `request_id` correlated across the request.
 
 ## Testing
 
+One command runs everything — config guards, lint, the suite, and a live smoke
+test of every auth boundary against a real server:
+
+```bash
+./scripts/verify.sh
+```
+
+It is safe to run alongside a live stack: the suite uses a separate
+`deliveriq_test_db`, so development data is untouched.
+
+Or drive the suite directly:
+
 ```bash
 docker compose up -d db redis kafka
 docker compose up kafka-init --exit-code-from kafka-init
 alembic upgrade head
-pytest -q
+pytest -q                                    # 71 tests
 ```
 
-Tests run against real Postgres, Redis and Kafka rather than mocks, covering the
-dispatch lifecycle, the state machine, authentication, the per-role
-authorization matrix, and idempotent retries.
+**71 tests**, of which 47 are integration — they run against real Postgres and
+Redis rather than mocks, covering the dispatch lifecycle, the state machine,
+authentication, the per-role authorization matrix, read scoping, and idempotent
+retries. The remaining 24 are unit tests over configuration validation and the
+middleware key-derivation helpers, which are pure functions and do not need
+infrastructure to be worth testing.
+
+| File | Covers |
+|---|---|
+| `test_orders.py` | order lifecycle, dispatch, state machine, idempotent retries |
+| `test_auth.py` | registration, login, the authn-vs-authz split, actor guards |
+| `test_scoping_and_idempotency.py` | per-role read scoping, cross-tenant key isolation |
+| `test_rider_location_auth.py` | the dispatch-integrity guard, including a hijack attempt |
+| `test_middleware_hardening.py` | rate-limit keying, request-id adoption, metrics coverage |
+| `test_config.py` | the `JWT_SECRET` startup guard |
 
 Kafka publishing is patched at the **call sites**: every module that did
 `from … import publish_event` holds its own binding, so patching the definition
@@ -236,9 +321,22 @@ drift.
 
 ## Load
 
-Locust, 50 concurrent users, rate limiter disabled: **~123 RPS, p99 220 ms, 0%
-errors**. With the limiter enabled, throughput is capped by the bucket by design
-— worth naming which configuration a number came from.
+**No number quoted here yet, on purpose.** The previous figure came from a Locust
+run that only hit unauthenticated `POST /orders` — it measured a plain INSERT,
+not matching, locking or Kafka, so it was retired rather than restated.
+
+`locustfile.py` now drives `POST /orders/dispatch` — the claim — under contention
+with a seeded rider fleet, which is the path worth measuring:
+
+```bash
+API_PORTS=8000-8002:8000 docker compose up -d --scale api=3
+python -m scripts.seed_users
+RATE_LIMIT_ENABLED=false locust -f locustfile.py --host http://localhost:8000
+```
+
+Always name which configuration *and which endpoint* a load number came from.
+With the limiter enabled, throughput is capped by the bucket by design — that
+measures the limiter, not the app.
 
 ---
 
@@ -254,7 +352,7 @@ app/
   workers/     shared consumer runner + notification/analytics/audit
 frontend/      React console (built into the API image)
 ops/           Prometheus config · provisioned Grafana dashboard
-scripts/       seeding · rider reindex · concurrency test
+scripts/       seeding · rider reindex · concurrency test · verify.sh
 tests/
 ```
 

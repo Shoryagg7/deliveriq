@@ -8,7 +8,7 @@ from app.core.dependencies import (
     get_current_user,
     require_ops,
 )
-from app.core.enums import OrderStatus
+from app.core.enums import OrderStatus, UserRole
 from app.core.exceptions import NoPendingOrders, OrderNotFound, RiderUnavailable
 from app.core.metrics import dispatch_duration_seconds, dispatch_total
 from app.models.order import Order
@@ -22,9 +22,41 @@ from app.services.order_state import transition
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 
+def _visible_orders(query, user: User):
+    """Narrow a query to what this caller is allowed to see (G03).
+
+    Applied as a WHERE clause rather than a post-filter, so a customer's listing
+    never loads another customer's row into memory in the first place.
+
+        ops       — everything
+        rider     — only orders assigned to them
+        customer  — only their own
+    """
+    if user.role == UserRole.OPS.value:
+        return query
+    if user.role == UserRole.RIDER.value:
+        # A rider account with no linked record can see nothing rather than
+        # everything: `rider_id IS NULL` would match every unassigned order.
+        if user.rider_id is None:
+            return query.filter(False)
+        return query.filter(Order.rider_id == user.rider_id)
+    return query.filter(Order.customer_id == user.id)
+
+
 @router.post("", response_model=OrderResponse, status_code=201)
-def create_order(order: OrderCreate, db: Session = Depends(get_db)):
-    new_order = Order(**order.model_dump())
+def create_order(
+    order: OrderCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """The caller places an order AS THEMSELVES (G02).
+
+    `customer_id` is taken from the verified token, not the body. Accepting it
+    from the client meant anyone could place an order under any customer id —
+    and left the system with no trustworthy notion of ownership at all, which is
+    what every read-scoping rule below depends on.
+    """
+    new_order = Order(**order.model_dump(), customer_id=user.id)
     db.add(new_order)
     db.commit()
     db.refresh(new_order)
@@ -32,16 +64,30 @@ def create_order(order: OrderCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/{order_id}", response_model=OrderResponse)
-def get_order(order_id: int, db: Session = Depends(get_db)):
-    order = db.query(Order).filter(Order.id == order_id).first()
+def get_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """404 for an order the caller may not see, not 403.
+
+    Deliberate: 403 would confirm the order EXISTS, letting anyone enumerate
+    order ids one request at a time. Here — unlike the rider-location guard —
+    hiding existence is the stronger answer, because the id alone is the secret.
+    """
+    order = _visible_orders(db.query(Order), user).filter(Order.id == order_id).first()
     if not order:
         raise OrderNotFound(f"Order {order_id} not found")
     return order
 
 
 @router.get("", response_model=list[OrderResponse])
-def list_orders(status: OrderStatus | None = None, db: Session = Depends(get_db)):
-    query = db.query(Order)
+def list_orders(
+    status: OrderStatus | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    query = _visible_orders(db.query(Order), user)
     if status:
         query = query.filter(Order.status == status.value)
     return query.all()
