@@ -8,6 +8,136 @@
 >
 > Written to be read cold the night before. Short definitions, one table per
 > idea, one soundbite each.
+>
+> **Start at Part 0.** It decodes every technical term on the resume bullets —
+> if a word is on the page, an interviewer can ask what it means.
+
+---
+
+# Part 0 — Your resume, decoded
+
+**The drill: an interviewer picks one word off your resume and asks "what does
+that mean?"** Every term below is on the page, so every term is fair game. One
+line each — the depth is in Parts 2 and 3.
+
+## Bullet 1 — concurrency
+
+> *Eliminated a double-dispatch race across 3 API replicas with a two-phase
+> `SELECT FOR UPDATE SKIP LOCKED` claim protocol; verified zero duplicate
+> assignments under concurrent load*
+
+| Term | What it means | How we handle it |
+|---|---|---|
+| **Double-dispatch race** | Two replicas read the same PENDING order at the same time and both assign it — one order, two riders | Lock the row before touching it, so the second reader can't see it as available |
+| **3 API replicas** | Three copies of the app behind a load balancer, sharing one database | Nothing lives in process memory; all shared state is in Postgres or Redis |
+| **`SELECT … FOR UPDATE`** | Read a row *and* take an exclusive lock on it until the transaction ends | Whoever locks the order owns it — nobody else can read-to-modify it |
+| **`SKIP LOCKED`** | Don't wait for a locked row; **skip it and take the next one** | A contested dispatch becomes "take a different order" instead of blocking in a queue |
+| **Two-phase claim** | Lock **both** the order *and* the rider before mutating *either* | Prevents assigning an order to a rider another replica just took. If the rider claim fails, we re-select the next-best rider for the **same** order rather than dropping the order |
+| **Zero duplicate assignments** | Every `order_id` and every `rider_id` appears at most once | `scripts/race_test.py`: 15 simultaneous dispatches, 3 replicas, asserts both sets are unique |
+
+**If they ask "why not just a lock/mutex?"** — a mutex is per-process; three
+replicas have three of them. The lock must live where the shared state is, which
+is the database.
+
+**"Why not optimistic locking?"** — optimistic assumes conflicts are rare and
+retries when wrong. Here contention is the normal case, so it would thrash.
+
+## Bullet 2 — the algorithm
+
+> *Built the dispatch core: aging-weighted priority scheduler preventing
+> starvation, and geohash matching with a fairness band that spreads work across
+> idle riders*
+
+| Term | What it means | How we handle it |
+|---|---|---|
+| **Priority scheduler** | Serve the most important order first, not the oldest | A max-heap ordered by score |
+| **Starvation** | A low-priority item that **never** gets served because better ones keep arriving | Real risk: a cheap order behind an endless stream of expensive ones |
+| **Aging** | Priority **grows with waiting time** | `score = value + minutes_waited × weight`. A cheap order that has waited long enough eventually outranks a fresh expensive one — starvation becomes impossible |
+| **Geohash** | Encodes lat/lon into a short string; nearby points share a prefix | Precision 6 ≈ 1.2 km × 0.61 km cells. Riders are indexed into their cell in Redis |
+| **Cell + 8 neighbours** | Search the order's cell plus the ring around it | Bounds the candidate set to 9 cells instead of scanning the whole fleet. Trade-off: a rider two cells out is not considered |
+| **Fairness band** | Among riders **within 500 m of the closest one**, pick whoever has done fewest orders today | Greedy-nearest lets one rider take everything while others idle. The band trades a little distance for even distribution |
+
+**"Why is it O(n log n), not O(log n)?"** — volunteer this before they find it.
+The `heappop` is O(log n), but every dispatch **rebuilds** the heap from all
+pending orders, and the build dominates. The fix is to push the ordering into
+SQL: `ORDER BY priority LIMIT 1 FOR UPDATE SKIP LOCKED`.
+
+## Bullet 3 — Kafka ⭐ (the most-probed one)
+
+> *Streamed events to 3 Kafka consumer groups with manual offset commits for
+> at-least-once delivery, idempotent consumption on `(partition, offset)`, and a
+> dead-letter queue for poison messages*
+
+| Term | What it means | How we handle it |
+|---|---|---|
+| **Consumer group** | A set of consumers sharing a `group.id`. **Same** id → members split the partitions (work queue). **Different** id → each group gets every message (fan-out) | Three groups — `notifications`, `analytics`, `audit` — so each gets its own full copy with its own progress |
+| **Offset** | A message's position in a partition; "how far this group has read" | Stored per group, so one consumer being down doesn't affect the others |
+| **Manual offset commit** | *We* decide when to record progress, rather than a background timer | `enable.auto.commit=false`. Auto-commit fires on a timer whether or not the handler finished — that silently turns at-least-once into at-most-once |
+| **At-least-once** | Every message is processed **one or more** times; never lost, sometimes duplicated | Comes from commit **placement**: `poll → process → commit`. Crash before the commit and the message is redelivered |
+| **Idempotent consumption** | Processing the same message twice has the same effect as once | Required, because at-least-once *guarantees* duplicates will happen |
+| **`(partition, offset)`** | A message's unique coordinates in the log | Unique constraint on that pair + `ON CONFLICT DO NOTHING` — a redelivery inserts **zero rows**. Delivery stays at-least-once; the **effect** becomes exactly-once |
+| **Poison message** | A message that can **never** be processed successfully — malformed JSON, a missing field, a schema change | See below |
+| **Dead-letter queue (DLQ)** | A separate topic where unprocessable messages are parked with their context | `order.dispatched.dlq` |
+
+### Poison messages, in full ⭐
+
+**The problem.** A consumer reads a bad message, the handler throws, the process
+dies. It restarts, reads *the same message*, throws again. Forever. The partition
+is **wedged**, and every valid event queued behind it is never delivered.
+
+**The part that makes it nasty:** monitoring won't catch it. Lag is
+`latest offset − committed offset`, and a partition that has **never committed**
+has no lag row at all. The system looks fine while a third of your traffic is
+frozen.
+
+**How we handle it — three steps, and the order matters:**
+
+1. **Catch every exception** in the handler. Never let one message kill the loop.
+2. **Publish to the DLQ** with full context: original topic, partition, offset,
+   key, raw payload, the error, and a timestamp — enough to replay or debug it
+   later without the original message.
+3. **Block until the DLQ publish is acknowledged, and only then commit.**
+
+Step 3 is the subtle one and the best thing to say out loud: *committing on an
+unacknowledged DLQ publish would advance past the message with no copy of it
+anywhere.* That is the one way this design can lose data. If the DLQ publish
+isn't confirmed, we stop **without** committing, so the message is redelivered
+rather than lost.
+
+**Soundbite:** "A poison message is one that can never succeed, so a naive
+consumer crash-loops on it and wedges the partition — invisibly, because a
+partition with no committed offset reports no lag. I catch it, publish it to a
+dead-letter topic with its coordinates and payload, block until the broker acks
+that publish, and only then commit. If the DLQ publish isn't confirmed I don't
+commit at all — I'd rather redeliver than advance past a message I have no copy
+of."
+
+**Likely follow-up — "what gets into the DLQ, and then what?"** In practice:
+schema changes, a producer bug, or a field a consumer assumed was always present.
+You alert on DLQ depth, inspect the payloads, fix the consumer, and replay the
+topic from a saved offset. A DLQ nobody monitors is just a slower way to lose
+messages.
+
+## Bullet 4 — security
+
+> *Audited and hardened the API: closed 4 unauthenticated endpoints, a forgeable
+> admin JWT, and a cross-tenant idempotency-cache leak; extended RBAC across
+> every route and re-keyed rate limiting to verified identity, backed by 71 tests*
+
+| Term | What it means | How we handle it |
+|---|---|---|
+| **Unauthenticated endpoint** | Reachable with no token at all | Four of them. The worst — `PATCH /riders/{id}/location` — writes to the geohash index, so anyone could move the fleet and steer every dispatch |
+| **Forgeable JWT** | The signing secret was a default published in the repo, so anyone could mint an `ops` token | Removed the default entirely: no boot without a real secret, placeholders rejected, 32-byte minimum |
+| **Cross-tenant leak** | One user receiving another user's data | The idempotency key was global, so two users sending `Idempotency-Key: retry-1` collided and the second got the first's response body. Now namespaced per verified subject |
+| **RBAC** | Role-Based Access Control — permissions attach to a role, not a person | `ops` / `rider` / `customer`. Roles can't be self-assigned: registration always creates a customer |
+| **Re-keyed rate limiting** | Changed *what* the limiter counts per | Was `X-API-Key or IP` — a header the caller controls, so rotating it minted a fresh bucket. Now the verified token subject |
+
+**"Why 404 in one place and 403 in another?"** — a deliberate pair worth
+volunteering. `GET /orders/{id}` returns **404** for an order you may not see,
+because 403 would confirm the id exists and let you enumerate. But
+`PATCH /riders/{id}/location` authorises **before** checking existence, because
+there the id isn't secret and checking existence first would leak the fleet the
+same way. **The deciding question is which fact is worth hiding.**
 
 ---
 
@@ -17,6 +147,10 @@ The rule for every row: **name the alternative you rejected and why.** "I used
 Redis" is a fact. "I used Redis instead of an in-process dict because three
 replicas each with their own counter means the real limit is 3× what I
 configured" is an engineering answer.
+
+> The **AI Engineering** line on the resume (LangGraph, RAG, embeddings, vector
+> search, LLM APIs) belongs to **DocMind** and is deliberately not covered here —
+> this file is DeliverIQ.
 
 ## Languages
 
@@ -44,7 +178,7 @@ configured" is an engineering answer.
 |---|---|---|---|
 | **PostgreSQL** | Relational DB, ACID, MVCC | Source of truth: orders, riders, users | I need **transactions and row locks** — the entire double-dispatch fix depends on them. **Rejected MongoDB**: no multi-row locking of the kind `SKIP LOCKED` gives, and my data is deeply relational |
 | **Redis** | In-memory key-value store, single-threaded, rich data types | Rate limiter, geohash index, idempotency cache | Sub-millisecond reads for data that is *derived and rebuildable*. Nothing lives only in Redis — losing it costs a rebuild, not data |
-| **pgvector** | Postgres extension for vector similarity search | DocMind embeddings | Vectors live next to relational data in one database — one backup, one transaction, one connection. **Rejected Pinecone/Weaviate**: a second datastore to run and sync for a dataset this size |
+| **pgvector** | Postgres extension for vector similarity search | **DocMind, not this project** | Vectors live next to relational data — one backup, one transaction, one connection. **Rejected Pinecone/Weaviate**: a second datastore to run and sync. Depth lives with DocMind; out of scope here |
 
 ## Distributed Systems
 
@@ -66,16 +200,6 @@ configured" is an engineering answer.
 | **Prometheus** | Pull-based metrics; scrapes `/metrics` | Custom app metrics | Pull means the app doesn't need to know where the monitoring lives |
 | **Grafana** | Dashboards over Prometheus | Provisioned from the repo | In version control, so `docker compose down -v` can't lose it |
 | **Linux / Git** | Shell, processes, signals; version control | SIGTERM handling in workers | `docker compose stop` sends SIGTERM — Python doesn't convert it to `KeyboardInterrupt`, so it needs an explicit handler |
-
-## AI Engineering (DocMind)
-
-| Skill | What it is | Why |
-|---|---|---|
-| **Embeddings** | Text → vector, where nearby vectors mean similar meaning | Lets "car" match "automobile" — keyword search can't |
-| **Vector Search** | Find nearest vectors by cosine/L2 distance | Retrieval by *meaning* rather than exact words |
-| **RAG** | Retrieve relevant chunks, put them in the prompt, let the LLM answer from them | Grounds answers in real documents and enables citations — cuts hallucination |
-| **LangGraph** | Framework for LLM workflows as a **graph** with state and cycles | The self-correcting loop needs a *cycle* (grade → rewrite → retry). A linear chain can't loop |
-| **LLM APIs** | Hosted model inference | No GPU to run, no model to host |
 
 ---
 
