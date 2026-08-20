@@ -1,16 +1,13 @@
 # DeliverIQ — Interview Notes
 
-> **What this is.** A refined companion to `INTERVIEW_PREP.md`. That file is the
-> deep study ladder; this one is the two things interviews actually spend time
-> on: **the skills on my resume** (what each is, why I chose it, what I rejected)
-> and **Redis + Kafka in depth**, because that is where every follow-up has gone
-> so far.
+> **What this is.** The interview-facing companion to `INTERVIEW_PREP.md`.
+> That file is the full study ladder; this one is what gets *asked*: the terms on
+> my resume, the stack choices behind them, and deep passes on **rate limiting**,
+> **Redis**, **Kafka** and **auth** — the four topics every follow-up has landed
+> on so far.
 >
-> Written to be read cold the night before. Short definitions, one table per
-> idea, one soundbite each.
->
-> **Start at Part 0.** It decodes every technical term on the resume bullets —
-> if a word is on the page, an interviewer can ask what it means.
+> Aimed at SDE-1 depth: what a backend engineer is expected to explain, draw, and
+> write pseudocode for on a whiteboard.
 
 ---
 
@@ -79,44 +76,8 @@ SQL: `ORDER BY priority LIMIT 1 FOR UPDATE SKIP LOCKED`.
 | **Poison message** | A message that can **never** be processed successfully — malformed JSON, a missing field, a schema change | See below |
 | **Dead-letter queue (DLQ)** | A separate topic where unprocessable messages are parked with their context | `order.dispatched.dlq` |
 
-### Poison messages, in full ⭐
-
-**The problem.** A consumer reads a bad message, the handler throws, the process
-dies. It restarts, reads *the same message*, throws again. Forever. The partition
-is **wedged**, and every valid event queued behind it is never delivered.
-
-**The part that makes it nasty:** monitoring won't catch it. Lag is
-`latest offset − committed offset`, and a partition that has **never committed**
-has no lag row at all. The system looks fine while a third of your traffic is
-frozen.
-
-**How we handle it — three steps, and the order matters:**
-
-1. **Catch every exception** in the handler. Never let one message kill the loop.
-2. **Publish to the DLQ** with full context: original topic, partition, offset,
-   key, raw payload, the error, and a timestamp — enough to replay or debug it
-   later without the original message.
-3. **Block until the DLQ publish is acknowledged, and only then commit.**
-
-Step 3 is the subtle one and the best thing to say out loud: *committing on an
-unacknowledged DLQ publish would advance past the message with no copy of it
-anywhere.* That is the one way this design can lose data. If the DLQ publish
-isn't confirmed, we stop **without** committing, so the message is redelivered
-rather than lost.
-
-**Soundbite:** "A poison message is one that can never succeed, so a naive
-consumer crash-loops on it and wedges the partition — invisibly, because a
-partition with no committed offset reports no lag. I catch it, publish it to a
-dead-letter topic with its coordinates and payload, block until the broker acks
-that publish, and only then commit. If the DLQ publish isn't confirmed I don't
-commit at all — I'd rather redeliver than advance past a message I have no copy
-of."
-
-**Likely follow-up — "what gets into the DLQ, and then what?"** In practice:
-schema changes, a producer bug, or a field a consumer assumed was always present.
-You alert on DLQ depth, inspect the payloads, fix the consumer, and replay the
-topic from a saved offset. A DLQ nobody monitors is just a slower way to lose
-messages.
+**Poison messages and the DLQ get the full treatment in §5.6** — it is the
+follow-up this bullet invites most often, so know it cold.
 
 ## Bullet 4 — security
 
@@ -203,111 +164,388 @@ configured" is an engineering answer.
 
 ---
 
-# Part 2 — Redis deep dive
+# Part 2 — Rate limiting, in depth ⭐
 
-## 2.1 What Redis actually is
+The most-asked topic so far. Be able to do four things for each algorithm:
+**draw it, write the pseudocode, name its limitation, say where it's used.**
+
+## 2.1 Why rate limit at all
+
+Three separate goals people conflate:
+
+| Goal | Example |
+|---|---|
+| **Protect capacity** | One client's retry loop must not exhaust the DB pool |
+| **Fair sharing** | One tenant must not starve the others |
+| **Abuse / cost control** | Brute-force logins, scraping, LLM API spend |
+
+They want different limits. Login gets a *strict, exact* limit; a read endpoint
+gets a *generous, bursty* one. That's why you pick the algorithm per use case.
+
+## 2.2 Fixed window
+
+**Idea.** Chop time into fixed buckets (12:00–12:01, 12:01–12:02). Count per
+bucket. Reset at the boundary.
+
+```
+limit = 5 per minute
+
+ 12:00:00                12:01:00                12:02:00
+ |───────────────────────|───────────────────────|
+ | ■ ■ ■ ■ ■  ✗ ✗ ✗      | ■ ■                   |
+ |  count=5, then reject | counter resets to 0   |
+```
+
+**Pseudocode**
+
+```
+function allow(user, limit, window):
+    now    = current_time()
+    bucket = floor(now / window)          # which window we're in
+    key    = "rl:" + user + ":" + bucket
+
+    count = INCR key                      # atomic, creates at 1
+    if count == 1:
+        EXPIRE key window                 # only on first write
+
+    return count <= limit
+```
+
+One command in the common case. Nothing to clean up — the key expires itself.
+
+**Limitations**
+
+1. **The boundary burst — the flaw interviewers fish for.** You can push **2×
+   the limit** through in an instant by straddling the edge:
+
+```
+        window A               window B
+ |──────────────────────|──────────────────────|
+                  ■■■■■ | ■■■■■
+                11:59:59  12:00:00
+                  5 reqs   5 reqs   =  10 requests in ~1 second
+                                       with a limit of 5/min
+```
+
+2. **Synchronised reset.** Every user's window resets at the same instant, so
+   clients that poll on the minute all stampede together.
+3. No smoothing at all within the window.
+
+**Where it's genuinely used**
+
+- Quotas that are naturally calendar-aligned: *"10,000 API calls this month"*.
+  The boundary burst doesn't matter when the window is a month.
+- **GitHub's REST API** uses hourly fixed windows.
+- Anywhere "roughly N per period" is the actual business rule.
+
+## 2.3 Sliding window log
+
+**Idea.** Store a timestamp for **every** request. To decide, drop anything older
+than the window and count what's left.
+
+```
+window = 60s, limit = 5, now = 12:00:30
+cutoff = 11:59:30   -> anything older is evicted
+
+sorted set (score = timestamp)
+ [11:59:10]  [11:59:40] [11:59:55] [12:00:10] [12:00:25]
+   evict         keep       keep       keep       keep
+                        count = 4  ->  allow, then add 12:00:30
+```
+
+The window **slides continuously** — there is no edge to straddle.
+
+**Pseudocode**
+
+```
+function allow(user, limit, window):
+    now    = current_time()
+    key    = "rl:" + user
+    cutoff = now - window
+
+    ZREMRANGEBYSCORE key 0 cutoff       # evict what aged out
+    count = ZCARD key                   # how many still in window
+
+    if count >= limit:
+        return false                    # note: do NOT record rejects
+
+    ZADD   key now now                  # score = value = timestamp
+    EXPIRE key window
+    return true
+```
+
+> **The bug to avoid:** if you `ZADD` *before* checking, a rejected request still
+> occupies a slot, and a client hammering you keeps itself permanently blocked.
+> Check first, or remove your own entry on reject.
+
+**Limitations**
+
+1. **Memory grows with traffic**, not with users. 10k users × 1000 req/min =
+   10M sorted-set members held for a minute.
+2. Every request does multiple writes — expensive at high volume.
+3. Needs the multi-command sequence to be atomic (MULTI or Lua), or two
+   concurrent requests both read `count = limit - 1` and both pass.
+
+**Where it's genuinely used**
+
+- **Low-volume, high-stakes endpoints** where the limit must be *exact*: login
+  attempts, password reset, OTP send, payment submission.
+- Compliance rules — *"no more than 3 OTPs per hour"* has to be exactly 3.
+- Small volume makes the memory cost irrelevant, and exactness is the point.
+
+## 2.4 Sliding window counter
+
+**Idea.** The compromise. Keep only two counters — current window and previous —
+and estimate the sliding count by weighting the previous one by how much of the
+current window has elapsed.
+
+```
+limit = 100/min.  now = 30s into the current window (50% elapsed)
+
+    previous window            current window
+ |────────────────────────|─────────●──────────────|
+        count = 80              count = 30
+                             30s of 60s elapsed
+
+ estimate = 80 × (1 − 0.5)  +  30
+          = 40              +  30   =  70    ->  allow (70 < 100)
+```
+
+**Pseudocode**
+
+```
+function allow(user, limit, window):
+    now      = current_time()
+    curr_win = floor(now / window)
+    prev_win = curr_win - 1
+    elapsed  = (now mod window) / window          # 0.0 .. 1.0
+
+    curr = GET("rl:" + user + ":" + curr_win) or 0
+    prev = GET("rl:" + user + ":" + prev_win) or 0
+
+    estimate = prev * (1 - elapsed) + curr
+
+    if estimate >= limit:
+        return false
+
+    INCR   "rl:" + user + ":" + curr_win
+    EXPIRE "rl:" + user + ":" + curr_win, 2 * window
+    return true
+```
+
+**Limitations**
+
+1. **It's an approximation.** It assumes the previous window's traffic was spread
+   evenly. If all 80 requests came in that window's final second, the estimate
+   *under*-counts and lets too many through.
+2. Can also be slightly over-strict, rejecting a request that a true sliding
+   window would allow.
+3. Slightly more logic than fixed window for a benefit you must be able to
+   justify.
+
+In practice the error is tiny — **Cloudflare reported roughly 0.003% of requests
+wrongly handled** at very large scale, which is why they use it.
+
+**Where it's genuinely used**
+
+- **High-volume public APIs and CDN edges** — Cloudflare's rate limiter.
+- Anywhere fixed window's boundary burst is unacceptable but sliding log's memory
+  is unaffordable. That's most large-scale HTTP rate limiting.
+
+## 2.5 Token bucket ⭐ (what DeliverIQ uses)
+
+**Idea.** A bucket holds up to `capacity` tokens and refills at a constant rate.
+Each request spends one token. No tokens, no service.
+
+```
+capacity = 10, refill = 1 token/sec
+
+        refill 1/sec (up to capacity)
+              │
+              ▼
+        ┌───────────┐
+        │ ● ● ● ● ● │  5 tokens   -> request takes 1 -> 4 left, ALLOW
+        └───────────┘
+        ┌───────────┐
+        │           │  0 tokens   -> REJECT 429, Retry-After: 1
+        └───────────┘
+
+burst behaviour — the whole point:
+   idle 10s   -> bucket refills to 10  -> 10 requests served instantly
+   sustained  -> settles to exactly 1 req/sec
+```
+
+**Pseudocode** (this is our Lua script in plain language)
+
+```
+function allow(user, capacity, refill_rate):
+    now = current_time()
+    key = "rl:" + user
+
+    (tokens, last_refill) = HMGET key, "tokens", "last_refill"
+
+    if tokens is null:                          # first request ever
+        tokens      = capacity
+        last_refill = now
+    else:
+        elapsed = now - last_refill
+        tokens  = min(capacity, tokens + elapsed * refill_rate)   # LAZY refill
+
+    if tokens < 1:
+        return false                            # 429
+
+    tokens = tokens - 1
+    HSET   key, "tokens", tokens, "last_refill", now
+    EXPIRE key, ttl
+    return true
+```
+
+**Two things to point out unprompted:**
+
+- **Lazy refill.** Nothing runs in the background. Tokens are *computed* from
+  elapsed time on the next request. No cron, no timer, no scheduler — a bucket
+  nobody touches costs nothing.
+- **This is read-modify-write**, so it must be atomic. See §3.1.
+
+**Limitations**
+
+1. **Needs atomicity.** Can't be a single `INCR`; requires Lua or a
+   `WATCH`/`MULTI` retry loop.
+2. **Allows a full burst by design** — if downstream genuinely cannot absorb
+   `capacity` at once, this is the wrong choice.
+3. **Two fields written per request**, versus one `INCR`.
+4. **Clock skew.** Ours passes `now` from the application server. Two app servers
+   with drifting clocks compute different refills for the same bucket. Using
+   Redis's own `TIME` command inside the script would make one clock authoritative
+   — a real improvement I'd name if asked how to harden it.
+
+**Where it's genuinely used**
+
+- **General-purpose API rate limiting** — AWS API Gateway, Stripe, and most
+  cloud APIs are token-bucket-shaped.
+- Any client that is **naturally bursty**: a web page load fires 10 calls at
+  once, then idles. Fixed window rejects that legitimate burst; token bucket
+  absorbs it.
+- Network traffic shaping and QoS.
+
+## 2.6 Leaky bucket
+
+**Idea.** The mirror image. Requests enter a queue that drains at a **constant**
+rate. Output is perfectly smooth; a full bucket overflows and drops.
+
+```
+   bursty in            queue (capacity)        constant out
+  ■ ■■■  ■   ──────>  ┌──────────────────┐ ──────>  ■ ─ ■ ─ ■ ─ ■
+                      │ ■ ■ ■ ■          │          exactly 1 per 100ms
+                      └────────┬─────────┘
+                               │ full? overflow -> drop (429)
+```
+
+**Pseudocode** (meter variant — no real queue, tracks the level)
+
+```
+function allow(user, capacity, leak_rate):
+    now = current_time()
+    (level, last_leak) = HMGET key, "level", "last_leak"
+
+    elapsed = now - last_leak
+    level   = max(0, level - elapsed * leak_rate)     # drains over time
+
+    if level + 1 > capacity:
+        return false                                  # overflow
+
+    HSET key, "level", level + 1, "last_leak", now
+    return true
+```
+
+**Token bucket vs leaky bucket — the one-liner they want:**
+**token bucket allows bursts, leaky bucket forbids them.** Token bucket caps the
+*average* rate while permitting a spike; leaky bucket caps the *instantaneous*
+output rate, always.
+
+**Limitations**
+
+1. **No bursts at all** — a legitimate spike is delayed or dropped.
+2. The true queue variant **adds latency** and needs memory plus a scheduler.
+3. Worse user experience for interactive traffic.
+
+**Where it's genuinely used**
+
+- **Shaping traffic to a downstream with a hard ceiling**: a payment provider
+  contractually capped at 10 TPS, or a legacy system that falls over on a spike.
+- **Outbound** calls to third-party APIs with strict per-second contracts.
+- Network QoS, video streaming, packet shaping.
+
+## 2.7 Choosing — the decision table
+
+| | Memory | Accuracy | Bursts | Cost/req | Pick it when |
+|---|---|---|---|---|---|
+| **Fixed window** | O(1) | Poor (2× at edges) | Accidental | 1 op | Quota is calendar-shaped; simplicity wins |
+| **Sliding log** | **O(requests)** | Exact | None | Several ops | Low volume, must be exact — login, OTP, payment |
+| **Sliding counter** | O(1) | ~99.997% | Smoothed | 2–3 ops | High volume, edges matter, memory doesn't allow logs |
+| **Token bucket** | O(1) | Good | **Bounded, deliberate** | 1 script | General API limiting; bursty clients |
+| **Leaky bucket** | O(1) | Exact output rate | **Forbidden** | 1 script | Downstream cannot absorb any spike |
+
+**Rule of thumb to say out loud:** *"Exactness at low volume → sliding log.
+Scale with edges that matter → sliding counter. Bursty clients → token bucket.
+Fragile downstream → leaky bucket. Calendar quota → fixed window."*
+
+**Why token bucket here:** DeliverIQ's callers are ordinary API clients — bursty
+then idle. I wanted a bounded burst with a capped sustained rate, at O(1) memory
+per user regardless of traffic.
+
+## 2.8 The parts that aren't the algorithm
+
+Interviewers often move here once you've named the algorithm.
+
+**What do you key on?** Most trustworthy identifier available:
+verified user id → API key → proxy-verified IP → peer address.
+**Never a raw client-supplied header** — see §3.3, a real bug I shipped.
+
+**What do you return?** `429 Too Many Requests`, plus headers so a good client
+can behave:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 3
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1735689600
+```
+
+Without `Retry-After` clients just retry immediately and make it worse.
+
+**Where does it run?** Layered, cheapest first: CDN/edge → API gateway →
+application. The application layer is the only one that knows *who* the user is,
+which is why identity-keyed limiting lives there.
+
+**Multiple limits at once** is normal: 10/sec **and** 1000/hour **and**
+100k/month. Check all; the strictest wins.
+
+**Fail open or closed?** If the limiter's own store is down: DeliverIQ **fails
+open**, because a protective control must not cause the outage it exists to
+prevent. For an auth or payment control, invert it and fail closed.
+
+---
+
+# Part 3 — Redis
+
+## 3.0 What Redis actually is
 
 An **in-memory**, **single-threaded** key-value store with real data structures
 (strings, hashes, lists, sets, sorted sets).
 
-Two consequences that explain most interview answers:
-
-- **In-memory** → microsecond operations, but RAM is the limit and it is *not*
+- **In-memory** → microsecond operations, but RAM is the ceiling and it is *not*
   your source of truth.
-- **Single-threaded** → every command is atomic on its own. No two commands
-  interleave. This is why Redis is a good place to coordinate.
+- **Single-threaded** → each command is atomic on its own, and no two commands
+  interleave. That is what makes Redis a good coordination point.
 
-**In DeliverIQ:** rate-limit buckets, the geohash rider index, and the
-idempotency cache. All three are **derived** — `scripts/reindex_riders.py`
-rebuilds the index from Postgres, so a flushed Redis costs a rebuild, not data.
+**In DeliverIQ:** rate-limit buckets, the geohash rider index, the idempotency
+cache. All three are **derived** — `scripts/reindex_riders.py` rebuilds the index
+from Postgres, so a flushed Redis costs a rebuild, not data.
 
-## 2.2 Rate limiting — the four algorithms ⭐
+## 3.1 Why the rate-limit script has to be atomic ⭐
 
-**This is the most-asked topic. Know all four and why you picked yours.**
-
-### Fixed window
-
-Count requests per fixed clock bucket. Reset at the boundary.
-
-```
-INCR  rate:user1:12:00      -> 1, 2, 3 ...
-EXPIRE rate:user1:12:00 60
-```
-
-- ✅ Simplest. One counter, one command.
-- ❌ **The boundary burst.** Limit 100/min: 100 requests at `11:59:59` and 100 at
-  `12:00:00` = **200 requests in one second**, and both windows are "within
-  limit". This is the flaw the interviewer is fishing for.
-
-### Sliding window log
-
-Store a timestamp for **every** request in a sorted set; count what's left in the
-window.
-
-```
-ZREMRANGEBYSCORE key 0 (now-60)    # drop what aged out
-ZADD  key now now
-ZCARD key                          # how many remain
-```
-
-- ✅ Perfectly accurate. No boundary problem at all.
-- ❌ **Memory scales with traffic.** 1000 req/min × 10k users = 10M entries held.
-
-### Sliding window counter
-
-The compromise: keep the current window's counter *and* the previous one, then
-weight the previous by how far into the current window you are.
-
-```
-estimate = prev_count * (1 - elapsed_fraction) + curr_count
-```
-
-- ✅ Two counters, near-accurate. This is what Cloudflare uses.
-- ❌ An approximation — assumes the previous window's traffic was evenly spread.
-
-### Token bucket ⭐ (what DeliverIQ uses)
-
-A bucket holds up to `capacity` tokens and refills at a steady rate. Each request
-spends one. Empty bucket = 429.
-
-```
-tokens = min(capacity, tokens + elapsed_seconds * refill_rate)
-if tokens < 1: reject
-tokens -= 1
-```
-
-- ✅ **Allows bursts up to capacity, then settles to the refill rate.**
-- ✅ Constant memory: two fields (`tokens`, `last_refill`) no matter the traffic.
-- ✅ **Lazy refill** — no background timer or cron. The refill is *computed* from
-  elapsed time on the next access. Nothing runs when nobody calls.
-
-### Which to pick
-
-| | Memory | Accuracy | Bursts | Complexity |
-|---|---|---|---|---|
-| Fixed window | Tiny | Poor (boundary) | Accidental, at boundaries | Trivial |
-| Sliding log | **Grows with traffic** | Exact | None | Medium |
-| Sliding counter | Tiny | Good | Smoothed | Medium |
-| **Token bucket** | Tiny | Good | **Deliberate, bounded** | Low |
-| Leaky bucket | Tiny | Exact output rate | **None — fully smoothed** | Medium |
-
-**Leaky bucket** is the one people forget: requests queue and drain at a constant
-rate, so output is perfectly smooth and *no* burst gets through. That's the
-difference — **token bucket allows bursts, leaky bucket forbids them.** Use leaky
-when the thing downstream genuinely cannot absorb a spike.
-
-**Why token bucket here:** real clients are bursty and then idle — a page load
-fires 10 calls at once, then nothing for a minute. Fixed window would reject that
-legitimate burst; token bucket absorbs it and still caps the sustained rate.
-
-**Soundbite:** "Token bucket, because API traffic is bursty by nature and it lets
-me allow a bounded burst while capping the sustained rate. Fixed window is
-cheaper but has the boundary problem — double the limit across a window edge.
-Sliding log fixes that exactly but its memory grows with request volume. Token
-bucket is two fields per user regardless of traffic, and the refill is computed
-lazily from elapsed time, so there's no timer anywhere."
-
-## 2.3 Why the script has to be atomic ⭐
 
 The operation is **read → modify → write**. Three separate commands are three
 chances to interleave:
@@ -319,11 +557,10 @@ Request A: writes tokens = 0, allows
 Request B: writes tokens = 0, allows      <- limit breached
 ```
 
-That's a classic **race condition**. Redis being single-threaded doesn't save
-you: each command is atomic, but the *sequence* isn't.
-
-The fix: send the whole read-modify-write as **one Lua script**. Redis executes
-it start to finish with nothing interleaved.
+A classic **race condition**. Redis being single-threaded doesn't save you: each
+command is atomic, but the *sequence* isn't. The fix is to send the whole
+read-modify-write as **one Lua script**, which Redis runs start to finish with
+nothing interleaved.
 
 | Option | Trade-off |
 |---|---|
@@ -335,14 +572,14 @@ it start to finish with nothing interleaved.
 rather than its body on every call, and only uploads the source if the server
 doesn't know it yet.
 
-## 2.4 Why Redis and not a variable
+## 3.2 Why Redis and not a variable
 
 With 3 API replicas, an in-process counter means each replica allows the full
 limit independently — **the real limit becomes 3× what you configured**, and it
 changes whenever you scale. Shared state must live in a store all replicas see.
 This is the single clearest example of the statelessness rule.
 
-## 2.5 What to key on ⭐ (a real bug I fixed)
+## 3.3 What to key on ⭐ (a real bug I shipped)
 
 The limiter originally keyed on `X-API-Key or client.host`. A caller controls
 that header, so **rotating it minted a fresh bucket every request** — a rate
@@ -361,7 +598,7 @@ The key is hashed so an email never lands in a Redis key or a log line.
 **Live proof:** 110 requests on one token → `101 × 200, 9 × 429`. Twenty requests
 rotating `X-API-Key` → `20 × 429`. Before the fix that was `20 × 200`.
 
-## 2.6 Redis structures used here
+## 3.4 Redis structures used here
 
 | Structure | Used for | Commands |
 |---|---|---|
@@ -379,14 +616,14 @@ was lock-hold time. One pipeline now: all commands sent together, all replies
 read together. **Pipelining is not a transaction** — it batches network round
 trips; it does not make the batch atomic.
 
-## 2.7 TTL and expiry
+## 3.5 TTL and expiry
 
 Every key here expires: rate buckets 120s, idempotency 24h, daily counters 48h.
 Redis expires keys **lazily** (on access) *plus* by random sampling — so a key
 past its TTL may still occupy memory briefly. TTL is also the safety net for
 cache correctness: even if invalidation is missed, staleness is bounded.
 
-## 2.8 Likely follow-ups
+## 3.6 Likely follow-ups
 
 - **"What if Redis goes down?"** The limiter **fails open** — a protective
   control must not cause the outage it prevents. For a payment or auth control
@@ -403,19 +640,215 @@ cache correctness: even if invalidation is missed, staleness is bounded.
 
 ---
 
-# Part 3 — Kafka deep dive
+# Part 4 — Auth: JWT, RBAC, passwords ⭐
 
-## 3.1 The one sentence that reframes everything ⭐
+Core SDE-1 backend territory, and the part of this project that changed most.
+
+## 4.1 The two words, and the two status codes
+
+**Authentication = who are you. Authorization = what may you do.**
+Mixing the codes is an instant red flag.
+
+| Code | Means | Example here |
+|---|---|---|
+| **401** Unauthorized | *Unauthenticated* — no token, bad token, expired token | `POST /orders` with no header |
+| **403** Forbidden | Authenticated, but not allowed | A customer calling `POST /orders/dispatch` |
+
+(The name "401 Unauthorized" is a historical misnomer — it means *unauthenticated*.)
+
+## 4.2 What a JWT actually is
+
+Three base64url segments joined by dots:
+
+```
+   header  .  payload  .  signature
+   ▲          ▲           ▲
+   {"alg":    {"sub":     HMAC-SHA256(
+    "HS256",   "u@x.io",    base64(header) + "." + base64(payload),
+    "typ":     "exp":       SECRET
+    "JWT"}     1735…}     )
+```
+
+**The single most important fact: the payload is base64-encoded, not encrypted.**
+Anyone holding the token can read every claim. The signature doesn't hide it —
+it proves it hasn't been *changed*.
+
+Two consequences:
+
+- **Never put secrets in a JWT.** No passwords, no card numbers, no PII you
+  wouldn't hand the client.
+- **Never trust a decoded payload without verifying the signature.** That is the
+  classic JWT hole — and the reason `jwt.decode()` in our code always passes the
+  key and algorithm.
+
+**Standard claims worth naming:** `sub` (subject/user), `exp` (expiry), `iat`
+(issued at), `iss` (issuer), `aud` (audience), `jti` (unique token id, used for
+revocation).
+
+Ours carries `sub` (email), `is_admin`, `iat`, `exp`, expiring in 60 minutes.
+
+## 4.3 Sessions vs JWT — the trade
+
+```
+ SESSIONS (stateful)                  JWT (stateless)
+ login  -> server stores {sid: 7}     login  -> server SIGNS {sub, exp}
+ request + cookie                     request + Bearer header
+   -> DB/Redis lookup every request     -> verify signature, no lookup
+ revoke = delete the session   ✅     revoke = hard              ❌
+ needs shared session store    ❌     any replica verifies alone ✅
+```
+
+**Why JWT here:** three API replicas, and any of them must authenticate a caller
+with no shared session store. That's the whole argument.
+
+**The honest cost:** you cannot easily revoke. A stolen token stays valid until
+`exp`.
+
+## 4.4 The one deliberate deviation ⭐
+
+`get_current_user` **loads the user row from Postgres** rather than trusting the
+token's claims wholesale — so this isn't purely stateless, by choice.
+
+**Why:** a token stays valid until it expires. Without the lookup, a user deleted
+or demoted from `ops` a minute ago keeps full admin access for the rest of the
+hour. The role that matters is the one in the database *now*, not the one signed
+into the token 59 minutes ago.
+
+That's a DB read per request, consciously paid for.
+
+**Say it like this:** "I use JWT for stateless verification across replicas, but I
+still load the user, because authorization should reflect current state. It costs
+a lookup and it closes the demoted-admin window."
+
+## 4.5 JWT vulnerabilities — the checklist
+
+| Attack | What it is | Our answer |
+|---|---|---|
+| **`alg: none`** | Attacker sets the algorithm to `none` and strips the signature; a naive library accepts it | We pass `algorithms=["HS256"]` explicitly — never read the algorithm from the token |
+| **Weak / leaked secret** | HS256 is only as strong as the key. Ours was `dev-only-change-me`, **published in the repo** | No default at all; boot fails without a real secret; placeholders rejected; 32-byte minimum |
+| **No expiry check** | Token valid forever | `exp` is verified by the library, not by us |
+| **Algorithm confusion** | Server expects RS256 (public key) but attacker signs with HS256 *using the public key as the HMAC secret* | Only HS256 is accepted here, so there's nothing to confuse |
+| **Sensitive data in payload** | It's readable base64 | Payload holds an email and a boolean, nothing more |
+| **Token stored in `localStorage`** | Any XSS can read it | **True of our console** — the honest answer is below |
+
+**On storage — the trade to be able to argue:**
+
+| | `localStorage` | `httpOnly` cookie |
+|---|---|---|
+| XSS can read it | **Yes** | No |
+| CSRF risk | No | **Yes** — needs SameSite / CSRF tokens |
+| Works cross-origin | Easy | Needs CORS + credentials |
+
+Our React console uses `localStorage`, which is the common SPA choice and is
+XSS-exposed. The stronger option is an `httpOnly`, `Secure`, `SameSite=Strict`
+cookie — you trade an XSS exposure for a CSRF one, and CSRF has cleaner defences.
+
+## 4.6 HS256 vs RS256
+
+- **HS256** — symmetric. One secret both signs and verifies. Simple; everyone who
+  can *verify* can also *forge*.
+- **RS256** — asymmetric. Private key signs, public key verifies. Use it when a
+  **different service** must verify tokens it should not be able to mint.
+
+One issuer and one verifier here, so HS256 is right. If DeliverIQ split into
+several services, RS256 would be the move.
+
+## 4.7 Refresh tokens and revocation — the open gap
+
+Short access token + long refresh token is the standard pattern:
+
+```
+access token   15 min, sent on every request  -> small stolen-token window
+refresh token  7 days, sent only to /refresh  -> stored server-side, revocable
+```
+
+**DeliverIQ has neither refresh tokens nor revocation.** The per-request user
+lookup (§4.4) covers *deleted* and *demoted* users, but nothing covers a stolen
+token, a password change, or "log me out everywhere".
+
+**The fix, which I can describe:** add a `jti` claim and keep a Redis denylist
+keyed on it with a TTL matching the token's remaining life, plus
+`POST /auth/logout`. Redis is already a hard dependency, so it costs no new
+infrastructure. **Volunteer this one** — it's a known gap with a known fix.
+
+## 4.8 RBAC, concretely
+
+Permissions attach to a **role**, not a person.
+
+| Role | May |
+|---|---|
+| `ops` | Everything — dispatch, onboard riders, any status change, `/admin/stats` |
+| `rider` | Advance **only** orders assigned to them; never cancel |
+| `customer` | Place orders; read only their own; never touch status |
+
+Three rules worth stating:
+
+1. **Roles cannot be self-assigned.** `/auth/register` always creates a customer;
+   promotion is an operator action. An API that lets a caller declare itself
+   `ops` is not an authorization system.
+2. **The guard sits on the router, not each handler** for `/admin` — so a new
+   endpoint added there is protected by default. Per-handler guards are one
+   forgotten decorator away from an open route.
+3. **Two orthogonal guards on status changes.** `transition()` asks *is this move
+   legal?* (`PENDING → DELIVERED` is not). `assert_may_change_status()` asks *may
+   this caller make it?* A customer marking their own order delivered is a
+   **legal move by the wrong actor** — a state machine alone can never catch that.
+
+## 4.9 Password hashing
+
+**Never store passwords. Never encrypt them — hash them.** Encryption is
+reversible; that's the wrong property.
+
+- **bcrypt**, not SHA-256. Slowness is the *feature*: SHA-256 is built to be fast,
+  which is exactly what an attacker with a leaked table wants. bcrypt has a
+  tunable work factor.
+- **Salt** — a random value per password, stored alongside the hash. Without it,
+  identical passwords produce identical hashes and one rainbow table cracks
+  everybody. bcrypt generates and embeds the salt automatically.
+- **Constant-time comparison** — `bcrypt.checkpw` takes the same time for a wrong
+  password as a right one, leaking no timing signal.
+- **The 72-byte gotcha:** bcrypt silently truncates past 72 **bytes**, so two
+  different long passwords can hash identically. We **reject** rather than
+  truncate, so the limit is visible instead of a silent downgrade. (Bytes, not
+  characters — an emoji is four.)
+- **Alternatives:** Argon2id is the current recommendation (memory-hard, resists
+  GPU cracking); scrypt and PBKDF2 are also acceptable. bcrypt remains fine.
+
+**One more:** login returns **one generic message** for both "no such user" and
+"wrong password". Distinguishing them turns the endpoint into an
+account-enumeration oracle.
+
+## 4.10 Likely follow-ups
+
+- **"How do you log someone out?"** With plain JWT you can't, really — the token
+  stays valid until `exp`. You shorten expiry, or add a `jti` denylist. I'd add
+  the denylist.
+- **"Why not just check `is_admin` from the token?"** Because it's a snapshot
+  from issue time. I read the role from the database so a demotion takes effect
+  immediately.
+- **"How do you protect against brute force on login?"** Rate limiting — and
+  login is exactly the case where I'd use a **sliding window log** (§2.3) rather
+  than token bucket: the limit must be exact and bursts are precisely what you're
+  trying to stop.
+- **"What if the secret leaks?"** Rotate it. Every existing token becomes invalid
+  — which is also the crude, universal revocation mechanism.
+- **"HTTPS?"** Mandatory. A bearer token in plaintext over HTTP is a credential
+  anyone on the path can copy and replay.
+
+---
+
+# Part 5 — Kafka
+
+## 5.1 The one sentence that reframes everything ⭐
 
 **Kafka is a log, not a queue.**
 
-A queue *deletes* a message when it is consumed. A log **appends**, keeps
-messages for a retention period, and lets each consumer track its own position.
-So the same message can be read by three different consumers at three different
-times — and re-read tomorrow.
+A queue *deletes* on consume. A log **appends**, retains for a period, and lets
+each consumer track its own position — so three consumers can read the same
+message at three different times, and re-read it tomorrow.
 
-That is exactly why Redis Pub/Sub wasn't enough: Pub/Sub is
-broadcast-and-forget, so a subscriber that is down **misses the message forever**.
+That is why Redis Pub/Sub wasn't enough: it is broadcast-and-forget, so a
+subscriber that is down **misses the message forever**.
 
 | | Queue (RabbitMQ) | Log (Kafka) |
 |---|---|---|
@@ -424,7 +857,7 @@ broadcast-and-forget, so a subscriber that is down **misses the message forever*
 | Replay | Not a feature | Reset the offset |
 | Ordering | Per queue | Per **partition** |
 
-## 3.2 Topics, partitions, offsets
+## 5.2 Topics, partitions, offsets
 
 - **Topic** — a named stream (`order.dispatched`).
 - **Partition** — an ordered, append-only sequence. A topic has N of them.
@@ -439,7 +872,7 @@ order.dispatched
                               ^ committed offset per consumer group
 ```
 
-## 3.3 Partitions: ordering and parallelism are the same knob ⭐
+## 5.3 Partitions: ordering and parallelism are the same knob ⭐
 
 **Ordering is guaranteed within a partition only — never across partitions.**
 
@@ -470,7 +903,7 @@ consumers in a group do work. A 4th sits idle.
 | **Can't shrink** | Partition count can increase, never decrease | Over-provision a little at design time |
 | **Increasing breaks mapping** | `hash(key) % N` changes when N changes, so a key moves to a new partition and **ordering breaks across the change** | Plan capacity up front |
 
-## 3.4 Consumer groups: one string picks the architecture ⭐
+## 5.4 Consumer groups: one string picks the architecture ⭐
 
 `group.id` is the whole switch:
 
@@ -490,7 +923,7 @@ Three groups, **three independent failure domains, one event**. That is the
 payoff of the log model, and adding a fourth consumer requires no producer change
 at all.
 
-## 3.5 Delivery semantics are a commit *placement* ⭐
+## 5.5 Delivery semantics are a commit *placement* ⭐
 
 Not a setting — **where you put the commit relative to the work.**
 
@@ -516,7 +949,7 @@ message's own coordinates, guaranteed unique — so a redelivery inserts zero ro
 Doing it in *one* statement matters: a `SELECT` then `INSERT` would race a second
 worker and both would decide the row was absent.
 
-## 3.6 The problems nobody mentions until asked ⭐
+## 5.6 The problems nobody mentions until asked ⭐
 
 ### Poison pill
 A message that can *never* be processed — malformed payload, missing field.
@@ -564,7 +997,7 @@ When a member joins or leaves, partitions are reassigned and consumption
 Messages are kept by time or size, not until consumption. A consumer down longer
 than retention **loses data permanently**. Retention is a data-loss window.
 
-## 3.7 Durability: acks and replication
+## 5.7 Durability: acks and replication
 
 | `acks` | Means | Risk |
 |---|---|---|
@@ -579,14 +1012,14 @@ replication-factor 1, "all" is one replica** — so `acks=all` provides no real
 durability. The producer config is right; the *topology* isn't. Production needs
 3 brokers, RF=3, `min.insync.replicas=2`.
 
-## 3.8 One real config gotcha
+## 5.8 One real config gotcha
 
 librdkafka (the C/Python client) defaults to **CRC32** partitioning; the Java
 client uses **murmur2**. Same key, different partition, depending on which client
 wrote it — so per-key ordering silently breaks in a mixed-language shop. We pin
 `partitioner=murmur2_random` to match the ecosystem default.
 
-## 3.9 Likely follow-ups
+## 5.9 Likely follow-ups
 
 - **"Why not RabbitMQ?"** I need replay and multiple independent readers of the
   same event. A queue deletes on consume.
@@ -603,25 +1036,42 @@ wrote it — so per-key ordering silently breaks in a mixed-language shop. We pi
 
 ---
 
-# Part 4 — Two-minute recap
+# Part 6 — Two-minute recap
 
-**Redis.** In-memory, single-threaded, used for three derived things: rate
-limiting, the geohash index, idempotency. Token bucket over fixed/sliding window
-because API traffic is bursty and I wanted a bounded burst with a capped
-sustained rate. The read-modify-write is a Lua script so it's atomic — three
-separate commands would race. It lives in Redis rather than memory because three
+Say these out loud until they're fluent.
+
+**Rate limiting.** Token bucket, because API clients are bursty then idle and I
+wanted a bounded burst with a capped sustained rate at O(1) memory per user.
+Fixed window is cheaper but lets 2× the limit through across a boundary. Sliding
+log is exact but its memory grows with request volume — I'd use it for login,
+where the limit has to be exact. Sliding counter is the large-scale compromise.
+Leaky bucket forbids bursts entirely, which is what you want in front of a
+fragile downstream. The read-modify-write runs as one Lua script because three
+separate commands would race.
+
+**Redis.** In-memory, single-threaded, holding three *derived* things: rate
+buckets, the geohash index, the idempotency cache — all rebuildable from
+Postgres. The limiter lives here rather than in process memory because three
 replicas with local counters give you 3× your configured limit. It keys on the
-verified token subject, because keying on a client-supplied header let anyone
-mint a fresh bucket — a real bug I found and fixed.
+verified token subject; keying on a client-supplied header let anyone mint a
+fresh bucket, which was a real bug I shipped and fixed.
+
+**Auth.** JWT over sessions because three replicas must verify with no shared
+session store. The payload is base64, not encrypted — so nothing secret goes in
+it and nothing is trusted without verifying the signature. One deliberate
+deviation: I load the user row per request, so a demoted admin loses access
+immediately instead of at token expiry. The signing secret has no default, and
+the app refuses to boot without one. Known gap: no revocation — the fix is a
+`jti` claim plus a Redis denylist.
 
 **Kafka.** A log, not a queue: consumption doesn't delete, so three groups read
 the same event with independent offsets and a new consumer backfills history.
 Keyed by `order_id`, so per-order ordering holds within a partition — ordering
-and parallelism being the same dial. Commit *after* processing, which makes it
+and parallelism being the same dial. Commit *after* processing makes it
 at-least-once, so the analytics consumer dedupes on `(partition, offset)`:
-delivery stays at-least-once, the effect becomes exactly-once. Unprocessable
-messages go to a DLQ, and I only commit once that publish is acked — otherwise
-I'd advance past a message with no copy of it anywhere.
+delivery stays at-least-once, the effect becomes exactly-once. Poison messages go
+to a DLQ, and I only commit once that publish is acked — otherwise I'd advance
+past a message with no copy of it anywhere.
 
 **The gap I volunteer:** no transactional outbox. A crash between the DB commit
 and the Kafka publish loses the event. That's the dual-write problem, and the fix

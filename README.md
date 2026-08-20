@@ -344,7 +344,7 @@ measures the limiter, not the app.
 
 `docs/INTERVIEW_NOTES.md` explains the stack choices — what each component is,
 why it was chosen, and what was rejected — plus deep dives on rate-limiting
-algorithms and Kafka's delivery semantics. `docs/INTERVIEW_PREP.md` is the long
+algorithms, Redis, auth/JWT, and Kafka's delivery semantics. `docs/INTERVIEW_PREP.md` is the long
 form. `docs/DAILY_COMMANDS.md` is the operational runbook.
 
 ---

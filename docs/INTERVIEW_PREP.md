@@ -6,12 +6,12 @@
 > the build plan is history now that the project is done, and the general
 > backend theory only earns its place where the project demonstrates it.
 
-> **Companion file:** [`INTERVIEW_NOTES.md`](./INTERVIEW_NOTES.md) — a refined,
-> beginner-level pass over the resume skills (what each is, why it was chosen,
-> what was rejected) plus deep dives on **Redis rate-limiting algorithms** and
-> **Kafka partitions / consumer groups / delivery semantics**, which is where
-> follow-up questions have actually gone. Read that one the night before; read
-> this one to build the depth behind it.
+> **Companion file:** [`INTERVIEW_NOTES.md`](./INTERVIEW_NOTES.md) — the
+> interview-facing pass: every resume term decoded, the stack choices and what
+> was rejected, and depth on the four topics follow-ups actually land on —
+> **rate limiting** (all five algorithms with pseudocode, diagrams, limitations
+> and real-world uses), **Redis**, **auth/JWT**, and **Kafka**. Read that one the
+> night before; read this one to build the depth behind it.
 
 ## How to use this
 
