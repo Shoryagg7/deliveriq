@@ -32,7 +32,7 @@ flowchart TD
 
     subgraph REPLICAS["API replicas (--scale api=3)"]
         API["FastAPI<br/>JWT auth · role-based authz"]
-        Dispatch["Dispatch<br/>priority heap + aging, O(log n)"]
+        Dispatch["Dispatch<br/>priority heap + aging, O(n log n)/dispatch"]
         Match["Matching<br/>geohash cell + fairness band"]
     end
 
@@ -236,9 +236,22 @@ drift.
 
 ## Load
 
-Locust, 50 concurrent users, rate limiter disabled: **~123 RPS, p99 220 ms, 0%
-errors**. With the limiter enabled, throughput is capped by the bucket by design
-— worth naming which configuration a number came from.
+**No number quoted here yet, on purpose.** The previous figure came from a Locust
+run that only hit unauthenticated `POST /orders` — it measured a plain INSERT,
+not matching, locking or Kafka, so it was retired rather than restated.
+
+`locustfile.py` now drives `POST /orders/dispatch` — the claim — under contention
+with a seeded rider fleet, which is the path worth measuring:
+
+```bash
+API_PORTS=8000-8002:8000 docker compose up -d --scale api=3
+python -m scripts.seed_users
+RATE_LIMIT_ENABLED=false locust -f locustfile.py --host http://localhost:8000
+```
+
+Always name which configuration *and which endpoint* a load number came from.
+With the limiter enabled, throughput is capped by the bucket by design — that
+measures the limiter, not the app.
 
 ---
 
