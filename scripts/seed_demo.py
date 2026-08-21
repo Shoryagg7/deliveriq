@@ -23,13 +23,14 @@ from app.models.order import Order
 from app.models.rider import Rider
 from app.models.user import User
 from app.services.dispatch import pick_next_order
-from app.services.geohash_service import add_rider
+from app.services.geohash_service import add_rider, update_rider_location
 
 PICKUP = (28.6100, 77.2000)
 DROP = (28.6500, 77.2500)
 JITTER = 0.0015  # ~165m — comfortably inside the geohash search ring
 
 DEMO_CUSTOMER = "customer@deliveriq.io"  # created by scripts.seed_users
+DEMO_RIDER_LOGIN = "rider@deliveriq.io"  # ditto — must end up holding an order
 
 N_RIDERS = 6
 N_ORDERS = 9
@@ -77,6 +78,27 @@ def main() -> None:
         db.commit()
         print(f"  {N_RIDERS} riders (indexed), {N_ORDERS} orders created")
 
+        # The rider LOGIN has to end up holding an order, or signing in as
+        # `rider` shows an empty board and the whole role demo falls flat.
+        # Previously this was luck: Demo Rider sits ~70 m from the pickup while
+        # the couriers are jittered 0-165 m, so on some runs four dispatches all
+        # went to couriers.
+        #
+        # Park the demo rider exactly ON the pickup point instead. On the first
+        # dispatch every rider has 0 orders today, so the fairness band falls
+        # through to distance — and 0 m wins. No special-casing inside dispatch;
+        # the demo rider simply wins the real algorithm, deterministically.
+        demo_rider = (
+            db.query(Rider)
+            .join(User, User.rider_id == Rider.id)
+            .filter(User.email == DEMO_RIDER_LOGIN)
+            .first()
+        )
+        if demo_rider is not None:
+            demo_rider.current_lat, demo_rider.current_lon = PICKUP
+            db.commit()
+            update_rider_location(demo_rider.id, PICKUP[0], PICKUP[1])
+
         assigned = 0
         for _ in range(N_DISPATCH):
             try:
@@ -86,6 +108,11 @@ def main() -> None:
                 print(f"  dispatch stopped early: {type(exc).__name__}")
                 break
         print(f"  {assigned} dispatched, {N_ORDERS - assigned} left PENDING")
+
+        if demo_rider is not None:
+            mine = db.query(Order).filter(Order.rider_id == demo_rider.id).count()
+            note = "" if mine else "  <- NOT OK, rider login has nothing to advance"
+            print(f"  {DEMO_RIDER_LOGIN} holds {mine} order(s){note}")
     finally:
         db.close()
 

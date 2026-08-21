@@ -24,3 +24,7 @@ class OrderResponse(BaseModel):
     value: float
     status: OrderStatus
     created_at: datetime
+    # Who it was dispatched to; None while PENDING. The console renders this as
+    # a "rider N" badge — without it that badge was dead code and an assigned
+    # order looked identical to an unassigned one.
+    rider_id: int | None = None

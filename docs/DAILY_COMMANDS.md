@@ -682,7 +682,21 @@ curl -s localhost:8000/ready | python -m json.tool       # all three deps "ok"
 | Script | Creates | Without it |
 |---|---|---|
 | `seed_users` | The 3 demo logins, and the `Rider` row the rider login acts as | **Every login returns 401** — the DB has zero users |
-| `seed_demo` | 6 riders (indexed into Redis) + 9 orders, 4 already dispatched | Console loads but the board is **empty**; "Dispatch next" has nothing to do |
+| `seed_demo` | 6 riders (indexed into Redis) + 9 orders, 4 dispatched — **one of them guaranteed to the rider login** | Console loads but the board is **empty**; "Dispatch next" has nothing to do |
+
+`seed_demo` prints a confirmation line you should actually read:
+
+```
+  4 dispatched, 5 left PENDING
+  rider@deliveriq.io holds 1 order(s)
+```
+
+If that count is ever `0` it says so loudly — signing in as `rider` would show an
+empty board and the role demo would fall flat. It is guaranteed by **parking the
+demo rider exactly on the pickup point**: on the first dispatch every rider has
+zero orders today, so the fairness band falls through to distance and 0 m wins.
+Nothing is special-cased inside dispatch — the demo rider just wins the real
+algorithm.
 
 `seed_demo` requires `seed_users` to have run first — orders now belong to a real
 `customer_id`, so it looks up `customer@deliveriq.io` and exits with a clear
@@ -723,6 +737,10 @@ API_PORTS=8000:8000 docker compose up -d
 ```bash
 API_PORTS=8000-8002:8000 docker compose up -d --scale api=3
 ```
+
+**This bites on rebuilds too.** `docker compose up -d --build api` without the
+variable moved it to **8002** in testing. Pin it on *every* `up`, not just the
+first one.
 
 **Always check before presenting:** `docker compose port api 8000`
 
@@ -775,6 +793,7 @@ docker compose exec api python -m scripts.seed_demo
 | Console won't load at `:8000` | Docker picked another port from the range | `docker compose port api 8000`, then pin with `API_PORTS=8000:8000` |
 | Every login 401 | `down -v` wiped the users | `seed_users` |
 | Board empty after seeding users | `seed_demo` not run | `seed_demo` |
+| Signed in as `rider`, board empty | `seed_demo` reported `holds 0 order(s)` | Re-run `seed_demo`; check the confirmation line |
 | Stack won't even parse | `JWT_SECRET` unset in `.env` | Generate one — see §1 |
 | Dispatch says no rider available | Redis flushed; riders exist in Postgres but not in the geohash index | `python -m scripts.reindex_riders` |
 
