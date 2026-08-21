@@ -2,6 +2,10 @@
 
 > Two questions before any command: **which MODE am I in** (dev vs proof), and
 > **which curl mode do I need** (A happy-path vs B debugging).
+>
+> **Demoing, or just wiped everything with `down -v`? Go straight to §9.** It has
+> the reset-to-working-demo sequence, the three logins, and the port gotcha that
+> otherwise breaks the console mid-demo.
 
 ---
 
@@ -88,9 +92,12 @@ git add -A && git commit -m "day NN: <what>"
 
 **After a `down -v` (fresh volumes) — extra steps before uvicorn:**
 ```bash
-docker compose exec db psql -U deliveriq_user -d deliveriq_db -c "CREATE DATABASE deliveriq_test_db;"
 alembic upgrade head                     # host runs migrations; infra-only up has no migrate job
+python -m scripts.seed_users             # DB is empty — no logins exist yet
 ```
+> `deliveriq_test_db` is created automatically by `docker/postgres-init/` on a
+> fresh `pgdata` volume, which is exactly the `down -v` case. No manual
+> `CREATE DATABASE` needed. (Warm restarts skip init — the DB already exists.)
 > `down -v` **now also wipes `kafkadata`** — every message AND every consumer
 > group offset. The topic auto-recreates on first use (3 partitions via
 > `KAFKA_NUM_PARTITIONS`), but groups start with no committed offsets, so
@@ -467,13 +474,10 @@ run instead of silently publishing to a live broker.
 ```bash
 docker compose restart api        # proof mode bounce (env change; code needs --build)
 docker compose down               # remove containers+network, KEEP data
-docker compose down -v            # + wipe volumes = Postgres AND Kafka gone → §1 "after down -v" steps
+docker compose down -v            # + wipe volumes = Postgres AND Kafka gone → §9.2 to get back to a demo
 ```
 `-v` kills `pgdata` + `kafkadata`: DB rows, Kafka messages, **and consumer-group
 offsets**. No confirmation prompt.
-
----
-
 ## 8. Kafka — daily commands
 
 > Broker: `apache/kafka:4.1.2`, KRaft, single node. UI: http://localhost:8080
@@ -632,3 +636,146 @@ the same path.
 - `Clean Up Policy: DELETE` vs `COMPACT` (keep latest value per key forever) —
   `__consumer_offsets` is compacted, which is exactly why the bookmark outlives
   the events it points at.
+
+---
+
+## 9. Users, logins, and demo recovery
+
+### 9.1 The rule that explains everything
+
+**`POST /auth/register` always creates a `customer`. Always.** Roles cannot be
+self-assigned — an API where the caller declares itself `ops` is not an
+authorization system. Promotion is an **operator action**, which is what
+`seed_users` and `make_ops` are.
+
+Verified on a fresh database:
+
+```
+POST /auth/register           ->  {"role": "customer"}   <- never ops
+that user -> POST /orders/dispatch  ->  403               <- correctly refused
+```
+
+So after any wipe you cannot demo anything privileged until you seed. **There is
+no bootstrap admin and no default account** — by design.
+
+### 9.2 Full reset → working demo (verified end to end)
+
+```bash
+docker compose down -v                                  # wipes pgdata + kafkadata
+API_PORTS=8000:8000 docker compose up -d                # see 9.4 — pin the port!
+docker compose exec api python -m scripts.seed_users    # the three demo logins
+docker compose exec api python -m scripts.seed_demo     # riders + a populated board
+```
+
+Takes ~25 s with a warm image. `migrate` runs the 6 migrations automatically
+(the API waits on `service_completed_successfully`), so **no manual `alembic`
+step in proof mode**.
+
+Confirm before you present anything:
+
+```bash
+curl -s localhost:8000/ready | python -m json.tool       # all three deps "ok"
+```
+
+**What each seed does — and why you need both:**
+
+| Script | Creates | Without it |
+|---|---|---|
+| `seed_users` | The 3 demo logins, and the `Rider` row the rider login acts as | **Every login returns 401** — the DB has zero users |
+| `seed_demo` | 6 riders (indexed into Redis) + 9 orders, 4 already dispatched | Console loads but the board is **empty**; "Dispatch next" has nothing to do |
+
+`seed_demo` requires `seed_users` to have run first — orders now belong to a real
+`customer_id`, so it looks up `customer@deliveriq.io` and exits with a clear
+message if it's missing.
+
+### 9.3 The three demo logins
+
+| Login | Password | Demonstrates |
+|---|---|---|
+| `ops@deliveriq.io` | `opspassword123` | Everything — dispatch, onboard riders, any status change, `/admin/stats` |
+| `rider@deliveriq.io` | `riderpassword123` | Advances **only its own** orders; 403 on cancel |
+| `customer@deliveriq.io` | `custpassword123` | Places orders, sees **only its own**; 403 on everything above |
+
+Sign in at http://localhost:8000. Re-running `seed_users` is safe and idempotent
+— it re-applies roles, so an account edited by hand snaps back.
+
+### 9.4 The port gotcha that will bite you mid-demo ⭐
+
+`docker-compose.yml` publishes `${API_PORTS:-8000-8002:8000}` — a **range**, so
+`--scale api=3` has three free host ports. But with a range **Docker may pick any
+port in it, even when 8000 is free.** Observed on a clean `up`:
+
+```
+$ docker compose port api 8000
+0.0.0.0:8001          <- not 8000, and nothing else was holding 8000
+```
+
+Your bookmark to `localhost:8000` then fails and the console looks broken.
+
+**For any single-replica run — demos included — pin it:**
+
+```bash
+API_PORTS=8000:8000 docker compose up -d
+```
+
+**Only use the range when you actually scale:**
+
+```bash
+API_PORTS=8000-8002:8000 docker compose up -d --scale api=3
+```
+
+**Always check before presenting:** `docker compose port api 8000`
+
+### 9.5 Making your own login
+
+```bash
+# create a new account at any role, or PROMOTE an existing one
+docker compose exec api python -m scripts.make_ops me@example.com mypassword123        # -> ops
+docker compose exec api python -m scripts.make_ops me@example.com mypassword123 rider  # -> rider
+```
+
+- **Promoting leaves the password alone** on purpose — you can promote someone
+  who registered through the UI without taking over their account.
+- Promoting to `rider` also creates a `Rider` row **and indexes it into Redis**.
+  Both halves matter: a rider written straight to Postgres is `AVAILABLE` in the
+  table and **invisible to dispatch**, because matching reads the Redis geohash
+  index, not the table.
+
+Dev mode (app on host) is the same commands without the `docker compose exec api`
+prefix.
+
+### 9.6 Demo script — five minutes, in order
+
+```bash
+# 0. clean slate
+docker compose down -v && API_PORTS=8000:8000 docker compose up -d
+docker compose exec api python -m scripts.seed_users
+docker compose exec api python -m scripts.seed_demo
+```
+
+1. **http://localhost:8000** — sign in as **ops**. Show the board: pending vs
+   assigned orders, riders idle vs busy.
+2. **Dispatch next** — an order flips to ASSIGNED and a rider to BUSY. That is
+   the heap + geohash + fairness band running.
+3. Sign out, sign in as **customer** — the same list now shows **only their own
+   orders**. That is role-scoped reads, not a UI filter.
+4. Sign in as **rider** — advance their own order; try to cancel it and get a
+   **403**. Legal move, wrong actor.
+5. **http://localhost:8080** (Kafka UI) — `order.dispatched`, 3 partitions, and
+   **three consumer groups each with their own offsets** on the same topic.
+6. **http://localhost:3000** (Grafana) — dispatch outcomes, latency, dependency
+   health.
+7. Back in a terminal: `./scripts/verify.sh` — the security boundaries, live,
+   including a token forged with the old shipped secret being rejected.
+
+### 9.7 "It was working yesterday" — the four usual causes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Console won't load at `:8000` | Docker picked another port from the range | `docker compose port api 8000`, then pin with `API_PORTS=8000:8000` |
+| Every login 401 | `down -v` wiped the users | `seed_users` |
+| Board empty after seeding users | `seed_demo` not run | `seed_demo` |
+| Stack won't even parse | `JWT_SECRET` unset in `.env` | Generate one — see §1 |
+| Dispatch says no rider available | Redis flushed; riders exist in Postgres but not in the geohash index | `python -m scripts.reindex_riders` |
+
+---
