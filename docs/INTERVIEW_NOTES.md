@@ -25,13 +25,16 @@ line each — the depth is in Parts 2 onward.
 because those are the conversations worth having — they're where the depth is,
 and an interviewer reading top-down will pick from there.
 
+**A bullet is a hook, not an explanation.** Each one is ~20 words and names two
+or three things, because every term on the page is a question you have invited
+and you have to be able to answer all of them. The depth below is what you
+*say*, not what you print. If a bullet needs a second sentence to make sense,
+it's too long for a resume.
+
 ## Bullet 1 — the algorithms ⭐ (lead with this)
 
-> *Built the dispatch core: aging-weighted priority scheduling that makes
-> starvation impossible, geohash prefix indexing for O(1) candidate lookup with
-> haversine ranking, and a fairness band that spreads work across idle riders;
-> load-testing the claim path exposed an unbounded scan, and bounding it cut
-> dispatch p99 from 11 s to 2.8 s*
+> *Built dispatch as a priority queue with aging to prevent starvation, plus
+> geohash-based rider matching; bounding the search cut p99 from 11 s to 2.8 s*
 
 | Term | What it means | How we handle it |
 |---|---|---|
@@ -54,10 +57,9 @@ scan was still unbounded when no rider was free (1,730 orders walked to answer
 
 ## Bullet 2 — Redis ⭐
 
-> *Used Redis as the shared state layer for 3 stateless replicas: an atomic Lua
-> token-bucket rate limiter keyed to verified token identity, a geohash set
-> index queried by pipelined 9-cell fan-out, self-expiring fairness counters,
-> and `SET NX`-claimed idempotency plus a `jti` revocation denylist*
+> *Used Redis as shared state for 3 replicas: an atomic Lua token-bucket rate
+> limiter, a geohash rider index, and TTL-based idempotency and token
+> revocation*
 
 **Open with the problem, not the tool.** Three replicas, no shared memory.
 Anything one remembers in a variable, the other two can't see — so a rate limit
@@ -95,11 +97,8 @@ minute. **"Why not Memcached?"** No sets, no sorted sets, no Lua.
 
 ## Bullet 3 — Kafka ⭐ (the most-probed one)
 
-> *Closed a dual-write hole with a transactional outbox — the event commits with
-> the order, a relay publishes then marks — and streamed to 3 Kafka consumer
-> groups over RF=3/`min.insync=2` with manual offset commits for at-least-once
-> delivery, idempotent consumption on `(partition, offset)`, and a dead-letter
-> queue for poison messages*
+> *Streamed events to 3 Kafka consumer groups with at-least-once delivery, and
+> added a transactional outbox so a crash can't lose an event*
 
 | Term | What it means | How we handle it |
 |---|---|---|
@@ -117,10 +116,9 @@ follow-up this bullet invites most often, so know it cold.
 
 ## Bullet 4 — concurrency
 
-> *Eliminated a double-dispatch race across 3 API replicas with a two-phase
-> `SELECT FOR UPDATE SKIP LOCKED` claim; re-measured under burst, found it
-> correct but not live — half the orders stalling with riders idle — and added
-> bounded rider-level retry to drain every order with zero duplicates*
+> *Fixed a double-dispatch race across 3 replicas with
+> `SELECT … FOR UPDATE SKIP LOCKED`, proven by a concurrency test that runs in
+> CI*
 
 | Term | What it means | How we handle it |
 |---|---|---|
@@ -191,10 +189,8 @@ retries when wrong. Here contention is the normal case, so it would thrash.
 
 ## Bullet 5 — security
 
-> *Hardened after a self-audit: closed 4 unauthenticated endpoints, a forgeable
-> admin JWT and a cross-tenant idempotency leak; extended RBAC across every
-> route with separate role and ownership guards, backed by 79 tests and a CI
-> race check at 3 replicas*
+> *Hardened after a self-audit: JWT auth with role and ownership checks,
+> closing 4 unauthenticated endpoints; 79 tests*
 
 **"79 tests", never "79 integration tests"** — the split is **55 integration**
 (real Postgres and Redis over HTTP, one of them producing and consuming against
