@@ -32,7 +32,7 @@ flowchart TD
 
     subgraph REPLICAS["API replicas (--scale api=3)"]
         Auth["JWT auth + RBAC<br/>ops · rider · customer"]
-        Dispatch["dispatch<br/>priority heap + aging"]
+        Dispatch["dispatch<br/>SQL priority + aging"]
         Match["matching<br/>geohash cell + fairness band"]
     end
 
@@ -158,8 +158,9 @@ Within the candidate set a 500 m fairness band admits everyone near the closest
 rider, then picks whoever has taken the fewest orders today.
 
 ### Scheduling — priority with aging
-A max-heap orders by `value + minutes_waited × weight`, so high-value orders go
-first but nothing starves: a cheap order that has waited long enough outranks a
+Postgres orders by `value + minutes_waited × weight` — `ORDER BY … LIMIT 1 FOR
+UPDATE SKIP LOCKED`, capped at the top 20 — so high-value orders go first but
+nothing starves: a cheap order that has waited long enough outranks a
 fresh expensive one.
 
 ### Events — a transactional outbox, then at-least-once delivery

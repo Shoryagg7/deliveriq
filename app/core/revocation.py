@@ -37,7 +37,8 @@ def revoke(jti: str, exp: int | None) -> None:
     remaining = int(exp - datetime.now(UTC).timestamp()) if exp else 0
     if remaining <= 0:
         return
-    redis_client.setex(_key(jti), remaining, "1")
+    # set(ex=) rather than the deprecated setex; same single round trip.
+    redis_client.set(_key(jti), "1", ex=remaining)
 
 
 def is_revoked(jti: str | None) -> bool:

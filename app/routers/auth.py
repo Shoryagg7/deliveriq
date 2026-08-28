@@ -87,10 +87,17 @@ def logout(
 ):
     """Revoke the token presented on this request.
 
-    Deliberately idempotent and silent: logging out twice, or with a token that
-    already expired, is a 204 either way. There is nothing useful to tell a
-    caller who is trying to end a session that is already over, and a
-    distinguishable response would leak whether a token was live.
+    Silent by design: a successful logout returns 204 with no body, because
+    there is nothing useful to tell a caller whose session is now over.
+
+    Note it is NOT idempotent, and that is a consequence rather than a choice.
+    `get_current_user` treats a revoked token as unauthenticated, so the second
+    logout with the same token is rejected by the dependency before this handler
+    runs and comes back 401. That is consistent with every other authenticated
+    route, and it leaks nothing: the caller already holds the token and could
+    learn the same thing from any endpoint. Clients should treat 204 and 401
+    alike here — both mean "this token is done" — which is exactly what the
+    console's sign-out does.
 
     Note this revokes ONE token, not the user. Logging out of a phone should not
     log you out of a laptop — that is what the per-token `jti` buys. Revoking

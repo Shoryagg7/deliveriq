@@ -1359,7 +1359,7 @@ use an empty tag — a **Fragment**. [App.jsx:130](../frontend/src/App.jsx#L130)
   <>
     <span className="who">...</span>
     <span className="grow" />
-    <button className="ghost">Sign out</button>
+    <button className="ghost" onClick={signOut}>Sign out</button>
   </>
 ) : (
   <> ... </>
@@ -2089,18 +2089,45 @@ onClick={() => advance(o.id, next)}         // App.jsx:393 — arguments from th
 **call** `addOrder(false)` during render and pass its return value to React. The
 arrow gives React a function to invoke on click instead.
 
-**The inline handler** — [App.jsx:149-155](../frontend/src/App.jsx#L149-L155):
+**The named async handler** — `signOut` in [App.jsx](../frontend/src/App.jsx),
+passed as `onClick={signOut}` with no arrow, because it already *is* a function
+and takes no arguments:
+
 ```jsx
-onClick={() => {
-  setToken(null);
-  onUser(null);
-  say("signed out");
-}}
+async function signOut() {
+  setBusy(true);
+  try {
+    await api.logout();          // POST /auth/logout → jti onto the denylist
+    try {
+      await api.me();            // replay the SAME token — should now fail
+      say("logged out, but the token still works — is Redis up?", "warn");
+    } catch (e) {
+      say(e.status === 401 ? "signed out — token revoked, reuse returned 401" : ..., "ok");
+    }
+  } catch (e) {
+    say(`server logout failed (${e.message}) — clearing locally`, "warn");
+  } finally {
+    setToken(null);              // runs on EVERY path, including failure
+    onUser(null);
+    setBusy(false);
+  }
+}
 ```
-Three statements: clear the token from memory and `localStorage`, clear the
-parent's user state, log it. That is your entire sign-out — no server call,
-because a JWT is stateless and cannot be revoked client-side. **Know that
-implication** (§5.4).
+
+🔴 **Three React points live in this one function**, and they are all askable:
+
+1. **`finally` is the whole safety argument.** Whatever happens to the network
+   call, the local token is cleared. A user who clicks Sign out must end up
+   signed out even if the server is unreachable — so the local clear cannot sit
+   in the `try`.
+2. **Nested try/catch, deliberately.** The inner one expects to fail: a 401 is
+   the *success* signal for the probe. The outer one handles the logout call
+   itself failing. Collapsing them would make "revocation worked" and "the
+   server is down" indistinguishable.
+3. **`onClick={signOut}` vs `onClick={() => signOut()}`.** Both work; the bare
+   reference is right here because there are no arguments to close over. The
+   arrow is only needed when you must pass something in — `() => advance(o.id,
+   next)` a few lines up.
 
 ### `preventDefault` ⚠️ — you do NOT use it
 
@@ -2128,7 +2155,7 @@ That answer proves you understand the concept *and* the gap. Much stronger than
 4  setBusy(true)                       → re-render → all action buttons disabled
 5  await api.dispatch()                → POST /orders/dispatch, Bearer token attached
 6  Backend: require_ops guard          → ops? proceed. otherwise 403
-7  Backend: pick_next_order(db)        → heap + geohash matching
+7  Backend: pick_next_order(db)        → SQL priority claim + geohash matching
 8  Response 200 { dispatched: { order_id, rider_id } }
 9  say(`dispatched order 12 → rider 4`, "ok")   → setLog → green line in Activity
 10 refresh()                           → GET /orders + /riders in parallel
@@ -2907,7 +2934,10 @@ put secrets in a JWT.
                   then LOAD THE USER FROM THE DATABASE
 7  RELOAD         useEffect on mount → getToken() → GET /auth/me → setUser
 8  EXPIRED        /auth/me returns 401 → .catch(() => setToken(null))
-9  LOGOUT         setToken(null) → removeItem → onUser(null). No server call.
+9  LOGOUT         POST /auth/logout → server adds the token's jti to a Redis
+                  denylist (TTL = the token's remaining life)
+10 PROOF          replay the same token at /auth/me → 401
+11 LOCAL          setToken(null) → removeItem → onUser(null), in `finally`
 ```
 
 ### Two details worth raising unprompted 🔴
@@ -2923,12 +2953,27 @@ user = db.query(User).filter(User.email == claims["sub"]).first()
 This means a role change takes effect on the **next request**, not at token
 expiry. That is a genuinely good design point and it's in *your* backend.
 
-**2. Logout is purely client-side.** JWTs are stateless — the server holds no
-session to destroy. Your sign-out deletes the local copy, but if a token had
-already been copied elsewhere, it stays valid until `exp`. **The honest fix** is
-a server-side denylist (Redis, keyed by token id, TTL = remaining lifetime) or
-short-lived access tokens plus refresh tokens. You have neither, and saying so
-is far stronger than pretending logout revokes.
+**2. Logout is a server-side event, and the UI proves it.** This is the classic
+JWT trap: a signature check can never express "this one was logged out", so
+clearing `localStorage` leaves a copied token valid until `exp`. The fix is a
+denylist — every token carries a `jti`, `POST /auth/logout` writes that `jti` to
+Redis with **TTL = the token's remaining lifetime**, and `get_current_user`
+checks it.
+
+Two things to say about it unprompted:
+
+- **It does not undo statelessness.** The denylist is bounded and self-cleaning
+  — an entry outlives the token by zero seconds — so it is not a session store
+  that grows forever. Signature verification is still local; only the "was this
+  revoked" lookup is shared.
+- **The console demonstrates it rather than claiming it.** After logging out it
+  replays the same token against `/auth/me` and reports the 401. Without that
+  step, a real revocation and a purely local clear look *identical* on screen.
+
+The remaining honest gap is that this revokes **one token, not the user** —
+signing out on a phone deliberately leaves the laptop signed in. Revoking every
+session would need a second denylist keyed on `sub` plus an issued-after
+timestamp. Refresh tokens are also still absent.
 
 ### Storage: `localStorage` vs the alternatives 🔴 — near-certain question
 

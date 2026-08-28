@@ -49,8 +49,8 @@ five riders sat AVAILABLE.**
 that would differentiate them — the winner removing that rider from the geohash
 index and bumping their `orders_today` — only lands **after commit**. So all the
 losers pick the same top-ranked rider, fail the claim, and then moved on to the
-**next order** — chasing that same contested rider down the entire heap until
-they ran out. **Losing a rider lost the whole order.**
+**next order** — chasing that same contested rider down the entire pending queue
+until they ran out. **Losing a rider lost the whole order.**
 
 **The fix — retry the rider, keep the order.** On a failed rider claim, add that
 rider to an `exclude` set and re-select the next-best **for the same order**.
@@ -107,10 +107,15 @@ retries when wrong. Here contention is the normal case, so it would thrash.
 | **Cell + 8 neighbours** | Search the order's cell plus the ring around it | Bounds the candidate set to 9 cells instead of scanning the whole fleet. Trade-off: a rider two cells out is not considered |
 | **Fairness band** | Among riders **within 500 m of the closest one**, pick whoever has done fewest orders today | Greedy-nearest lets one rider take everything while others idle. The band trades a little distance for even distribution |
 
-**"Why is it O(n log n), not O(log n)?"** — volunteer this before they find it.
-The `heappop` is O(log n), but every dispatch **rebuilds** the heap from all
-pending orders, and the build dominates. The fix is to push the ordering into
-SQL: `ORDER BY priority LIMIT 1 FOR UPDATE SKIP LOCKED`.
+**"Why was it O(n log n), not O(log n)?"** — volunteer this; the fix is the
+interesting half. `heappop` is O(log n), but every dispatch **rebuilt** the heap
+from all pending orders and the build dominates. Two problems, not one: the cost
+scaled with the backlog, and three API replicas each held their own heap, so no
+two agreed on "the" best order. The ordering moved into SQL — `ORDER BY priority
+LIMIT 1 FOR UPDATE SKIP LOCKED` — which makes Postgres the single arbiter and
+stops at the first lockable row. Then load-testing the *claim* path found the
+scan was still unbounded when no rider was free (1,730 orders walked to answer
+"nobody is available", p99 11s), so it is capped at the top 20 — p99 2.8s.
 
 ## Bullet 3 — Kafka ⭐ (the most-probed one)
 
@@ -1341,8 +1346,13 @@ session store. The payload is base64, not encrypted — so nothing secret goes i
 it and nothing is trusted without verifying the signature. One deliberate
 deviation: I load the user row per request, so a demoted admin loses access
 immediately instead of at token expiry. The signing secret has no default, and
-the app refuses to boot without one. Known gap: no revocation — the fix is a
-`jti` claim plus a Redis denylist.
+the app refuses to boot without one. Revocation is a `jti` per token plus a
+Redis denylist with TTL = the token's remaining life — bounded and
+self-cleaning, so statelessness survives. That check **fails closed**, the
+opposite of the rate limiter: the limiter protects capacity, so unthrottled
+traffic beats an outage, while revocation guards a *stolen* token and failing
+open would reopen the hole exactly when things are degraded. Still open: no
+refresh tokens, and it revokes one token rather than every session for a user.
 
 **Kafka.** A log, not a queue: consumption doesn't delete, so three groups read
 the same event with independent offsets and a new consumer backfills history.

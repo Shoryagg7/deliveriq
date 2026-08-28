@@ -54,6 +54,10 @@ export const api = {
   login: (email, password) =>
     request("/auth/login", { method: "POST", body: { email, password } }),
   me: () => request("/auth/me"),
+  // Signing out is a server-side event, not just a cleared localStorage key.
+  // Dropping the token locally leaves it valid for the rest of its hour; this
+  // adds the jti to the Redis denylist so a copied token dies with the session.
+  logout: () => request("/auth/logout", { method: "POST" }),
 
   listOrders: () => request("/orders"),
   createOrder: (body, idempotencyKey) =>

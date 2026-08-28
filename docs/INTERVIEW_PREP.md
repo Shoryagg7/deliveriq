@@ -646,10 +646,12 @@ staleness, bounded by TTL, and stampede, bounded by recompute locks or jitter."
 shouldn't wait behind a just-arrived ₹150 one. You always want the
 highest-priority pending order next. That's a heap.
 
-**The mechanics.** `std::priority_queue` is a max-heap; Python's `heapq` is a
-**min-heap with no max flag**, so you push the **negated** key. Push tuples
-`(-priority, id)`; tuples compare element-by-element. `heapq` operates on a
-plain list — it isn't a class you instantiate.
+**The mechanics, as a heap.** `std::priority_queue` is a max-heap; Python's
+`heapq` is a **min-heap with no max flag**, so you push the **negated** key.
+Push tuples `(-priority, id)`; tuples compare element-by-element. `heapq`
+operates on a plain list — it isn't a class you instantiate. Know this cold: it
+is the answer to "how would you build a priority queue," and it is what this
+project shipped first.
 
 **Priority is a design decision, not a given.** Two factors compete: order
 **value** (revenue) and **wait time** (don't starve cheap orders). Value-only
@@ -662,26 +664,62 @@ priority = order.value + wait_minutes * AGING_WEIGHT   # AGING_WEIGHT = 10
 The longer an order waits, the higher it climbs until it outranks fresh
 expensive ones.
 
-**Soundbite:** "Dispatch pops the highest-priority pending order from a max-heap
-— negated keys, because Python's heapq is a min-heap. Priority is value plus a
-wait-time aging term: without aging, a cheap order starves behind a stream of
-expensive ones, which is the classic scheduling-starvation problem, and aging is
-the OS technique for exactly it."
+**Why the heap is gone — this is the better story (see §9.5).** The in-process
+heap reloaded *every* pending order and rebuilt itself on each call: **O(n log n)
+per dispatch**, not O(log n), where the rebuild dominates the pop and `n` grows
+with the backlog. For a single pop a plain `max()` would do identical work — a
+heap only earns its keep when you pop many in sequence or keep it warm across
+calls, and a per-request heap is neither.
 
-**Gotcha — volunteer this, it's a strength (see §9.5):** the current
-implementation reloads *all* pending orders and rebuilds the heap on every call,
-so it is **O(n log n) per dispatch**, not O(log n). For a single pop, a plain
-`max()` would do equal work. The heap earns its keep when you pop many in
-sequence or keep it warm across calls. The fix is a persistent/indexed priority
-queue updated incrementally.
+Worse, it could not be shared. Three API replicas meant three heaps, each
+confident it had picked "the" best order, with nothing but the row lock to sort
+out the collision afterwards.
+
+The ordering now lives in the database:
+
+```python
+_PRIORITY = Order.value + (
+    func.extract("epoch", func.timezone("UTC", func.now()) - Order.created_at)
+    / 60.0
+) * AGING_WEIGHT
+
+q.order_by(_PRIORITY.desc()).limit(1).with_for_update(skip_locked=True).first()
+```
+
+`ORDER BY … LIMIT 1` lets Postgres stop at the first row it can lock, so the
+work stops scaling with how far behind you are, and `SKIP LOCKED` makes a row
+another replica holds *invisible* rather than blocking. One arbiter, no
+per-replica copies.
+
+**The timezone trap in that snippet, worth volunteering:** `created_at` is
+stored naive-UTC, so it must be compared against `timezone('UTC', now())`.
+Subtracting a tz-aware `now()` from a naive column is a silent one-hour priority
+skew — no error, just subtly wrong ordering.
+
+**And a bound on top.** Load-testing the *claim* path (§9.5) showed that with a
+big backlog and no free riders, a call still walked the whole pending set to
+answer "nobody is available" — 1,730 orders scanned, p99 **11s**, holding locks
+throughout. `MAX_ORDERS_SCANNED = 20` caps it: if the top 20 by priority have no
+claimable rider, that is a **supply** problem and scanning further cannot
+conjure one. p99 fell to 2.8s. The cost is a rare false 409 when the only free
+rider sits far down the queue — cheap, because the caller just dispatches again.
+
+**Soundbite:** "Dispatch takes the highest-priority pending order — value plus a
+wait-time aging term, so a cheap order can't starve behind a stream of expensive
+ones; that's the classic scheduling-starvation problem and aging is the OS
+technique for it. I built it as a heap first, then moved the ordering into
+`ORDER BY … LIMIT 1 FOR UPDATE SKIP LOCKED`, because a per-request heap is
+O(n log n) and three replicas can't share one. Then load-testing the claim path
+showed an unbounded scan on the no-riders case, so it's capped at the top 20."
 
 **The distributed alternative I know but didn't use:** move the queue into a
 Redis sorted set — `ZADD` on create, `ZREVRANGE` to peek, `ZREM` to claim, where
 `ZREM` returning 1-or-0 is an atomic concurrent-claim guard. I went with
 Postgres row locks instead (§5.3) because they keep the aging and fairness logic
 in one place and give me the same guarantee with the database as the single
-arbiter. The sorted set also *hides* the DSA inside Redis; the heap demonstrates
-it.
+arbiter — the same reason the heap moved into SQL rather than into Redis. It is
+also the honest trade: the sorted set would be faster, but it puts the ordering
+somewhere the claim transaction cannot see.
 
 ## 4.2 Geohash matching — two filters, in order
 

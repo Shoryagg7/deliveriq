@@ -124,6 +124,34 @@ function Auth({ user, onUser, say }) {
     }
   }
 
+  // Sign-out revokes the token server-side, then proves it: the same token is
+  // replayed against /auth/me and should come back 401. Clearing localStorage
+  // alone would look identical in the UI while leaving a live token in the wild
+  // — this makes the difference visible instead of asserted.
+  async function signOut() {
+    setBusy(true);
+    try {
+      await api.logout();
+      try {
+        await api.me();
+        say("logged out, but the token still works — is Redis up?", "warn");
+      } catch (e) {
+        say(
+          e.status === 401
+            ? "signed out — token revoked, reuse returned 401"
+            : `signed out (revocation check: ${e.message})`,
+          "ok",
+        );
+      }
+    } catch (e) {
+      say(`server logout failed (${e.message}) — clearing locally`, "warn");
+    } finally {
+      setToken(null);
+      onUser(null);
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="auth-bar">
       {user ? (
@@ -145,14 +173,7 @@ function Auth({ user, onUser, say }) {
               {d.label}
             </button>
           ))}
-          <button
-            className="ghost"
-            onClick={() => {
-              setToken(null);
-              onUser(null);
-              say("signed out");
-            }}
-          >
+          <button className="ghost" disabled={busy} onClick={signOut}>
             Sign out
           </button>
         </>

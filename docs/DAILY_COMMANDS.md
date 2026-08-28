@@ -774,16 +774,21 @@ docker compose exec api python -m scripts.seed_demo
 1. **http://localhost:8000** — sign in as **ops**. Show the board: pending vs
    assigned orders, riders idle vs busy.
 2. **Dispatch next** — an order flips to ASSIGNED and a rider to BUSY. That is
-   the heap + geohash + fairness band running.
-3. Sign out, sign in as **customer** — the same list now shows **only their own
-   orders**. That is role-scoped reads, not a UI filter.
-4. Sign in as **rider** — advance their own order; try to cancel it and get a
+   the SQL priority claim + geohash + fairness band running.
+3. **Sign out** — the activity log says *"token revoked, reuse returned 401"*.
+   The console calls `POST /auth/logout`, then deliberately replays the same
+   token against `/auth/me` to prove the denylist took effect. Clearing
+   `localStorage` alone would look identical here and leave a live token in the
+   wild — this is that difference, on screen.
+4. Sign in as **customer** — the same list now shows **only their own orders**.
+   That is role-scoped reads, not a UI filter.
+5. Sign in as **rider** — advance their own order; try to cancel it and get a
    **403**. Legal move, wrong actor.
-5. **http://localhost:8080** (Kafka UI) — `order.dispatched`, 3 partitions, and
+6. **http://localhost:8080** (Kafka UI) — `order.dispatched`, 3 partitions, and
    **three consumer groups each with their own offsets** on the same topic.
-6. **http://localhost:3000** (Grafana) — dispatch outcomes, latency, dependency
+7. **http://localhost:3000** (Grafana) — dispatch outcomes, latency, dependency
    health.
-7. Back in a terminal: `./scripts/verify.sh` — the security boundaries, live,
+8. Back in a terminal: `./scripts/verify.sh` — the security boundaries, live,
    including a token forged with the old shipped secret being rejected.
 
 ### 9.7 "It was working yesterday" — the four usual causes
@@ -796,5 +801,37 @@ docker compose exec api python -m scripts.seed_demo
 | Signed in as `rider`, board empty | `seed_demo` reported `holds 0 order(s)` | Re-run `seed_demo`; check the confirmation line |
 | Stack won't even parse | `JWT_SECRET` unset in `.env` | Generate one — see §1 |
 | Dispatch says no rider available | Redis flushed; riders exist in Postgres but not in the geohash index | `python -m scripts.reindex_riders` |
+| Console at `:8000` looks out of date | Host `uvicorn` serves `frontend/dist/`, which is only rebuilt by hand | `cd frontend && npm run build` — or use the Vite dev server, §9.8 |
+
+### 9.8 The console itself
+
+The React console is not a separate deployment. FastAPI mounts the built bundle
+at `/`, so there is **one origin and therefore no CORS configuration anywhere** —
+that was the reason for serving it this way rather than hosting it apart.
+
+```bash
+# Live-reloading UI against the running API (proxied to :8000 by vite.config.js)
+cd frontend && npm run dev          # → http://localhost:5173
+
+# What Docker actually ships: built in its own image stage, never committed
+cd frontend && npm run build        # → frontend/dist/, served at :8000
+npm run lint                        # oxlint
+```
+
+`frontend/dist/` is **gitignored and built inside the Dockerfile**, so the
+container is always current. Only the *host* `uvicorn` path can go stale — it
+serves whatever `dist/` you last built by hand. If the console at `:8000` is
+missing something you know you wrote, that is why; `npm run build` fixes it, and
+`npm run dev` sidesteps it entirely.
+
+What the console demonstrates that curl cannot show as quickly:
+
+| Control | Proves |
+|---|---|
+| **+ Order** with fixed `Idempotency-Key` (click twice) | The second click is a **replay** — no duplicate row, and the badge says so |
+| **+ Rider** / **Dispatch next** greyed for non-ops | RBAC — disabled *with a reason* rather than hidden, so the permission model is visible |
+| **act as** chips | Same board, three roles: the customer sees only their own orders |
+| **Sign out** | Token revocation, verified live — see §9.6 step 3 |
+| Health pills (top right) | `/ready` per-dependency, polled every 5s |
 
 ---

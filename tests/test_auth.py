@@ -153,3 +153,49 @@ def test_rider_onboarding_is_ops_only(client):
     assert client.post(
         "/riders", json=body, headers={"Authorization": f"Bearer {_token(client)}"}
     ).status_code == 403
+
+
+def test_logout_revokes_only_the_token_it_was_called_with(client):
+    """The half of stateless auth a signature check cannot express.
+
+    A JWT is valid until it expires, so "signed out" has to mean something
+    server-side or it means nothing — clearing the client's copy leaves a live
+    token in the wild for the rest of its hour. Logout adds the token's `jti` to
+    the denylist, and every authenticated route consults it.
+
+    The second half of the name is the point of a PER-TOKEN jti: signing out on
+    a phone must not sign you out on a laptop. Revoking the user instead would
+    need a second denylist keyed on `sub` plus an issued-after timestamp.
+    """
+    _register(client)
+    phone = _token(client)
+    laptop = _token(client)
+    assert phone != laptop, "each login must mint a distinct jti"
+
+    def auth(token):
+        return {"Authorization": f"Bearer {token}"}
+
+    assert client.get("/auth/me", headers=auth(phone)).status_code == 200
+    assert client.post("/auth/logout", headers=auth(phone)).status_code == 204
+
+    assert client.get("/auth/me", headers=auth(phone)).status_code == 401
+    assert client.get("/auth/me", headers=auth(laptop)).status_code == 200
+
+
+def test_logout_twice_is_401_not_204(client):
+    """Not idempotent, and deliberately so.
+
+    `get_current_user` rejects a revoked token before the handler runs, so the
+    replay is 401 exactly like every other authenticated route. Clients should
+    read 204 and 401 alike here — both mean "this token is done".
+    """
+    _register(client)
+    token = _token(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    assert client.post("/auth/logout", headers=headers).status_code == 204
+    assert client.post("/auth/logout", headers=headers).status_code == 401
+
+
+def test_logout_requires_a_token(client):
+    """Otherwise it is an unauthenticated write against the denylist."""
+    assert client.post("/auth/logout").status_code == 401
