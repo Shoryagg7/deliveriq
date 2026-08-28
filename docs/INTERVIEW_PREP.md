@@ -72,7 +72,7 @@ and I can defend each one's trade-off rather than just list it."
 
 ---
 
-# The five decisions worth defending
+# The six decisions worth defending
 
 ## 1. Dispatch under concurrency ⭐ — the strongest story
 
@@ -225,31 +225,194 @@ and the work no longer scales with how far behind you are.
 is stored naive-UTC, and subtracting a tz-aware value from a naive column is a
 silent one-hour priority skew — no error, just wrong ordering.
 
-## 5. Events — the dual write, and the outbox
+## 5. Redis — the state three replicas have to share ⭐
 
-**The hole.** Dispatch committed the order, then published to Kafka. Two systems,
-no shared transaction: a crash in the gap leaves the order assigned and the
-event **gone forever**. Post-commit publishing doesn't fix it, it just shrinks
-the window.
+**Start with the problem, because it's the whole reason Redis is here.** The API
+is stateless and there are three copies of it. Anything one replica remembers in
+a Python variable, the other two cannot see — and it dies on restart. So any
+state that is *shared*, *fast-changing*, and *not worth a database write* has to
+live somewhere all three can reach. That is Redis: an in-memory key-value store,
+single-threaded, sub-millisecond.
 
-**The fix.** The event is a **row in an `outbox` table, written inside the same
-transaction** as the order and the rider. One commit, three facts, atomic. A
-relay polls for unpublished rows, publishes them, marks them done.
+**"Why not just a dictionary in the process?"** — because with three replicas
+you'd have three dictionaries, each wrong. A rate limit of 100/min becomes 300.
+**"Why not Postgres?"** — these are writes on every single request; you don't
+want disk I/O and row locks for a counter you'll throw away in a minute.
 
-**The ordering inside the relay is the design**, and it mirrors the consumer's
-commit placement exactly: `publish → wait for the broker's ack → then mark
-published`. Marking first loses the event on a crash in the gap — the same hole,
-moved down a layer. Publishing first means a crash before the mark **republishes**
-it: at-least-once, which consumers already dedupe on `(partition, offset)`.
+Four jobs here, each using a different Redis data structure. Being able to say
+*which structure and why* is what separates "I used Redis" from knowing it.
 
-**The honest trade:** the event is no longer lost, but it is no longer instant.
-It's delayed by the relay's poll interval. **You buy durability with latency.**
+### a) The rate limiter — a token bucket in Lua ⭐
 
-Downstream: three consumer groups read the same topic with independent offsets
-(a log, not a queue — consumption doesn't delete). Commit *after* processing
-makes it at-least-once. Poison messages go to a DLQ, and the offset is only
-committed once that DLQ publish is acked — otherwise you advance past a message
-no copy of which exists anywhere.
+**The algorithm.** A bucket holds tokens up to a capacity. Tokens refill at a
+steady rate. Each request takes one; empty bucket → **429 Too Many Requests**.
+Because the bucket can be *full*, it absorbs a **burst** — which fixed-window
+counters cannot, and which is what you actually want.
+
+**The bug that makes this interesting.** Read the count, add a token, write it
+back — that's a **read-modify-write**, and three replicas doing it at once
+interleave: two read `5`, both write `6`, and one request vanished. Wrapping it
+in application code doesn't help, because the gap is *between* the Redis calls.
+
+**The fix — do it inside Redis.** The whole check is a **Lua script**, and Redis
+executes Lua **atomically**: it is single-threaded, so while the script runs
+nothing else touches those keys. Read, refill, decide, write — one indivisible
+step. The script is registered once and called by its SHA hash, so the source
+isn't resent on every request.
+
+**And what you key on is a security decision, not a detail.** It was
+`X-API-Key or IP` — a header **the caller controls**, so anyone rate-limited
+could send a new value and get a fresh bucket. It's now the **verified token
+subject**, which a caller cannot forge without the signing key. *I shipped that
+bug; finding it is a better story than never having had it.*
+
+**Fails open.** If Redis is unreachable the request is allowed through. Losing
+rate limiting is bad; refusing all traffic because the *limiter* is sick is
+worse. Compare this deliberately with revocation, which fails **closed** — see
+the audit.
+
+### b) The rider index — a set per geohash cell
+
+`geohash:{cell}` is a Redis **set** of rider ids. Finding candidates is
+`SMEMBERS` on nine cells — the home cell and its eight neighbours — issued in one
+**pipeline** (one network round trip carrying nine commands, rather than nine
+round trips). Assigning a rider `SREM`s them out of the index; going available
+`SADD`s them back.
+
+**Why a set:** membership and removal are O(1), and there are no duplicates by
+construction.
+
+### c) The fairness counter — an integer with an expiry
+
+`rider:{id}:orders:{today}` is an `INCR` with an `EXPIRE`. It answers "how many
+orders has this rider had today", which the fairness band sorts on. The TTL is
+the point: the key **deletes itself** at day roll-over, so there is no cleanup
+job and no unbounded growth.
+
+### d) Idempotency and revocation — `SET` with flags
+
+Both use plain strings, and both lean on `SET`'s options doing the work:
+
+- **Idempotency:** `SET key value NX EX 60`. `NX` = "only if it doesn't exist",
+  and it is the *claim*: whoever's `SET` succeeds owns the request; the loser
+  knows it's a duplicate. Atomic, so two simultaneous retries cannot both win.
+- **Revocation:** `SET revoked_jti:{id} 1 EX <seconds left>`.
+
+**The general lesson:** Postgres is the source of truth; Redis holds derived,
+expiring state. Every Redis write here happens **after** the database commit, so
+a rolled-back dispatch never leaves a bumped counter or a stale index entry.
+
+## 6. Events — the dual write, and the transactional outbox ⭐
+
+This is the newest and least intuitive part, so here it is from the beginning.
+
+### Why publish events at all
+
+When an order is dispatched, other things need to know: analytics wants to
+count it, an audit log wants to record it, a notifier wants to text the
+customer. Calling all three from the dispatch handler is **coupling** — dispatch
+now fails when the notifier is down, and gets slower every time someone adds a
+feature.
+
+Instead dispatch **announces what happened** — "order 12 went to rider 4" — and
+whoever cares subscribes. Dispatch doesn't know who is listening. Adding a
+fourth consumer requires no change to dispatch at all.
+
+### The dual-write problem — the bug this is all about
+
+Dispatch has to do **two writes to two different systems**: save the assignment
+to Postgres, and publish the event to Kafka.
+
+```
+db.commit()            ← Postgres now says: order 12 → rider 4
+                       ← ✗ CRASH HERE
+publish(event)         ← never runs
+```
+
+Postgres and Kafka know nothing about each other. There is **no transaction
+spanning both**, so there is a window where one succeeded and the other didn't.
+Crash in that window and the order is assigned forever with **no event** — the
+analytics count is silently short, the audit log has a hole. Nothing errors.
+Nobody notices.
+
+**That's the dual-write problem: two systems, two writes, no shared
+transaction.** Swapping the order doesn't fix it (publish first and a crash
+gives you an event for an assignment that never happened — arguably worse). It
+just moves the window.
+
+### The transactional outbox — the fix
+
+The trick is to stop writing to two systems.
+
+**"Outbox" as in an outbox tray:** you don't hand the letter to the postman
+yourself, you put it in the tray. Someone else collects it. The tray is *in your
+office* — so putting a letter in it is part of what you're already doing.
+
+Concretely: instead of publishing to Kafka, dispatch **inserts a row into an
+`outbox` table in Postgres** — the same database, inside the **same
+transaction** as the order and the rider.
+
+```
+BEGIN
+  order.status  = ASSIGNED      ┐
+  rider.status  = BUSY          ├─ one transaction, one commit
+  INSERT INTO outbox (event)    ┘
+COMMIT
+```
+
+Now it's **one write to one system**. The commit is atomic: either all three
+facts land or none do. The dual-write window is *gone*, because there is no
+second system to fall out of sync with.
+
+### The relay — who actually sends it
+
+A separate background process (`app/workers/outbox_relay.py`) polls the outbox
+table: *"any rows not yet published?"* For each one it publishes to Kafka and
+then marks the row as published.
+
+**The order of those two steps is the entire design, and it's the natural
+follow-up question:**
+
+- **Mark published, then publish** → crash in between and the row says "sent"
+  when it never was. **The event is lost.** That's the original hole, moved one
+  layer down.
+- **Publish, wait for the broker's acknowledgement, then mark** → crash in
+  between and the row still says unpublished, so the relay **sends it again**.
+  A duplicate, not a loss.
+
+We choose duplicates, because a duplicate is *fixable* and a loss is not. The
+consumers already discard repeats by remembering `(partition, offset)` — the
+message's unique address in Kafka. **Delivery is at-least-once; the effect is
+exactly-once.**
+
+Several relays can run safely: they claim rows with the same
+`FOR UPDATE SKIP LOCKED` protocol dispatch uses on orders.
+
+**The honest trade — say this unprompted.** The event is no longer lost, but it
+is no longer instant: it waits for the relay's next poll. **You buy durability
+with latency.** That is the whole bargain, and pretending it's free is how you
+get caught.
+
+### What Kafka does with it downstream
+
+**Kafka is a log, not a queue** — the one sentence that reframes everything.
+Reading a message does **not** remove it. Each consumer group keeps its own
+bookmark (an **offset**) into the same log, so three groups — analytics, audit,
+notifications — all read the same events independently, and a new consumer added
+tomorrow can start from the beginning and replay history. A queue (RabbitMQ)
+deletes on consumption, so the first reader takes the message and the others
+never see it.
+
+Two more things worth knowing, because they get asked:
+
+- **At-least-once comes from where you commit the offset.** Commit *after*
+  processing → a crash re-delivers the message. Commit *before* → a crash skips
+  it, losing data. It's a placement, not a setting.
+- **The poison pill.** A message that always fails to process blocks the
+  partition forever, because the offset can never advance. The fix is a
+  **dead-letter queue**: after N failures, publish it to a side topic, then
+  commit past it — and only commit once that DLQ publish is acknowledged, or
+  you've advanced past a message no copy of which exists anywhere.
 
 ---
 
@@ -288,21 +451,68 @@ the control.**
 
 ### Durability theatre → real replication
 
-One broker, RF=1, `acks=all`. "All" was one replica — theatre. Now **three
-brokers, RF=3, `min.insync.replicas=2`**, including the internal
-`__consumer_offsets` topic (a group whose offsets live on one broker loses its
-place when that broker dies).
+**The three terms, first, because the fix is meaningless without them.**
 
-**Why 2 and not 3:** `min.insync=3` refuses writes the moment any broker blinks;
-`min.insync=1` silently accepts a write only one replica has — theatre again.
-RF=3 with min.insync=2 survives one broker down and still accepts writes. **The
-producer config was always right; the topology was the gap.**
+- **Replication factor (RF)** — how many brokers hold a copy of each partition.
+  RF=1 means one copy: that machine dies, the data is gone.
+- **ISR — in-sync replicas** — the copies that are currently caught up with the
+  leader. A replica that falls behind drops out of the ISR and rejoins when it
+  catches up.
+- **`acks=all`** — the producer waits until "all" in-sync replicas have the
+  write before calling it successful.
 
-### Token revocation
+**The gap.** I had `acks=all` set and felt safe. But I was running **one broker
+with RF=1** — so "all replicas" was *one replica*. The setting was doing
+nothing. **Durability theatre:** the config said safe, the topology said single
+point of failure.
 
-Every token now carries a **`jti`**, and `POST /auth/logout` puts it on a Redis
-denylist with TTL = the token's remaining life — bounded and self-cleaning, so
-it isn't a session store by the back door.
+**Now:** three brokers, **RF=3**, and `min.insync.replicas=2` — a floor that
+says *refuse the write unless at least 2 replicas are in sync*. Verified on the
+running cluster, where `Isr: 2,3,1` means all three are caught up:
+
+```
+Topic: order.dispatched  PartitionCount: 3  ReplicationFactor: 3
+    Partition: 0  Leader: 2  Replicas: 2,3,1  Isr: 2,3,1
+```
+
+**Why 2 and not 3 — the good follow-up.** It's a availability/durability dial:
+
+| min.insync | Behaviour |
+|---|---|
+| 1 | accepts a write only *one* replica has — the theatre again |
+| 2 | survives one broker down and **keeps accepting writes** ✅ |
+| 3 | refuses every write the moment any broker blinks — a single restart takes you down |
+
+This also had to be applied to Kafka's own internal `__consumer_offsets` topic.
+That's where consumer groups store their bookmarks — if those live on one broker
+and it dies, every group forgets its place and re-reads or skips.
+
+**The lesson worth stating:** the producer config was right the whole time; the
+**topology** was the gap. A durability setting is a claim about your
+infrastructure, not a property of the setting.
+
+### Token revocation — the half of JWT that signatures can't do
+
+**The problem, plainly.** A JWT is *self-contained*: the server checks the
+signature and the expiry and that's it — no lookup, which is exactly why it
+scales to three replicas with no shared session store. But it means there is
+**no way to express "this particular token was logged out."** Sign out, and the
+token in someone's clipboard stays valid for the rest of its hour. My sign-out
+deleted the browser's copy and called it done.
+
+**The fix — three pieces:**
+
+1. **`jti`** ("JWT ID") — a random unique id baked into every token when it's
+   minted. Tokens previously had no identity, so there was nothing to point at.
+2. **A denylist.** `POST /auth/logout` writes that `jti` to Redis. Every
+   authenticated request now checks: *is this token's id on the list?*
+3. **A TTL equal to the token's remaining life.** Once the token would have
+   expired anyway, the entry deletes itself.
+
+**"Doesn't that undo statelessness?"** — the obvious challenge, and the answer
+is no. The list only holds tokens that were *explicitly revoked* and *haven't
+expired yet* — bounded and self-cleaning, not a session store that grows
+forever. Signature verification is still local; only this one lookup is shared.
 
 **The interesting part is the failure direction.** `is_revoked` **fails CLOSED**:
 if Redis is unreachable, the token is rejected. That's the exact opposite of the
@@ -338,6 +548,12 @@ row locks the whole way. Dispatch p99: **11 seconds**.
 claimable rider, that's a **supply** problem and scanning further cannot conjure
 one. The cost is a rare false 409 when the only free rider is far down the
 queue — cheap, because the caller just dispatches again.
+
+**Reading the table.** `p99 = 11000 ms` means *99% of requests finished faster
+than 11 seconds — and 1% were worse*. Percentiles, not averages, because an
+average hides exactly the requests users complain about: if 1 in 100 dispatches
+takes 11 seconds, every operator hits it several times an hour, and the mean
+still looks fine.
 
 *50 users, 60 s, limiter off, 3 replicas, same machine:*
 
@@ -392,6 +608,42 @@ per-city-tuned; `orders_today` resets at **UTC** midnight rather than the
 business timezone; there's no rider-penalty tracking (order state and rider
 penalties are deliberately independent state spaces); and there's no circuit
 breaker — timeouts plus a bounded retry cover the failures this system has.
+
+---
+
+# Glossary — the terms on this page
+
+If an interviewer picks one of these off my resume, this is the one-line answer.
+
+| Term | What it means |
+|---|---|
+| **Dual-write problem** | Writing to two systems (Postgres *and* Kafka) with no shared transaction, so a crash between them leaves them disagreeing forever |
+| **Transactional outbox** | Instead of writing to both, write the event as a **row in the same database, in the same transaction**. One commit, nothing to fall out of sync. A relay sends it afterwards |
+| **Relay** | The background process that reads unpublished outbox rows, publishes them to Kafka, then marks them sent — **in that order**, so a crash duplicates rather than loses |
+| **At-least-once** | Delivery guarantee: a message arrives, possibly more than once. Comes from committing your position *after* processing, not before |
+| **Idempotent consumption** | Handling a repeat safely by remembering what you've already processed — here, the message's `(partition, offset)` |
+| **Partition** | A shard of a Kafka topic. Ordering is guaranteed *within* one, so the key you pick (here `order_id`) decides what stays ordered |
+| **Offset** | A consumer group's bookmark into a partition — the position it has read to |
+| **Consumer group** | A named set of consumers sharing one bookmark. Same group = split the work; different groups = everyone gets everything |
+| **DLQ (dead-letter queue)** | A side topic for messages that keep failing, so one bad message can't block the partition forever |
+| **Replication factor** | How many brokers hold a copy of each partition. RF=3 = survives losing one |
+| **ISR (in-sync replicas)** | The copies currently caught up with the leader |
+| **`min.insync.replicas`** | The floor: refuse a write unless this many replicas are in sync. 2 of 3 = survive one failure and keep writing |
+| **`acks=all`** | The producer waits for all in-sync replicas before calling a write successful — **only as strong as your replication factor** |
+| **`FOR UPDATE`** | Lock these rows until my transaction ends, so nobody else can change them |
+| **`SKIP LOCKED`** | Rows someone else has locked are *invisible* to me instead of something I wait behind — a contested claim becomes "take a different row" |
+| **Two-phase claim** | Lock **every** row you need before mutating **any** of them, so an abandoned attempt leaves nothing half-written |
+| **Liveness vs correctness** | Correct = nothing bad happens (no double-dispatch). Live = something good eventually does (orders actually get assigned). You can have one without the other, and must measure both |
+| **Token bucket** | Rate-limit algorithm: tokens refill at a fixed rate, each request spends one, empty = 429. Absorbs bursts because the bucket can be full |
+| **Atomic (Lua)** | Redis runs a Lua script with nothing else touching those keys, which closes the read-modify-write race three replicas would otherwise have |
+| **Fail open / fail closed** | What a dependency's outage does: fail open = allow (the rate limiter), fail closed = deny (revocation). Opposite choices, each defensible for its own reason |
+| **`jti`** | A unique id inside each JWT, so a specific token can be pointed at — and revoked |
+| **Denylist** | The set of revoked `jti`s, each expiring when its token would have anyway |
+| **`ON DELETE RESTRICT`** | The database refuses to delete a customer who still has orders — loudly, instead of silently destroying history |
+| **Geohash** | Encoding (lat, lon) into a string where nearby points share a prefix, so "who is nearby" becomes a key lookup rather than a scan of every rider |
+| **Haversine** | Great-circle distance between two lat/lon points — correct on a sphere, unlike Euclidean |
+| **Aging** | Adding waiting time to a priority score so low-value items can't starve behind an endless stream of better ones |
+| **p50 / p95 / p99** | Latency percentiles. p99 = the slowest 1%. Averages hide precisely the requests people complain about |
 
 ---
 

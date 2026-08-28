@@ -19,9 +19,103 @@
 
 **The drill: an interviewer picks one word off your resume and asks "what does
 that mean?"** Every term below is on the page, so every term is fair game. One
-line each — the depth is in Parts 2 and 3.
+line each — the depth is in Parts 2 onward.
 
-## Bullet 1 — concurrency
+**The bullets are ordered on purpose.** Algorithms, Redis and Kafka come first
+because those are the conversations worth having — they're where the depth is,
+and an interviewer reading top-down will pick from there.
+
+## Bullet 1 — the algorithms ⭐ (lead with this)
+
+> *Built the dispatch core: aging-weighted priority scheduling that makes
+> starvation impossible, geohash prefix indexing for O(1) candidate lookup with
+> haversine ranking, and a fairness band that spreads work across idle riders;
+> load-testing the claim path exposed an unbounded scan, and bounding it cut
+> dispatch p99 from 11 s to 2.8 s*
+
+| Term | What it means | How we handle it |
+|---|---|---|
+| **Priority scheduler** | Serve the most important order first, not the oldest | `ORDER BY value + minutes_waited * weight DESC LIMIT 1` — the ordering lives in Postgres, so all 3 replicas agree. Built as a heap first; see below |
+| **Starvation** | A low-priority item that **never** gets served because better ones keep arriving | Real risk: a cheap order behind an endless stream of expensive ones |
+| **Aging** | Priority **grows with waiting time** | `score = value + minutes_waited × weight`. A cheap order that has waited long enough eventually outranks a fresh expensive one — starvation becomes impossible |
+| **Geohash** | Encodes lat/lon into a short string; nearby points share a prefix | Precision 6 ≈ 1.2 km × 0.61 km cells. Riders are indexed into their cell in Redis |
+| **Cell + 8 neighbours** | Search the order's cell plus the ring around it | Bounds the candidate set to 9 cells instead of scanning the whole fleet. Trade-off: a rider two cells out is not considered |
+| **Fairness band** | Among riders **within 500 m of the closest one**, pick whoever has done fewest orders today | Greedy-nearest lets one rider take everything while others idle. The band trades a little distance for even distribution |
+
+**"Why was it O(n log n), not O(log n)?"** — volunteer this; the fix is the
+interesting half. `heappop` is O(log n), but every dispatch **rebuilt** the heap
+from all pending orders and the build dominates. Two problems, not one: the cost
+scaled with the backlog, and three API replicas each held their own heap, so no
+two agreed on "the" best order. The ordering moved into SQL — `ORDER BY priority
+LIMIT 1 FOR UPDATE SKIP LOCKED` — which makes Postgres the single arbiter and
+stops at the first lockable row. Then load-testing the *claim* path found the
+scan was still unbounded when no rider was free (1,730 orders walked to answer
+"nobody is available", p99 11s), so it is capped at the top 20 — p99 2.8s.
+
+## Bullet 2 — Redis ⭐
+
+> *Used Redis as the shared state layer for 3 stateless replicas: an atomic Lua
+> token-bucket rate limiter keyed to verified token identity, a geohash set
+> index queried by pipelined 9-cell fan-out, self-expiring fairness counters,
+> and `SET NX`-claimed idempotency plus a `jti` revocation denylist*
+
+**Open with the problem, not the tool.** Three replicas, no shared memory.
+Anything one remembers in a variable, the other two can't see — so a rate limit
+of 100/min silently becomes 300. Redis is the one place all three can reach in
+under a millisecond.
+
+| Term | What it means | Why here |
+|---|---|---|
+| **Token bucket** | Tokens refill at a fixed rate; each request spends one; empty → **429** | Absorbs a **burst**, because the bucket can be full — a fixed-window counter can't |
+| **Atomic / Lua** | Redis runs the script single-threaded with nothing else touching those keys | The check is a **read-modify-write**; without atomicity two replicas both read `5` and both write `6`, and a request vanishes. The gap is *between* the calls, so application-level locking can't close it |
+| **Keyed to verified identity** | The limiter counts per authenticated subject | It was `X-API-Key or IP` — **a header the caller controls**, so rotating it minted a fresh bucket. A real bug I shipped |
+| **Set index** | `geohash:{cell}` → a Redis **set** of rider ids | O(1) add/remove, no duplicates by construction. `SREM` on assign, `SADD` on release |
+| **Pipelined fan-out** | Nine `SMEMBERS` (home cell + 8 neighbours) sent in **one** round trip | Nine sequential calls would be nine network waits; the work is trivial, the latency isn't |
+| **Self-expiring counter** | `rider:{id}:orders:{today}` = `INCR` + `EXPIRE` | The fairness sort key. The TTL means the key **deletes itself** at day roll-over — no cleanup job, no unbounded growth |
+| **`SET NX`** | "Set only if absent" — atomic | It's the idempotency **claim**: whoever's `SET` wins owns the request, the loser knows it's a retry. Two simultaneous retries can't both win |
+| **Denylist** | Revoked `jti`s, each with TTL = the token's remaining life | Bounded and self-cleaning, so revocation doesn't smuggle a session store back in |
+
+**"What happens when Redis goes down?"** — the question that separates people who
+configured Redis from people who thought about it. **Two opposite answers here,
+deliberately:**
+
+- The **rate limiter fails open** — requests are allowed. Losing rate limiting
+  is bad; refusing all traffic because the *limiter* is sick is worse.
+- **Revocation fails closed** — the token is rejected. It exists to stop a
+  *stolen* token, and failing open would reopen that hole exactly when the
+  system is already degraded.
+
+**Being able to argue both directions is the whole point.** The rule: fail open
+when the check protects *capacity*, fail closed when it protects *access*.
+
+**"Why not just a dictionary?"** Three replicas → three dictionaries, each
+wrong, all lost on restart. **"Why not Postgres?"** These are writes on every
+request; you don't want disk I/O and row locks for a counter you'll discard in a
+minute. **"Why not Memcached?"** No sets, no sorted sets, no Lua.
+
+## Bullet 3 — Kafka ⭐ (the most-probed one)
+
+> *Closed a dual-write hole with a transactional outbox — the event commits with
+> the order, a relay publishes then marks — and streamed to 3 Kafka consumer
+> groups over RF=3/`min.insync=2` with manual offset commits for at-least-once
+> delivery, idempotent consumption on `(partition, offset)`, and a dead-letter
+> queue for poison messages*
+
+| Term | What it means | How we handle it |
+|---|---|---|
+| **Consumer group** | A set of consumers sharing a `group.id`. **Same** id → members split the partitions (work queue). **Different** id → each group gets every message (fan-out) | Three groups — `notifications`, `analytics`, `audit` — so each gets its own full copy with its own progress |
+| **Offset** | A message's position in a partition; "how far this group has read" | Stored per group, so one consumer being down doesn't affect the others |
+| **Manual offset commit** | *We* decide when to record progress, rather than a background timer | `enable.auto.commit=false`. Auto-commit fires on a timer whether or not the handler finished — that silently turns at-least-once into at-most-once |
+| **At-least-once** | Every message is processed **one or more** times; never lost, sometimes duplicated | Comes from commit **placement**: `poll → process → commit`. Crash before the commit and the message is redelivered |
+| **Idempotent consumption** | Processing the same message twice has the same effect as once | Required, because at-least-once *guarantees* duplicates will happen |
+| **`(partition, offset)`** | A message's unique coordinates in the log | Unique constraint on that pair + `ON CONFLICT DO NOTHING` — a redelivery inserts **zero rows**. Delivery stays at-least-once; the **effect** becomes exactly-once |
+| **Poison message** | A message that can **never** be processed successfully — malformed JSON, a missing field, a schema change | See below |
+| **Dead-letter queue (DLQ)** | A separate topic where unprocessable messages are parked with their context | `order.dispatched.dlq` |
+
+**Poison messages and the DLQ get the full treatment in §5.6** — it is the
+follow-up this bullet invites most often, so know it cold.
+
+## Bullet 4 — concurrency
 
 > *Eliminated a double-dispatch race across 3 API replicas with a two-phase
 > `SELECT FOR UPDATE SKIP LOCKED` claim; re-measured under burst, found it
@@ -95,61 +189,12 @@ is the database.
 **"Why not optimistic locking?"** — optimistic assumes conflicts are rare and
 retries when wrong. Here contention is the normal case, so it would thrash.
 
-## Bullet 2 — the algorithm
-
-> *Built the dispatch core — aging-weighted priority scheduling that prevents
-> starvation, and geohash matching with a fairness band that spreads work across
-> idle riders; load-testing the claim path exposed an unbounded scan under
-> backlog, and bounding it cut dispatch p99 from 11 s to 2.8 s*
-
-| Term | What it means | How we handle it |
-|---|---|---|
-| **Priority scheduler** | Serve the most important order first, not the oldest | A max-heap ordered by score |
-| **Starvation** | A low-priority item that **never** gets served because better ones keep arriving | Real risk: a cheap order behind an endless stream of expensive ones |
-| **Aging** | Priority **grows with waiting time** | `score = value + minutes_waited × weight`. A cheap order that has waited long enough eventually outranks a fresh expensive one — starvation becomes impossible |
-| **Geohash** | Encodes lat/lon into a short string; nearby points share a prefix | Precision 6 ≈ 1.2 km × 0.61 km cells. Riders are indexed into their cell in Redis |
-| **Cell + 8 neighbours** | Search the order's cell plus the ring around it | Bounds the candidate set to 9 cells instead of scanning the whole fleet. Trade-off: a rider two cells out is not considered |
-| **Fairness band** | Among riders **within 500 m of the closest one**, pick whoever has done fewest orders today | Greedy-nearest lets one rider take everything while others idle. The band trades a little distance for even distribution |
-
-**"Why was it O(n log n), not O(log n)?"** — volunteer this; the fix is the
-interesting half. `heappop` is O(log n), but every dispatch **rebuilt** the heap
-from all pending orders and the build dominates. Two problems, not one: the cost
-scaled with the backlog, and three API replicas each held their own heap, so no
-two agreed on "the" best order. The ordering moved into SQL — `ORDER BY priority
-LIMIT 1 FOR UPDATE SKIP LOCKED` — which makes Postgres the single arbiter and
-stops at the first lockable row. Then load-testing the *claim* path found the
-scan was still unbounded when no rider was free (1,730 orders walked to answer
-"nobody is available", p99 11s), so it is capped at the top 20 — p99 2.8s.
-
-## Bullet 3 — Kafka ⭐ (the most-probed one)
-
-> *Closed a dual-write hole with a transactional outbox — the event commits with
-> the order, a relay publishes then marks — and streamed to 3 Kafka consumer
-> groups over RF=3/`min.insync=2` with manual offset commits for at-least-once
-> delivery, idempotent consumption on `(partition, offset)`, and a dead-letter
-> queue for poison messages*
-
-| Term | What it means | How we handle it |
-|---|---|---|
-| **Consumer group** | A set of consumers sharing a `group.id`. **Same** id → members split the partitions (work queue). **Different** id → each group gets every message (fan-out) | Three groups — `notifications`, `analytics`, `audit` — so each gets its own full copy with its own progress |
-| **Offset** | A message's position in a partition; "how far this group has read" | Stored per group, so one consumer being down doesn't affect the others |
-| **Manual offset commit** | *We* decide when to record progress, rather than a background timer | `enable.auto.commit=false`. Auto-commit fires on a timer whether or not the handler finished — that silently turns at-least-once into at-most-once |
-| **At-least-once** | Every message is processed **one or more** times; never lost, sometimes duplicated | Comes from commit **placement**: `poll → process → commit`. Crash before the commit and the message is redelivered |
-| **Idempotent consumption** | Processing the same message twice has the same effect as once | Required, because at-least-once *guarantees* duplicates will happen |
-| **`(partition, offset)`** | A message's unique coordinates in the log | Unique constraint on that pair + `ON CONFLICT DO NOTHING` — a redelivery inserts **zero rows**. Delivery stays at-least-once; the **effect** becomes exactly-once |
-| **Poison message** | A message that can **never** be processed successfully — malformed JSON, a missing field, a schema change | See below |
-| **Dead-letter queue (DLQ)** | A separate topic where unprocessable messages are parked with their context | `order.dispatched.dlq` |
-
-**Poison messages and the DLQ get the full treatment in §5.6** — it is the
-follow-up this bullet invites most often, so know it cold.
-
-## Bullet 4 — security
+## Bullet 5 — security
 
 > *Hardened after a self-audit: closed 4 unauthenticated endpoints, a forgeable
-> admin JWT, and a cross-tenant idempotency leak; added `jti`-based token
-> revocation, extended RBAC across every route and re-keyed Lua-atomic rate
-> limiting to verified identity, backed by 79 tests and a CI race check at 3
-> replicas*
+> admin JWT and a cross-tenant idempotency leak; extended RBAC across every
+> route with separate role and ownership guards, backed by 79 tests and a CI
+> race check at 3 replicas*
 
 **"79 tests", never "79 integration tests"** — the split is **55 integration**
 (real Postgres and Redis over HTTP, one of them producing and consuming against
