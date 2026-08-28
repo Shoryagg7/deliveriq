@@ -2232,6 +2232,28 @@ socket timeouts is what made the design I'd described real."
   claim could expire mid-flight and let a retry double-execute — precisely what
   the middleware exists to prevent.
 
+**Two more, found by *using* it rather than reading it.** Everything above came
+out of a code audit. These came out of walking the demo as a user would, which is
+a different net and catches different things:
+
+- **The rider login often had an empty board.** Signing in as `rider` looked like
+  the role could only place orders. Not an authorization bug — a *seeding* bug,
+  and a probabilistic one: the demo rider sits ~70 m from the pickup point while
+  six couriers are jittered 0–165 m around it, so across only four dispatches the
+  demo rider frequently lost every one. Some runs worked, some didn't, which is
+  the worst kind. Fixed by parking that rider exactly on the pickup point: on the
+  first dispatch every rider has zero orders today, so the fairness band falls
+  through to distance and 0 m wins. Nothing is special-cased inside dispatch — the
+  demo rider wins the real algorithm, deterministically. Verified over five
+  consecutive clean seeds.
+- **`OrderResponse` never included `rider_id`,** but the console renders a
+  "rider N" badge from it — so the badge was dead code and an assigned order
+  looked identical to an unassigned one on screen.
+
+**The lesson worth stating:** a passing test suite said nothing about either.
+Both were only visible by driving the product end to end, and the first was
+*intermittent*, so a single successful run would have hidden it.
+
 ## 9.5 Still open — the genuine remaining gaps
 
 Volunteer these. They are the honest half of the story and each one has a fix I
