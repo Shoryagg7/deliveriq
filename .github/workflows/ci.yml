@@ -48,7 +48,7 @@ jobs:
       # This way a broken compose file fails CI instead of surfacing at deploy.
       - name: Start infrastructure
         run: |
-          docker compose up -d db redis kafka
+          docker compose up -d db redis kafka-1 kafka-2 kafka-3
           docker compose ps
 
       # kafka-init is gated on the broker healthcheck and exits 0 only once the
@@ -82,6 +82,63 @@ jobs:
       - name: Dump container logs on failure
         if: failure()
         run: docker compose logs --tail 100
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # The project's headline correctness claim — no double-dispatch across
+  # replicas — was proved by a script somebody had to remember to run. That is
+  # not regression protection. It runs here now, against three real replicas.
+  race:
+    name: Concurrency proof (3 replicas)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      JWT_SECRET: ci-only-not-a-real-secret-do-not-reuse-anywhere-0123456789
+      # A range would let Docker pick arbitrary ports; race_test.py expects
+      # exactly 8000-8002, one per replica.
+      API_PORTS: 8000-8002:8000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install httpx
+        run: pip install httpx
+
+      - name: Start the stack with 3 API replicas
+        run: |
+          docker compose up -d --build --scale api=3
+          docker compose ps
+
+      - name: Wait for all three replicas
+        run: |
+          for port in 8000 8001 8002; do
+            for i in $(seq 1 60); do
+              curl -sf "http://localhost:$port/health" >/dev/null && break
+              sleep 3
+            done
+            curl -sf "http://localhost:$port/health" >/dev/null \
+              || { echo "replica on $port never became healthy"; exit 1; }
+          done
+
+      - name: Seed the ops login the script authenticates with
+        run: docker compose exec -T api python -m scripts.seed_users
+
+      # Asserts every assigned order_id AND rider_id is unique across 15
+      # simultaneous dispatches. Exits non-zero on any duplicate.
+      - name: Race test
+        run: python -m scripts.race_test
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
 
       - name: Tear down
         if: always()

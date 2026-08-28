@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.enums import OrderStatus, UserRole
+from app.core.revocation import is_revoked
 from app.core.security import decode_access_token
 from app.models.user import User
 
@@ -29,6 +30,11 @@ def get_current_user(
 
     claims = decode_access_token(creds.credentials)
     if claims is None or not claims.get("sub"):
+        raise _UNAUTHENTICATED
+
+    # A valid signature is not the same as a live session: logout puts this
+    # token's jti on a denylist that outlives it by exactly its remaining life.
+    if is_revoked(claims.get("jti")):
         raise _UNAUTHENTICATED
 
     # Load the user rather than trusting the token's claims wholesale: a token

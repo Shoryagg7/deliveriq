@@ -6,6 +6,7 @@ bcrypt 4.x (it reads a `__about__` attribute that no longer exists). One less
 abstraction over a primitive that doesn't need one.
 """
 
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import bcrypt
@@ -44,12 +45,19 @@ def verify_password(password: str, hashed: str) -> bool:
 
 
 def create_access_token(subject: str, is_admin: bool = False) -> str:
+    """Mint a token. Every one carries a `jti` so it can be revoked.
+
+    Without a unique id per token there is nothing to put on a denylist — you
+    could only revoke "every token for this user", which logs them out of every
+    device to end one session.
+    """
     now = datetime.now(UTC)
     payload = {
         "sub": subject,
         "is_admin": is_admin,
         "iat": now,
         "exp": now + timedelta(minutes=settings.jwt_expire_minutes),
+        "jti": uuid.uuid4().hex,
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=ALGORITHM)
 

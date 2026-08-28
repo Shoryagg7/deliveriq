@@ -22,6 +22,7 @@ from app.core.enums import UserRole
 from app.core.redis_client import redis_client
 from app.main import app
 from app.models.order import Order  # noqa: F401 — register tables on Base
+from app.models.outbox import OutboxEvent
 from app.models.rider import Rider  # noqa: F401
 from app.models.user import User  # noqa: F401
 
@@ -37,9 +38,12 @@ TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engin
 # list cannot silently rot: move a publish call site and the suite errors
 # instead of quietly publishing for real. (It already caught one — the Day 33
 # refactor moved the DLQ publish out of notification_consumer into runner.)
+# Dispatch no longer publishes directly — it writes an outbox row inside its
+# transaction and the relay publishes later. So the call sites that must be
+# patched are the relay and the DLQ path, not the service.
 _PUBLISH_CALL_SITES = (
-    "app.services.dispatch",
-    "app.workers.runner",  # DLQ path, shared by all three worker groups
+    "app.workers.runner",        # DLQ path, shared by all three worker groups
+    "app.workers.outbox_relay",  # the only producer on the dispatch path now
 )
 
 
@@ -53,7 +57,7 @@ def reset_state():
 
 
 @pytest.fixture(autouse=True)
-def recorded_events(monkeypatch):
+def recorded_events(request, monkeypatch):
     """Stop tests reaching a real broker, and record what they tried to publish.
 
     Autouse on purpose: pollution must not depend on a future test remembering
@@ -64,6 +68,22 @@ def recorded_events(monkeypatch):
     Recording (rather than swallowing) is what makes this coverage instead of a
     muzzle: see `published_events` and test_dispatch_publishes_event.
     """
+    # A test marked `real_kafka` deliberately wants the real producer: it is
+    # asserting that an event survives an actual broker round trip, which is the
+    # one thing the mock can never prove. Opt it out of both the patch and the
+    # no-real-producer assertion below.
+    if "real_kafka" in request.keywords:
+        yield []
+        # That test legitimately built a REAL producer, and it is a module
+        # global — so without this every later test trips the
+        # no-real-producer control below and errors in teardown. Drain and
+        # reset it, so the control keeps meaning something for the rest of
+        # the run instead of being collateral damage.
+        if kafka_producer._producer is not None:
+            kafka_producer._producer.flush(10.0)
+            kafka_producer._producer = None
+        return
+
     recorded: list[dict] = []
 
     def _record(topic, payload, key=None):
@@ -86,6 +106,20 @@ def recorded_events(monkeypatch):
 def published_events(recorded_events):
     """Explicit handle on what the code under test published."""
     return recorded_events
+
+
+@pytest.fixture
+def outbox_rows():
+    """Read the outbox directly — dispatch's event now lands here, not on Kafka."""
+
+    def _read():
+        db = TestingSessionLocal()
+        try:
+            return db.query(OutboxEvent).order_by(OutboxEvent.id).all()
+        finally:
+            db.close()
+
+    return _read
 
 
 @pytest.fixture

@@ -10,7 +10,16 @@ class Order(Base):
     __tablename__ = "orders"
 
     id = Column(Integer, primary_key=True, index=True)
-    customer_id = Column(Integer, nullable=False)
+    # FK, not a bare integer: the handler already derives this from the verified
+    # token, but application-level invariants are bypassed by scripts, fixtures
+    # and the next endpoint someone adds. RESTRICT so deleting a customer fails
+    # loudly instead of silently vaporising their order history.
+    customer_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     restaurant_id = Column(Integer, nullable=False)
     value = Column(Float, nullable=False)
     pickup_lat = Column(Float, nullable=False)

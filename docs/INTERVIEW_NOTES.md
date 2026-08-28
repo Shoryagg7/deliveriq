@@ -7,7 +7,8 @@
 > on so far.
 >
 > Aimed at SDE-1 depth: what a backend engineer is expected to explain, draw, and
-> write pseudocode for on a whiteboard.
+> write pseudocode for on a whiteboard — including **how each dependency is
+> actually wired up**, which gets asked more often than any theory question.
 
 ---
 
@@ -603,6 +604,38 @@ An **in-memory**, **single-threaded** key-value store with real data structures
 cache. All three are **derived** — `scripts/reindex_riders.py` rebuilds the index
 from Postgres, so a flushed Redis costs a rebuild, not data.
 
+## 3.0b How Redis is actually connected
+
+```
+REDIS_URL              redis://host:6379/0        (db 15 in tests — isolation)
+      │
+      ▼
+redis.Redis.from_url(...)      module-level singleton, holds a CONNECTION POOL
+      │                        (not one socket — the client pools internally)
+      ├── redis_client          SYNC  — services, workers, /ready
+      └── async_redis_client    ASYNC — middleware only
+```
+
+**Two clients, deliberately.** Routes are sync `def`, so FastAPI runs them in a
+threadpool and a blocking Redis call there costs one worker thread. Middleware
+runs on the **event loop**, where the same blocking call stalls every in-flight
+request on the process. So middleware awaits, services don't.
+
+**Both carry timeouts**, and this is the part people miss:
+
+```python
+socket_connect_timeout=2, socket_timeout=2, retry_on_timeout=True,
+health_check_interval=30
+```
+
+The middleware's fail-open catches `redis.RedisError`. Without a socket timeout
+that only fires on a **refused** connection — a Redis that accepts and then
+*hangs* raises nothing and blocks forever. **The timeout is what makes the
+fallback reachable.**
+
+**No explicit connect call, and none needed:** `from_url` is lazy, so importing
+this module never touches the network. The first command opens a socket.
+
 ## 3.1 Why the rate-limit script has to be atomic ⭐
 
 
@@ -696,6 +729,117 @@ cache correctness: even if invalidation is missed, staleness is bounded.
   and Lua.
 - **"Is Redis persistent?"** It can be (RDB snapshots, AOF log), but I treat it
   as a cache. Everything in it is rebuildable from Postgres.
+
+---
+
+# Part 3b — PostgreSQL: how it's actually connected
+
+Interviewers ask "how do you connect to the database?" far more often than they
+ask about CAP. Know the wiring, not just the theory.
+
+## 3b.1 The chain, top to bottom
+
+```
+DATABASE_URL              postgresql://user:pass@host:5432/dbname
+      │                   read from .env by pydantic-settings
+      ▼
+create_engine(...)        ONE engine per process. Owns the connection POOL.
+      │                   Not a connection — a factory with a pool behind it.
+      ▼
+sessionmaker(bind=engine) A factory for Sessions.
+      │
+      ▼
+get_db()  (FastAPI dep)   ONE Session per request, closed in `finally`.
+      │
+      ▼
+db.query(Order)...        Session borrows a connection from the pool,
+                          returns it on close.
+```
+
+**The one-liner:** *"An engine per process holding a pool, a session per request
+borrowing from it."*
+
+## 3b.2 The pool, and the arithmetic
+
+```python
+engine = create_engine(
+    settings.database_url,
+    pool_size=20,        # kept open permanently
+    max_overflow=10,     # burst above pool_size, closed when returned
+    pool_pre_ping=True,  # cheap SELECT 1 before handing one out
+    pool_recycle=1800,   # retire a connection before any idle timeout kills it
+)
+```
+
+- **Why a pool at all** — a new Postgres connection is a TCP handshake, auth,
+  *and a forked backend process* on the server. Tens of milliseconds. Reuse them.
+- **The sizing** — `instances × pool_size` against `max_connections` (~100 by
+  default). 3 replicas × 20 = 60, leaving room for migrations and `psql`. Do that
+  arithmetic before the DB does it for you; **PgBouncer** is the next tier when
+  you outgrow it.
+- **`pool_pre_ping`** — without it, every Postgres restart hands out dead
+  connections until each fails a real query. A self-inflicted error spike after
+  routine maintenance.
+
+## 3b.3 Session per request — and why `finally`
+
+```python
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db          # the request runs here
+    finally:
+        db.close()        # returns the connection to the pool, ALWAYS
+```
+
+`yield`, not `return`, makes this a FastAPI dependency with teardown. If `close()`
+were skipped on an exception path, the pool would leak a connection per failed
+request and the app would deadlock on the 31st. **The `finally` is the whole
+point of the pattern.**
+
+## 3b.4 Transactions
+
+A Session opens a transaction lazily on first query and holds it until
+`commit()` or `rollback()`. In DeliverIQ dispatch, that boundary *is* the
+correctness mechanism: `FOR UPDATE` locks live until commit, so "claim both rows,
+then mutate, then commit" is one atomic unit — and the outbox row rides the same
+commit.
+
+**Gotcha worth knowing:** after `commit()`, SQLAlchemy expires loaded attributes,
+so touching `rider.current_lat` afterwards silently re-queries. Dispatch captures
+what it needs into plain variables *before* committing.
+
+## 3b.5 Migrations, not `create_all`
+
+`Base.metadata.create_all()` only ever *creates* — it cannot add a column, change
+a type, or roll back. Alembic gives ordered, reviewable, reversible revisions.
+
+**They run as a one-shot job before the API starts**, never on app boot: three
+replicas booting means three concurrent migrations racing the same DDL.
+
+```bash
+alembic revision --autogenerate -m "add outbox"   # generate, then READ it
+alembic upgrade head                              # apply
+alembic downgrade -1                              # step back
+```
+
+Autogenerate is a first draft, not an answer — it misses renames (it sees a drop
+plus an add) and never writes your data migrations.
+
+## 3b.6 Likely follow-ups
+
+- **"Connection vs session vs engine?"** Engine = pool owner, one per process.
+  Connection = a socket from the pool. Session = a unit of work with an identity
+  map and a transaction, borrowing a connection.
+- **"What if the DB goes down mid-request?"** The query raises, the dependency's
+  `finally` returns the connection, and `/ready` starts reporting 503 so the load
+  balancer stops routing here. `/health` stays 200 — restarting the app would not
+  fix Postgres.
+- **"N+1 queries?"** The classic ORM trap: one query for the list, one per row for
+  a relationship. Fix with `joinedload`/`selectinload`, or measure with echoed SQL.
+- **"Why not async SQLAlchemy?"** The routes are sync `def`, so FastAPI runs them
+  in a threadpool and blocking there costs one worker thread, not the loop. Async
+  would help under much higher concurrency; it was not the bottleneck.
 
 ---
 
@@ -812,7 +956,7 @@ cookie — you trade an XSS exposure for a CSRF one, and CSRF has cleaner defenc
 One issuer and one verifier here, so HS256 is right. If DeliverIQ split into
 several services, RS256 would be the move.
 
-## 4.7 Refresh tokens and revocation — the open gap
+## 4.7 Revocation, and the refresh-token gap
 
 Short access token + long refresh token is the standard pattern:
 
@@ -821,14 +965,26 @@ access token   15 min, sent on every request  -> small stolen-token window
 refresh token  7 days, sent only to /refresh  -> stored server-side, revocable
 ```
 
-**DeliverIQ has neither refresh tokens nor revocation.** The per-request user
-lookup (§4.4) covers *deleted* and *demoted* users, but nothing covers a stolen
-token, a password change, or "log me out everywhere".
+**Revocation is implemented.** Every token carries a **`jti`**, and
+`POST /auth/logout` puts it on a Redis denylist with a TTL equal to the token's
+*remaining* life — so the set is bounded and self-cleaning, not a session store
+by the back door. Verification stays local to each replica; only the "was this
+revoked" check is shared.
 
-**The fix, which I can describe:** add a `jti` claim and keep a Redis denylist
-keyed on it with a TTL matching the token's remaining life, plus
-`POST /auth/logout`. Redis is already a hard dependency, so it costs no new
-infrastructure. **Volunteer this one** — it's a known gap with a known fix.
+**The interesting part is the failure direction ⭐.** `is_revoked` **fails
+CLOSED** — Redis unreachable means the token is rejected. That is the exact
+opposite of the rate limiter, which fails **open**. The limiter protects
+capacity, and unthrottled traffic beats an outage. This protects against a
+*stolen* token, so failing open would reopen that hole precisely when the system
+is already degraded. **Being able to argue both directions is the whole lesson.**
+
+It revokes **one token, not the user** — logging out a phone should not log out a
+laptop; that is what a per-token `jti` buys. Revoking every session for a user
+needs a second denylist keyed on `sub` plus an issued-after timestamp.
+
+**Still open, and worth volunteering:** no **refresh tokens**. A 60-minute access
+token is the whole session. The standard split is a short access token plus a
+long, revocable refresh token, which shrinks the stolen-token window.
 
 ## 4.8 RBAC, concretely
 
@@ -879,9 +1035,9 @@ account-enumeration oracle.
 
 ## 4.10 Likely follow-ups
 
-- **"How do you log someone out?"** With plain JWT you can't, really — the token
-  stays valid until `exp`. You shorten expiry, or add a `jti` denylist. I'd add
-  the denylist.
+- **"How do you log someone out?"** Plain JWT can't — the token stays valid until
+  `exp`. I mint a `jti` per token and deny it in Redis until it would have
+  expired anyway. The check fails closed, unlike the rate limiter.
 - **"Why not just check `is_admin` from the token?"** Because it's a snapshot
   from issue time. I read the role from the database so a demotion takes effect
   immediately.
@@ -915,6 +1071,50 @@ subscriber that is down **misses the message forever**.
 | Multiple consumers | Compete for messages | Each group gets a full copy |
 | Replay | Not a feature | Reset the offset |
 | Ordering | Per queue | Per **partition** |
+
+## 5.1b How Kafka is actually connected
+
+```
+KAFKA_BOOTSTRAP   kafka-1:19092,kafka-2:19092,kafka-3:19092
+      │           a HANDSHAKE address list, not where you end up
+      ▼
+Producer({...})   one per process, lazy, background delivery thread
+Consumer({...})   one per worker, subscribes, polls in a loop
+```
+
+**The bootstrap/advertised distinction — the config bug everyone hits once.**
+Bootstrap is only the *first* address you dial. The broker replies with its
+**advertised listener**, and the client reconnects to *that*. Get it wrong and
+the client connects, then hangs forever on a healthy-looking cluster.
+
+```
+from the host       localhost:9092    (PLAINTEXT_HOST listener)
+inside Compose      kafka-1:19092     (PLAINTEXT listener)
+```
+
+Same broker, two listeners, because "localhost" means different machines to a
+container and to your shell. `settings.kafka_bootstrap` switches by environment —
+never hardcoded.
+
+**Producer config that matters:**
+
+```python
+"acks": "all",                    # every in-sync replica, not just the leader
+"enable.idempotence": True,       # dedupe the producer's own retries
+"partitioner": "murmur2_random",  # match the Java client (librdkafka defaults
+                                  # to CRC32 — same key, different partition,
+                                  # per-key ordering silently broken)
+```
+
+**Producing is asynchronous.** `produce()` only *enqueues*; it does no I/O and
+cannot fail on a dead broker. Delivery happens on a background thread and
+reports via callback. That is why anything that must be durable calls
+`flush()` and checks the count of still-undelivered messages — the outbox relay
+does exactly this before marking a row published.
+
+**Consumers are a poll loop**, and `poll()` has a **three-way** return: `None`
+(no message), an error, or a message. Calling `.value()` on an error object
+crashes the worker — that check is not optional.
 
 ## 5.2 Topics, partitions, offsets
 
@@ -1022,18 +1222,32 @@ The subtlety: **block until the DLQ publish is acknowledged before committing.**
 Committing on an unacked DLQ publish advances past the message with no copy
 anywhere — the one way this design can lose data.
 
-### The dual-write problem (my honest open gap)
-`db.commit()` and the Kafka publish are two systems with **no shared
-transaction**. Crash in between and the DB has the order while the event is lost
-forever.
+### The dual-write problem — and the outbox that closes it ⭐
+`db.commit()` and a Kafka publish are two systems with **no shared transaction**.
+Crash in between and the DB has the order while the event is gone forever.
+Publishing *after* commit is right as far as it goes — never announce a fact that
+isn't durable — but it does not close the window.
 
-Publishing *after* commit is correct as far as it goes — never announce a fact
-that isn't durable — but it doesn't close the window.
+**Fixed with a transactional outbox.** The event is written as a **row in an
+`outbox` table inside the same transaction** as the order and the rider. One
+commit, three facts, atomic. A relay then publishes those rows and marks them
+done.
 
-**Fix: transactional outbox.** Write the event to an `outbox` table *inside the
-same DB transaction*, then a relay process reads that table and publishes. One
-atomic write, at-least-once publishing, which the idempotent consumers already
-absorb. **This is the thing I'd build next.**
+**The relay's ordering is the design, and it mirrors the consumer's commit
+placement exactly:**
+
+```
+publish  ->  wait for the broker's ack  ->  THEN mark published
+```
+
+Mark first and a crash in the gap loses the event — the same hole, moved one
+layer down. Publish first and a crash republishes it: at-least-once, which the
+consumers already dedupe on `(partition, offset)`. Rows are claimed with
+`FOR UPDATE SKIP LOCKED`, so several relays can run — the same protocol dispatch
+uses on orders.
+
+**The honest trade:** the event is no longer lost, but it is no longer instant —
+it is delayed by the relay's poll interval. **You buy durability with latency.**
 
 ### Consumer lag
 `lag = latest offset − committed offset`. The single best health metric: it says
@@ -1066,10 +1280,17 @@ than retention **loses data permanently**. Retention is a data-loss window.
 
 DeliverIQ uses `acks=all` + `enable.idempotence=true` (dedupes producer retries).
 
-**The honest caveat, worth volunteering:** with a **single broker and
-replication-factor 1, "all" is one replica** — so `acks=all` provides no real
-durability. The producer config is right; the *topology* isn't. Production needs
-3 brokers, RF=3, `min.insync.replicas=2`.
+**The story worth telling:** this used to be theatre. With a **single broker at
+RF=1, "all" is one replica** — `acks=all` bought nothing, and a single disk loss
+lost the log. The producer config was always right; the **topology** was the gap.
+
+Now: **3 brokers, RF=3, `min.insync.replicas=2`** — including the internal
+`__consumer_offsets` topic, because a group whose offsets live on one broker
+loses its place when that broker dies.
+
+**Why 2 and not 3:** `min.insync=3` refuses writes the moment any broker blinks;
+`min.insync=1` silently accepts a write only one replica holds — the theatre
+again. RF=3 with min.insync=2 survives one broker down and still takes writes.
 
 ## 5.8 One real config gotcha
 
@@ -1132,7 +1353,22 @@ delivery stays at-least-once, the effect becomes exactly-once. Poison messages g
 to a DLQ, and I only commit once that publish is acked — otherwise I'd advance
 past a message with no copy of it anywhere.
 
-**The gap I volunteer:** no transactional outbox. A crash between the DB commit
-and the Kafka publish loses the event. That's the dual-write problem, and the fix
-is an outbox table written inside the order's transaction with a relay publishing
-from it.
+**The story I volunteer.** I had the dual-write problem: dispatch committed the
+order, then published to Kafka, so a crash in the gap lost the event forever. I
+closed it with a transactional outbox — the event is a row written inside the
+same transaction, and a relay publishes it and marks it done, in that order,
+because marking first just moves the hole down a layer. You buy durability with
+latency: the event is no longer lost, but it is no longer instant.
+
+**And the one I'd lead with if they ask about measurement.** My original
+benchmark hit unauthenticated `POST /orders` — a plain INSERT, no matching, no
+locking, no Kafka. Pointing it at the dispatch claim instead found a real defect
+in one run: with a backlog and no free riders, every call scanned the entire
+pending set to answer "nobody is available" — 1,730 orders, p99 of 11 seconds.
+Bounding the scan to the top 20 by priority took p99 to 2.8 s on the same
+machine. **The absolute numbers describe my laptop; the comparison is the real
+result — a single-host benchmark is near-worthless for capacity and excellent
+for regression.**
+
+**Still open, honestly:** no refresh tokens, revocation is per-token rather than
+per-user, and the outbox relay has no depth alerting if it dies.

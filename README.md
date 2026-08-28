@@ -38,7 +38,9 @@ flowchart TD
 
     Postgres[("PostgreSQL<br/>orders · riders · users · dispatch_events")]
     Redis[("Redis<br/>token bucket · geo index · idempotency")]
-    Kafka["Kafka — order.dispatched<br/>3 partitions, keyed by order_id"]
+    Outbox[("outbox table<br/>written IN the order's transaction")]
+    Relay["outbox relay<br/>publish → ack → mark done"]
+    Kafka["Kafka — 3 brokers, RF=3<br/>order.dispatched, keyed by order_id"]
     DLQ["order.dispatched.dlq<br/>unprocessable messages"]
     Obs["Prometheus → Grafana"]
 
@@ -51,7 +53,9 @@ flowchart TD
     Dispatch -->|"claim: SELECT … FOR UPDATE SKIP LOCKED"| Postgres
     Dispatch --> Match
     Match -.->|"cell + 8 neighbours, one pipeline"| Redis
-    Dispatch -->|"publish AFTER commit"| Kafka
+    Dispatch -->|"same transaction"| Outbox
+    Outbox --> Relay
+    Relay -->|"publish, then mark"| Kafka
     RL -.-> Redis
     Idem -.-> Redis
     Auth -.-> Postgres
@@ -69,7 +73,8 @@ flowchart TD
     classDef sec fill:#FDECEF,stroke:#A61E4D,color:#5C0F26;
     class Dispatch,Match algo;
     class Redis,Postgres store;
-    class Kafka,DLQ bus;
+    class Kafka,DLQ,Relay bus;
+    class Outbox store;
     class Auth sec;
 ```
 
@@ -157,9 +162,16 @@ A max-heap orders by `value + minutes_waited × weight`, so high-value orders go
 first but nothing starves: a cheap order that has waited long enough outranks a
 fresh expensive one.
 
-### Events — at-least-once with a dead-letter path
-Dispatch publishes `order.dispatched` **after** commit, keyed by `order_id` so a
-single order's events stay ordered. Three consumer groups read the same topic
+### Events — a transactional outbox, then at-least-once delivery
+Dispatch does **not** publish to Kafka. It writes the event as a row in an
+`outbox` table **inside the same transaction** as the order and the rider, so one
+commit covers all three — closing the dual-write hole where a crash between
+`db.commit()` and a publish lost the event forever. A relay
+(`app/workers/outbox_relay.py`) then publishes those rows and marks them done, in
+that order: marking first would move the same hole one layer down. The trade is
+explicit — the event is durable but no longer instant.
+
+Events are keyed by `order_id` so a single order's events stay ordered. Three consumer groups read the same topic
 independently — `notifications`, `analytics` (writes Postgres), `audit` (appends
 a file) — each with its own committed offsets, so one consumer failing or falling
 behind cannot affect the others, and a new group replays history from the start.
@@ -321,17 +333,32 @@ drift.
 
 ## Load
 
-**No number quoted here yet, on purpose.** The previous figure came from a Locust
-run that only hit unauthenticated `POST /orders` — it measured a plain INSERT,
-not matching, locking or Kafka, so it was retired rather than restated.
+The previous figure measured unauthenticated `POST /orders` — a plain INSERT, no
+matching, locking or Kafka — so it was retired. Pointing the load profile at the
+**dispatch claim** instead found a real defect in one run: with a large backlog
+and no free riders, every call scanned the entire pending set to answer "nobody
+is available".
 
-`locustfile.py` now drives `POST /orders/dispatch` — the claim — under contention
-with a seeded rider fleet, which is the path worth measuring:
+Same host, 50 users, 60 s, limiter off, 3 replicas — before and after bounding
+that scan:
+
+| dispatch claim | RPS | p50 | p95 | p99 | max |
+|---|---|---|---|---|---|
+| unbounded scan | 9.3 | 1700 ms | 8200 ms | 11000 ms | 17000 ms |
+| bounded to top 20 | 14.3 | 1600 ms | 2300 ms | **2800 ms** | 3100 ms |
+
+**Read these as a comparison, not a capacity number.** API, Postgres, Redis and
+three Kafka brokers share one laptop, so the absolute figures describe the
+machine. What is valid is that one variable changed and p99 fell 4×: a
+single-host benchmark is near-worthless for capacity and excellent for
+regression.
+
+Reproduce:
 
 ```bash
-API_PORTS=8000-8002:8000 docker compose up -d --scale api=3
-python -m scripts.seed_users
-RATE_LIMIT_ENABLED=false locust -f locustfile.py --host http://localhost:8000
+RATE_LIMIT_ENABLED=false API_PORTS=8000-8002:8000 docker compose up -d --scale api=3
+docker compose exec api python -m scripts.seed_users
+locust -f locustfile.py --host http://localhost:8000 --headless -u 50 -r 10 -t 60s
 ```
 
 Always name which configuration *and which endpoint* a load number came from.
@@ -355,10 +382,10 @@ form. `docs/DAILY_COMMANDS.md` is the operational runbook.
 app/
   core/        config · security · metrics · enums · kafka producer
   middleware/  request_id · rate limit · idempotency · metrics
-  models/      SQLAlchemy models
+  models/      SQLAlchemy models (orders, riders, users, outbox, events)
   routers/     orders · riders · auth · admin
   services/    dispatch · geohash matching · order state machine
-  workers/     shared consumer runner + notification/analytics/audit
+  workers/     outbox relay + shared consumer runner (notification/analytics/audit)
 frontend/      React console (built into the API image)
 ops/           Prometheus config · provisioned Grafana dashboard
 scripts/       seeding · rider reindex · concurrency test · verify.sh
@@ -368,5 +395,5 @@ tests/
 ## Stack
 
 Python 3.14 · FastAPI · SQLAlchemy · Alembic · PostgreSQL 18 · Redis 7 ·
-Apache Kafka 4.1 (KRaft) · Docker Compose · Prometheus · Grafana · React (Vite) ·
+Apache Kafka 4.1 (KRaft, 3 brokers, RF=3) · Docker Compose · Prometheus · Grafana · React (Vite) ·
 pytest · Ruff · GitHub Actions

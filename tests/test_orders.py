@@ -4,6 +4,8 @@ Every /orders call carries a token now (G02). `customer_id` is derived from the
 subject rather than the body, so an anonymous order is not a thing that exists.
 """
 
+import json
+
 from app.core.enums import Topic
 
 
@@ -114,34 +116,51 @@ def test_dispatch_assigns_rider(ops_client):
     assert ops_client.get(f"/orders/{order_id}").json()["status"] == "ASSIGNED"
 
 
-def test_dispatch_publishes_event(ops_client, published_events):
-    """The publish is part of the dispatch contract, so assert on it.
+def test_dispatch_writes_an_outbox_row(ops_client, outbox_rows):
+    """The event is part of the dispatch contract, so assert on it.
 
-    Without this, the autouse mock would only be silencing the producer — the
-    same green-for-the-wrong-reason shape as a patch that never applied.
+    It now lands in the outbox rather than going straight to Kafka — written
+    inside the same transaction as the order and rider, which is what closes the
+    dual-write hole.
     """
     rider_id = _make_rider(ops_client)
     order_id = _make_order(ops_client)
 
-    assert published_events == []  # nothing published before the dispatch
+    assert outbox_rows() == []  # nothing written before the dispatch
 
     ops_client.post("/orders/dispatch")
 
-    assert len(published_events) == 1
-    event = published_events[0]
-    assert event["topic"] == Topic.ORDER_DISPATCHED.value
+    rows = outbox_rows()
+    assert len(rows) == 1
+    assert rows[0].topic == Topic.ORDER_DISPATCHED.value
     # keyed by order_id → same partition → per-order ordering downstream
-    assert event["key"] == str(order_id)
-    assert event["payload"]["order_id"] == order_id
-    assert event["payload"]["rider_id"] == rider_id
+    assert rows[0].key == str(order_id)
+    payload = json.loads(rows[0].payload)
+    assert payload["order_id"] == order_id
+    assert payload["rider_id"] == rider_id
+    assert rows[0].published_at is None  # the relay has not run
 
 
-def test_failed_dispatch_publishes_nothing(ops_client, published_events):
+def test_outbox_row_commits_with_the_assignment(ops_client, outbox_rows):
+    """The point of the outbox: the row and the state change share a transaction.
+
+    If the order says ASSIGNED, the event exists. There is no window where one
+    landed and the other did not.
+    """
+    _make_rider(ops_client)
+    order_id = _make_order(ops_client)
+    ops_client.post("/orders/dispatch")
+
+    assert ops_client.get(f"/orders/{order_id}").json()["status"] == "ASSIGNED"
+    assert len(outbox_rows()) == 1
+
+
+def test_failed_dispatch_writes_nothing(ops_client, outbox_rows):
     """No rider → no state change → no event. Announce only durable facts."""
     _make_order(ops_client)
 
     assert ops_client.post("/orders/dispatch").status_code == 409
-    assert published_events == []
+    assert outbox_rows() == []
 
 
 def test_busy_rider_not_dispatched_again(ops_client):
@@ -215,3 +234,64 @@ def test_no_key_means_no_deduplication(customer_client):
     a = customer_client.post("/orders", json=_order_payload())
     b = customer_client.post("/orders", json=_order_payload())
     assert a.json()["id"] != b.json()["id"]
+
+
+# --- priority ordering, now computed in SQL ---------------------------------
+
+def _backdate(order_id, minutes):
+    """Age an order by rewriting created_at — the aging term reads this."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.models.order import Order as OrderModel
+    from tests.conftest import TestingSessionLocal
+
+    db = TestingSessionLocal()
+    try:
+        when = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=minutes)
+        db.query(OrderModel).filter(OrderModel.id == order_id).update(
+            {"created_at": when}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_higher_value_wins_when_ages_are_equal(ops_client):
+    _make_rider(ops_client)
+    cheap = ops_client.post("/orders", json=_order_payload(value=100)).json()["id"]
+    rich = ops_client.post("/orders", json=_order_payload(value=900)).json()["id"]
+
+    dispatched = ops_client.post("/orders/dispatch").json()["dispatched"]
+    assert dispatched["order_id"] == rich, f"expected {rich} to outrank {cheap}"
+
+
+def test_aging_lets_a_cheap_old_order_overtake_a_fresh_expensive_one(ops_client):
+    """The anti-starvation property, and the one the SQL rewrite had to keep.
+
+    priority = value + minutes_waited * 10. A 100-rupee order that has waited
+    two hours scores 100 + 1200 = 1300, beating a brand-new 900-rupee order.
+    Without aging the cheap one would sit behind every richer arrival forever.
+    """
+    _make_rider(ops_client)
+    old_cheap = ops_client.post("/orders", json=_order_payload(value=100)).json()["id"]
+    _backdate(old_cheap, minutes=120)
+    ops_client.post("/orders", json=_order_payload(value=900))
+
+    dispatched = ops_client.post("/orders/dispatch").json()["dispatched"]
+    assert dispatched["order_id"] == old_cheap
+
+
+def test_ordering_survives_an_unclaimable_order(ops_client):
+    """If the best order has no rider, dispatch moves on instead of giving up.
+
+    The rewrite tracks tried orders in an exclude set, because we still hold
+    their row locks — re-selecting one would spin forever.
+    """
+    # rider is far away, reachable only from the second order's pickup
+    _make_rider(ops_client, lat=19.0760, lon=72.8777)
+    unreachable = ops_client.post("/orders", json=_order_payload(value=900)).json()["id"]
+    reachable = _make_order(ops_client, lat=19.0760, lon=72.8777)
+
+    dispatched = ops_client.post("/orders/dispatch").json()["dispatched"]
+    assert dispatched["order_id"] == reachable, "should skip the unclaimable top order"
+    assert unreachable != reachable

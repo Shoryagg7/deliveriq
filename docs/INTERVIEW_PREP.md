@@ -2081,20 +2081,26 @@ demands it.
 
 This section used to list seven known flaws. Then I audited every source file
 line by line and found **nine more** — including four endpoints that had no
-authentication at all. Thirteen are now fixed; six are not.
+authentication at all. All of them are now fixed, and so are the seven originals.
 
 That story is worth more in an interview than the original list was, because it
 demonstrates the thing the list only claimed: that I look for my own defects and
 then close them. Lead with it.
 
 **Governing rule, unchanged:** a gap is only "owned" when you can state **both
-the flaw and the fix**. For the fixed ones, state the flaw, the fix, and *why the
-fix is shaped the way it is* — that last part is where the signal is.
+the flaw and the fix**. Now that they are fixed, state the flaw, the fix, and
+*why the fix is shaped the way it is* — that last part is where the signal is.
+
+**The two best stories in here, if you only get time for two:** the
+unauthenticated rider-location endpoint (§9.1), because the reason it shipped
+open is more interesting than the bug; and the benchmark (§9.5), because
+pointing it at the right endpoint found a real defect within one run and the fix
+is measured.
 
 **One command re-checks all of it:** `./scripts/verify.sh` — config guard, lint,
-71 tests, and a live smoke test of every auth boundary against a real server,
-including an attempt to authenticate with a token forged using the old shipped
-secret.
+the full suite, and a live smoke test of every auth boundary against a real
+server, including an attempt to authenticate with a token forged using the old
+shipped secret.
 
 ## 9.1 The four auth holes ⭐ (lead with this one)
 
@@ -2254,55 +2260,157 @@ a different net and catches different things:
 Both were only visible by driving the product end to end, and the first was
 *intermittent*, so a single successful run would have hidden it.
 
-## 9.5 Still open — the genuine remaining gaps
+## 9.5 The gaps, closed — and what closing them taught
 
-Volunteer these. They are the honest half of the story and each one has a fix I
-can describe.
+All seven items that stood open here have been fixed. Each one is worth more as a
+short story than as a checkbox.
 
-**No transactional outbox.** A crash between `db.commit()` and the Kafka publish
-loses the event permanently (§6.9). **This is the dual-write problem, by name** —
-the most important thing still outstanding. *Fix:* an `outbox` table written
-inside the order's transaction plus a relay (polling, or WAL-tailing via
-Debezium), accepting the at-least-once publishing that the existing idempotent
-consumers already absorb.
+### The transactional outbox — the dual-write hole ⭐
 
-**Durability theatre.** One Kafka broker with RF=1 means `acks=all` provides no
-real durability — "all" is one replica. *Fix:* three brokers, RF=3,
-`min.insync.replicas=2`. **The producer config is already correct; the topology
-isn't**, which is the whole point.
+**Was:** dispatch committed the order, then published to Kafka. Two systems, no
+shared transaction, so a crash in the gap left the order assigned and the event
+gone forever.
 
-**The dispatcher is still O(n log n) per call.** Every dispatch reloads all
-pending orders and rebuilds the heap; the `heappop` is O(log n) but the build
-dominates. The README wording is corrected. *Fix:* push the ordering into the
-database (`ORDER BY priority LIMIT 1 FOR UPDATE SKIP LOCKED`) and drop the
-in-process heap entirely.
+**Now:** the event is a **row in an `outbox` table, written inside the same
+transaction** as the order and the rider. One commit, three facts, atomic. A
+separate relay (`app/workers/outbox_relay.py`) polls for unpublished rows,
+publishes them, and marks them done.
 
-**No benchmark numbers I'm willing to quote.** The old "~123 RPS, p99 220 ms"
-came from a Locust run hitting unauthenticated `POST /orders` — it measured a
-plain INSERT, not matching, locking or Kafka. The load profile now drives the
-dispatch **claim** under contention, but **I have not re-run it**, so I have no
-number. Say that rather than quoting the old one: *"I retired that figure because
-it measured the wrong endpoint, and I haven't re-measured yet."* An honest
-absence beats a confident irrelevance.
+**The ordering inside the relay is the design**, and it mirrors the consumer's
+commit placement exactly: `publish → wait for the broker's ack → then mark
+published`. Marking first would lose the event on a crash in the gap — the same
+hole, moved one layer down. Publishing first means a crash before the mark
+republishes it: at-least-once, which the consumers already dedupe on
+`(partition, offset)`. The relay claims rows with `FOR UPDATE SKIP LOCKED`, so
+several can run — the same protocol dispatch uses on orders.
 
-**The concurrency proof isn't in CI.** `scripts/race_test.py` is a manual script,
-so the project's headline correctness property is not regression-protected. No
-test asserts an event round-trips a real broker either — publishing is patched at
-the call sites. *Fix:* the race test as a CI job with `--scale api=3`, and one
-end-to-end produce-and-consume test.
+**The honest trade:** the event is no longer lost, but it is no longer instant.
+It is delayed by the relay's poll interval. You buy durability with latency.
 
-**No token revocation.** §7.1 names revocation as JWT's weakness and offers the
-per-request user lookup as mitigation — that covers *deleted* and *demoted* users
-only. A stolen token, a password change, or "log me out everywhere" all stay
-valid until `exp`. *Fix:* a `jti` claim plus a Redis denylist with a TTL matching
-the token's remaining life. Redis is already a hard dependency, so it costs no
-new infrastructure.
+### Durability theatre → real replication
 
-**No FK on `orders.customer_id`.** Ownership is enforced in the handler but not
-by the database. *Fix:* a migration adding the constraint — deferred because
-applying it to existing rows needs a decision about orphaned demo data.
+**Was:** one broker, RF=1. `acks=all` was theatre — "all" was one replica.
 
-## 9.6 Known-and-deliberate, not gaps
+**Now:** three brokers, **RF=3, `min.insync.replicas=2`**, including the internal
+`__consumer_offsets` topic (a group whose offsets live on one broker loses its
+place when that broker dies). Verified on the running cluster:
+
+```
+Topic: order.dispatched  PartitionCount: 3  ReplicationFactor: 3  Configs: min.insync.replicas=2
+    Partition: 0  Leader: 2  Replicas: 2,3,1  Isr: 2,3,1
+```
+
+**Why 2 and not 3:** `min.insync=3` refuses writes the moment any broker blinks;
+`min.insync=1` silently accepts a write only one replica has — the theatre again.
+RF=3 with min.insync=2 tolerates one broker down and still accepts writes. **The
+producer config was always right; the topology was the gap.**
+
+### The dispatcher: O(n log n) → an indexed lookup
+
+**Was:** every call loaded all pending orders and rebuilt an in-process heap. The
+`heappop` was O(log n); the build dominated, and n is your backlog.
+
+**Now:** the ordering is a SQL expression —
+`ORDER BY value + minutes_waited * weight DESC LIMIT 1 FOR UPDATE SKIP LOCKED`.
+Postgres walks and stops at the first row it can lock, so the work no longer
+scales with how far behind you are.
+
+**One subtlety worth volunteering:** `timezone('UTC', now())` rather than `now()`.
+`created_at` is stored naive, and subtracting a tz-aware value from a naive
+column is a silent hour-offset bug.
+
+### The benchmark — and the defect it found ⭐
+
+This is the one that paid for itself. The old figure measured unauthenticated
+`POST /orders` — a plain INSERT. Pointing the load profile at the **claim** found
+a real defect within one run.
+
+**The defect:** with a large backlog and no free riders, every dispatch call
+walked the **entire** pending set before returning 409 — 1,730 orders scanned to
+answer "nobody is available", holding row locks the whole way. Dispatch p99 was
+**11 s**.
+
+**The fix:** `MAX_ORDERS_SCANNED = 20`. If the top 20 by priority have no
+claimable rider, that is a **supply** problem and scanning further will not
+conjure one. The cost is a rare false 409 when the only free rider is far down
+the queue — cheap, because the caller just dispatches again.
+
+**Measured, same machine, 50 users, 60 s, limiter off, 3 replicas:**
+
+| | RPS | p50 | p95 | p99 | max |
+|---|---|---|---|---|---|
+| dispatch claim — **before** | 9.3 | 1700 ms | 8200 ms | **11000 ms** | 17000 ms |
+| dispatch claim — **after** | 14.3 | 1600 ms | 2300 ms | **2800 ms** | 3100 ms |
+| aggregate — before | 39.0 | 330 ms | 4100 ms | 8500 ms | — |
+| aggregate — after | 57.6 | 200 ms | 2000 ms | 2300 ms | — |
+
+**How to quote this honestly.** API, Postgres, Redis and three Kafka brokers all
+share one laptop, so **the absolute numbers characterise my machine, not the
+design** — do not present them as capacity. What *is* valid is the comparison:
+same host, same load, one variable changed, p99 down 4×. **A single-host
+benchmark is near-worthless for capacity and excellent for regression.** Say
+that, and you have said something true about benchmarking rather than something
+flattering about your project.
+
+### The concurrency proof, in CI
+
+`scripts/race_test.py` was a script somebody had to remember to run — not
+regression protection. It is now a CI job that boots the stack with
+`--scale api=3` and fails the build on any duplicate. And one test
+(`tests/test_kafka_roundtrip.py`) now produces and consumes against a **real
+broker**, because everything else patches `publish_event` — the suite could have
+stayed green while serialisation or the partitioner was broken.
+
+**A wrinkle worth telling:** that test built a real producer, which is a module
+global, so every test after it tripped the "no real producer was created" control
+and errored in teardown — 51 errors from one new test. The fixture now drains and
+resets it. **A test-isolation control is itself something that can break.**
+
+### Token revocation
+
+Every token now carries a **`jti`**, and `POST /auth/logout` puts it on a Redis
+denylist with a TTL equal to the token's remaining life — bounded and
+self-cleaning, so it is not a session store by the back door.
+
+**The interesting part is the failure direction.** `is_revoked` **fails CLOSED** —
+if Redis is unreachable, the token is rejected. That is the exact opposite of the
+rate limiter, which fails open. The rate limiter protects capacity, and
+unthrottled traffic beats an outage; this protects against a *stolen* token, and
+failing open would reopen that hole precisely when the system is already
+degraded. **Being able to argue both directions is the whole lesson.**
+
+It revokes one token, not the user — logging out a phone should not log out a
+laptop. Revoking all of a user's sessions needs a second denylist keyed on `sub`
+plus an issued-after timestamp.
+
+### The foreign key
+
+`orders.customer_id` is now a real FK to `users.id`, `ON DELETE RESTRICT`.
+Ownership was already enforced in the handler; this makes the **database**
+enforce it, because handler-level invariants get bypassed by scripts, fixtures
+and the next endpoint someone adds. RESTRICT rather than CASCADE: deleting a
+customer should fail loudly, not silently vaporise their order history.
+
+The migration deletes pre-existing orphan rows — stated plainly in the migration
+itself, because on a real system that is a data-migration decision, not a DELETE
+hiding in a schema change.
+
+## 9.6 What is still open, honestly
+
+Short list now, and none of it is load-bearing for the demo:
+
+- **Revoking every session for a user** — one token at a time today. Needs a
+  `sub`-keyed denylist plus an issued-after timestamp.
+- **No refresh tokens.** A 60-minute access token is the whole session; the
+  standard split is a short access token plus a long, revocable refresh token.
+- **The relay is single-instance in practice.** It is written to be safe with
+  several (`SKIP LOCKED`), but only one runs, and nothing alerts on outbox depth
+  if it dies.
+- **`MAX_ORDERS_SCANNED = 20` is a constant, not a tuned value.** It was chosen
+  to bound the pathological case, not derived from data.
+- **Numbers are single-host.** Valid for regression, not for capacity.
+
+## 9.7 Known-and-deliberate, not gaps
 
 State these as choices, not omissions: the fairness band Δ is a fixed constant
 rather than per-city-tuned; `orders_today` resets on **UTC** midnight rather than
