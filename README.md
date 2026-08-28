@@ -370,10 +370,13 @@ measures the limiter, not the app.
 
 ## Notes
 
-`docs/INTERVIEW_NOTES.md` explains the stack choices — what each component is,
-why it was chosen, and what was rejected — plus deep dives on rate-limiting
-algorithms, Redis, auth/JWT, and Kafka's delivery semantics. `docs/INTERVIEW_PREP.md` is the long
-form. `docs/DAILY_COMMANDS.md` is the operational runbook.
+- **[`docs/RUN.md`](docs/RUN.md)** — running it, testing it, load-testing it,
+  and the two gotchas that waste an afternoon.
+- **[`docs/INTERVIEW_PREP.md`](docs/INTERVIEW_PREP.md)** — the design decisions
+  and the audit: what was wrong here, and what I did about it.
+- **[`docs/INTERVIEW_NOTES.md`](docs/INTERVIEW_NOTES.md)** — the fundamentals
+  behind those decisions: rate-limiting algorithms, Redis, Postgres wiring,
+  auth/JWT, and Kafka's delivery semantics.
 
 ---
 

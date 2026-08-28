@@ -1,10 +1,13 @@
 # DeliverIQ — Interview Notes
 
-> **What this is.** The interview-facing companion to `INTERVIEW_PREP.md`.
-> That file is the full study ladder; this one is what gets *asked*: the terms on
-> my resume, the stack choices behind them, and deep passes on **rate limiting**,
-> **Redis**, **Kafka** and **auth** — the four topics every follow-up has landed
+> **What this is.** The fundamentals, one term at a time — my resume decoded,
+> the stack choices behind it, and deep passes on **rate limiting**, **Redis**,
+> **Postgres**, **auth/JWT** and **Kafka**, the topics every follow-up has landed
 > on so far.
+>
+> Its companion, [`INTERVIEW_PREP.md`](INTERVIEW_PREP.md), is the *project*
+> story: the design decisions and the audit. This file is the theory those
+> decisions are made of.
 >
 > Aimed at SDE-1 depth: what a backend engineer is expected to explain, draw, and
 > write pseudocode for on a whiteboard — including **how each dependency is
