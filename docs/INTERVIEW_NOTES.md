@@ -97,9 +97,10 @@ retries when wrong. Here contention is the normal case, so it would thrash.
 
 ## Bullet 2 — the algorithm
 
-> *Built the dispatch core: aging-weighted priority scheduler preventing
+> *Built the dispatch core — aging-weighted priority scheduling that prevents
 > starvation, and geohash matching with a fairness band that spreads work across
-> idle riders*
+> idle riders; load-testing the claim path exposed an unbounded scan under
+> backlog, and bounding it cut dispatch p99 from 11 s to 2.8 s*
 
 | Term | What it means | How we handle it |
 |---|---|---|
@@ -122,9 +123,11 @@ scan was still unbounded when no rider was free (1,730 orders walked to answer
 
 ## Bullet 3 — Kafka ⭐ (the most-probed one)
 
-> *Streamed events to 3 Kafka consumer groups with manual offset commits for
-> at-least-once delivery, idempotent consumption on `(partition, offset)`, and a
-> dead-letter queue for poison messages*
+> *Closed a dual-write hole with a transactional outbox — the event commits with
+> the order, a relay publishes then marks — and streamed to 3 Kafka consumer
+> groups over RF=3/`min.insync=2` with manual offset commits for at-least-once
+> delivery, idempotent consumption on `(partition, offset)`, and a dead-letter
+> queue for poison messages*
 
 | Term | What it means | How we handle it |
 |---|---|---|
@@ -143,15 +146,17 @@ follow-up this bullet invites most often, so know it cold.
 ## Bullet 4 — security
 
 > *Hardened after a self-audit: closed 4 unauthenticated endpoints, a forgeable
-> admin JWT, and a cross-tenant idempotency leak; extended RBAC across every
-> route and re-keyed Lua-atomic rate limiting to verified identity, backed by
-> 71 tests*
+> admin JWT, and a cross-tenant idempotency leak; added `jti`-based token
+> revocation, extended RBAC across every route and re-keyed Lua-atomic rate
+> limiting to verified identity, backed by 79 tests and a CI race check at 3
+> replicas*
 
-**"71 tests", never "71 integration tests"** — the split is 47 integration
-(real Postgres and Redis over HTTP) and 19 unit (config validation, middleware
-key derivation), collecting as 71 because one test is parametrised over six
-banned secrets. Verify it yourself:
-`grep -c "^def test_" tests/*.py` and `pytest tests/ -q`.
+**"79 tests", never "79 integration tests"** — the split is **55 integration**
+(real Postgres and Redis over HTTP, one of them producing and consuming against
+a real broker) and **24 unit** (config validation, middleware key derivation).
+It is 74 test functions collecting as 79, because the banned-secret test is
+parametrised. Verify it yourself:
+`pytest --collect-only -q` and `pytest -q`.
 
 | Term | What it means | How we handle it |
 |---|---|---|
@@ -199,7 +204,7 @@ configured" is an engineering answer.
 | **Alembic** | Versioned, reversible schema migrations | 6 migrations in `alembic/versions/` | `create_all()` cannot alter an existing table or run in a rollback. Migrations are ordered, reviewable, and run as a **one-shot job** before the API starts — never on app boot, because 3 replicas booting = 3 concurrent migrations |
 | **Pydantic** | Runtime validation from type hints | Request/response schemas | Bad input is rejected at the boundary with a 422 before it reaches business logic. Removing `customer_id` from `OrderCreate` is a *security* fix expressed as a schema change |
 | **Async Python** | `async`/`await` — one thread interleaves many I/O waits | Middleware, `redis.asyncio` | I/O-bound work (DB, Redis, Kafka) spends its life waiting, so one thread can serve many requests. **The trap I hit:** a *blocking* call inside `async def` stalls every in-flight request — sync routes are fine (threadpool), sync middleware is not |
-| **pytest** | Test framework — plain functions, fixtures for setup | 71 tests | Fixtures compose (`client` → `ops_client`), so setup isn't copy-pasted. **Rejected unittest** — class boilerplate for no gain |
+| **pytest** | Test framework — plain functions, fixtures for setup | 79 tests | Fixtures compose (`client` → `ops_client`), so setup isn't copy-pasted. **Rejected unittest** — class boilerplate for no gain |
 
 ## Data Stores
 

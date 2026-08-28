@@ -301,24 +301,27 @@ Or drive the suite directly:
 docker compose up -d db redis kafka
 docker compose up kafka-init --exit-code-from kafka-init
 alembic upgrade head
-pytest -q                                    # 71 tests
+pytest -q                                    # 79 tests
 ```
 
-**71 tests**, of which 47 are integration — they run against real Postgres and
+**79 tests**, of which 55 are integration — they run against real Postgres and
 Redis rather than mocks, covering the dispatch lifecycle, the state machine,
-authentication, the per-role authorization matrix, read scoping, and idempotent
-retries. The remaining 24 are unit tests over configuration validation and the
-middleware key-derivation helpers, which are pure functions and do not need
-infrastructure to be worth testing.
+authentication, token revocation, the per-role authorization matrix, read
+scoping, and idempotent retries; one produces and consumes against a real
+broker, because everything else patches the publisher and the suite could stay
+green while serialisation was broken. The remaining 24 are unit tests over
+configuration validation and the middleware key-derivation helpers, which are
+pure functions and do not need infrastructure to be worth testing.
 
 | File | Covers |
 |---|---|
 | `test_orders.py` | order lifecycle, dispatch, state machine, idempotent retries |
-| `test_auth.py` | registration, login, the authn-vs-authz split, actor guards |
+| `test_auth.py` | registration, login, the authn-vs-authz split, actor guards, logout revoking one token and not the user |
 | `test_scoping_and_idempotency.py` | per-role read scoping, cross-tenant key isolation |
 | `test_rider_location_auth.py` | the dispatch-integrity guard, including a hijack attempt |
 | `test_middleware_hardening.py` | rate-limit keying, request-id adoption, metrics coverage |
 | `test_config.py` | the `JWT_SECRET` startup guard |
+| `test_kafka_roundtrip.py` | produce and consume against a real broker (`real_kafka`) |
 
 Kafka publishing is patched at the **call sites**: every module that did
 `from … import publish_event` holds its own binding, so patching the definition
