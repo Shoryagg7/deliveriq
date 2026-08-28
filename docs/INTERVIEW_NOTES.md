@@ -20,8 +20,9 @@ line each — the depth is in Parts 2 and 3.
 ## Bullet 1 — concurrency
 
 > *Eliminated a double-dispatch race across 3 API replicas with a two-phase
-> `SELECT FOR UPDATE SKIP LOCKED` claim protocol; verified zero duplicate
-> assignments under concurrent load*
+> `SELECT FOR UPDATE SKIP LOCKED` claim; re-measured under burst, found it
+> correct but not live — half the orders stalling with riders idle — and added
+> bounded rider-level retry to drain every order with zero duplicates*
 
 | Term | What it means | How we handle it |
 |---|---|---|
@@ -31,6 +32,57 @@ line each — the depth is in Parts 2 and 3.
 | **`SKIP LOCKED`** | Don't wait for a locked row; **skip it and take the next one** | A contested dispatch becomes "take a different order" instead of blocking in a queue |
 | **Two-phase claim** | Lock **both** the order *and* the rider before mutating *either* | Prevents assigning an order to a rider another replica just took. If the rider claim fails, we re-select the next-best rider for the **same** order rather than dropping the order |
 | **Zero duplicate assignments** | Every `order_id` and every `rider_id` appears at most once | `scripts/race_test.py`: 15 simultaneous dispatches, 3 replicas, asserts both sets are unique |
+
+### Correct is not the same as live ⭐ (lead with this half)
+
+Plenty of people can say they fixed a race with row locks. Almost nobody can say
+they then **measured it again, found it still behaved badly, and redesigned.**
+That is the rarer signal, and it is the same harness — no extra work.
+
+**The measurement that changed the design.** Locking was correct — zero
+double-assignments — and the system was still bad. 15 simultaneous dispatches, 10
+orders, 10 riders, 3 replicas: only **5 succeeded**. Ten calls got 409 **while
+five riders sat AVAILABLE.**
+
+**Why.** Every concurrent caller ranks riders *identically*, because the state
+that would differentiate them — the winner removing that rider from the geohash
+index and bumping their `orders_today` — only lands **after commit**. So all the
+losers pick the same top-ranked rider, fail the claim, and then moved on to the
+**next order** — chasing that same contested rider down the entire heap until
+they ran out. **Losing a rider lost the whole order.**
+
+**The fix — retry the rider, keep the order.** On a failed rider claim, add that
+rider to an `exclude` set and re-select the next-best **for the same order**.
+
+- **Bounded** — the 3×3 cell ring is finite and every failure shrinks it.
+- **Mutation-free** — nothing is written during the retry, so the
+  claim-everything-before-you-mutate invariant survives.
+- **Subtlety worth volunteering:** exclusion runs *before* the nearest-rider
+  distance is computed, so the fairness band re-centres on the nearest
+  **eligible** rider. The SLA bound stays relative to riders you can actually get.
+
+**Same test after the fix: every order dispatched in one burst, still zero
+doubles.**
+
+> **Say "full drain", not "10 of 15".** 10 successes out of 15 calls sounds like
+> 67% — it is actually optimal: there were only 10 orders, and the other 5 calls
+> correctly returned "no pending orders". Losing a race now costs one candidate,
+> not the whole request.
+
+**A bonus it bought for free:** a stale BUSY rider left in the geohash index —
+crash after commit, before the index cleanup — used to poison every order's
+selection. Now it costs one failed claim and gets excluded. Self-healing.
+
+**Soundbite:** "My locking was correct but not live. Under a burst every replica
+chases the same top-ranked rider, because the state that would differentiate them
+only lands post-commit — I measured 5 of 15 succeeding with riders sitting idle.
+The fix is a bounded rider-level retry: exclude the contested rider and re-select
+for the same order. After that, full drain, still zero doubles. Correctness and
+liveness are separate properties and you have to measure both."
+
+**The general lesson, and the best line in it:** a test that only asserts "no
+duplicate assignments" **passes a system that assigns nothing at all.** Zero
+throughput has zero duplicates. That is why the second measurement existed.
 
 **If they ask "why not just a lock/mutex?"** — a mutex is per-process; three
 replicas have three of them. The lock must live where the shared state is, which
@@ -81,17 +133,24 @@ follow-up this bullet invites most often, so know it cold.
 
 ## Bullet 4 — security
 
-> *Audited and hardened the API: closed 4 unauthenticated endpoints, a forgeable
-> admin JWT, and a cross-tenant idempotency-cache leak; extended RBAC across
-> every route and re-keyed rate limiting to verified identity, backed by 71 tests*
+> *Hardened after a self-audit: closed 4 unauthenticated endpoints, a forgeable
+> admin JWT, and a cross-tenant idempotency leak; extended RBAC across every
+> route and re-keyed Lua-atomic rate limiting to verified identity, backed by
+> 71 tests*
+
+**"71 tests", never "71 integration tests"** — the split is 47 integration
+(real Postgres and Redis over HTTP) and 19 unit (config validation, middleware
+key derivation), collecting as 71 because one test is parametrised over six
+banned secrets. Verify it yourself:
+`grep -c "^def test_" tests/*.py` and `pytest tests/ -q`.
 
 | Term | What it means | How we handle it |
 |---|---|---|
 | **Unauthenticated endpoint** | Reachable with no token at all | Four of them. The worst — `PATCH /riders/{id}/location` — writes to the geohash index, so anyone could move the fleet and steer every dispatch |
 | **Forgeable JWT** | The signing secret was a default published in the repo, so anyone could mint an `ops` token | Removed the default entirely: no boot without a real secret, placeholders rejected, 32-byte minimum |
 | **Cross-tenant leak** | One user receiving another user's data | The idempotency key was global, so two users sending `Idempotency-Key: retry-1` collided and the second got the first's response body. Now namespaced per verified subject |
-| **RBAC** | Role-Based Access Control — permissions attach to a role, not a person | `ops` / `rider` / `customer`. Roles can't be self-assigned: registration always creates a customer |
-| **Re-keyed rate limiting** | Changed *what* the limiter counts per | Was `X-API-Key or IP` — a header the caller controls, so rotating it minted a fresh bucket. Now the verified token subject |
+| **RBAC** | Role-Based Access Control — permissions attach to a role, not a person | `ops` / `rider` / `customer`. Roles can't be self-assigned: registration always creates a customer. **Note the verb — the audit *extended* RBAC, it didn't add it.** The role model and the status-transition actor guard already existed; the audit applied them to the routes that had no guard at all |
+| **Re-keyed rate limiting** | Changed *what* the limiter counts per | Was `X-API-Key or IP` — a header the caller controls, so rotating it minted a fresh bucket. Now the verified token subject. Again **re-keyed, not added**: the atomic Lua token bucket predates the audit; the flaw was the key, not the algorithm |
 
 **"Why 404 in one place and 403 in another?"** — a deliberate pair worth
 volunteering. `GET /orders/{id}` returns **404** for an order you may not see,
