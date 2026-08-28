@@ -422,20 +422,46 @@ I went through the project looking for things I'd claimed but not verified. This
 section is the answer to *"how would you make this production-ready?"* — because
 it's what I actually did.
 
-### The four auth holes ⭐ (lead with this one)
+### Four endpoints had no login check at all ⭐ (lead with this one)
 
-`POST /orders`, `GET /orders`, `GET /riders` and `PATCH /riders/{id}/location`
-were all reachable **unauthenticated**. The location one is the worst: anyone
-could teleport a rider into any neighbourhood and farm every dispatch in it.
+**"Unauthenticated" just means: no token needed.** You could hit these four
+endpoints from a browser or `curl` with no account, no login, nothing:
 
-Fixed with two **orthogonal** guards, and the distinction matters:
+| Endpoint | What a stranger could do |
+|---|---|
+| `POST /orders` | create orders as anybody |
+| `GET /orders` | read every order in the system |
+| `GET /riders` | read the whole rider list |
+| `PATCH /riders/{id}/location` | **move any rider anywhere on the map** |
 
-- **Role** — "are you an operator?" Dispatch and rider onboarding are ops-only.
-- **Ownership** — "is this *your* row?" A rider may advance only the order
-  assigned to them, and a customer sees only their own orders.
+The last one is the bad one. Dispatch picks the rider *nearest the restaurant*,
+so if you can move riders, you can put your own rider next to every restaurant
+and take all the work. **It's not a data leak — it's a way to rig the
+algorithm.**
 
-Role alone is not enough: every rider passing a role check could still move
-every *other* rider. **401 = who are you; 403 = I know who you are, and no.**
+**The fix is two separate checks. Both are needed, and that's the point.**
+
+1. **Are you logged in?** No token → **401**. This is the one that was missing.
+2. **Are you allowed to do *this*?** Logged in but not permitted → **403**.
+
+And the second check comes in two flavours:
+
+- **By role** — "are you an operator?" Only ops can dispatch or add riders.
+- **By ownership** — "is this *yours*?" A rider can only update the order
+  assigned to them; a customer only sees their own orders.
+
+**Why role alone isn't enough:** every rider passes a "you are a rider" check.
+So if that were the only test, any rider could still move *every other* rider —
+the exact hole from before, just with a login attached. You need "and it belongs
+to you" on top.
+
+> **Say it like this:** "Four endpoints had no auth at all — the worst let
+> anyone move riders on the map, which lets you steer dispatch to yourself. I
+> added login checks, then role checks, then ownership checks, because being a
+> rider doesn't mean you can touch *another* rider's data."
+
+**Remember the two codes:** **401 = I don't know who you are.**
+**403 = I know who you are, and no.**
 
 ### The signing key had a working default
 
